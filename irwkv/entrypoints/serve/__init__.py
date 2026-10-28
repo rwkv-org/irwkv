@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from fastapi import FastAPI
+
+from irwkv.logger import init_logger
+
+from .exception_handling.error_response import create_error_response
+
+logger = init_logger(__name__)
+
+__all__ = [
+    "create_error_response",
+    "register_irwkv_serve_api_routers",
+    "register_irwkv_dev_api_routers",
+]
+
+
+def register_irwkv_serve_api_routers(app: FastAPI):
+    from .instrumentator import register_instrumentator_api_routers
+
+    register_instrumentator_api_routers(app)
+
+    from irwkv.entrypoints.serve.profile.api_router import (
+        attach_router as attach_profile_router,
+    )
+
+    attach_profile_router(app)
+
+    from irwkv.entrypoints.serve.tokenize.api_router import (
+        attach_router as attach_tokenize_router,
+    )
+
+    attach_tokenize_router(app)
+
+
+def register_irwkv_dev_api_routers(app: FastAPI):
+    logger.warning(
+        "SECURITY WARNING: Development endpoints are enabled! "
+        "This should NOT be used in production!"
+    )
+
+    from .dev.cache.api_router import attach_router as attach_cache_router
+
+    attach_cache_router(app)
+
+    from .dev.rpc.api_router import attach_router as attach_rpc_router
+
+    attach_rpc_router(app)
+
+    from .dev.server_info.api_router import (
+        attach_router as attach_server_info_router,
+    )
+
+    attach_server_info_router(app)
+
+    from .dev.sleep.api_router import attach_router as attach_sleep_router
+
+    attach_sleep_router(app)

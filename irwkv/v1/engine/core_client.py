@@ -1,0 +1,1472 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
+import contextlib
+import queue
+import sys
+import uuid
+import weakref
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from collections.abc import Awaitable, Callable, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
+from multiprocessing.queues import Queue
+from threading import Thread
+from typing import Any, TypeAlias, TypeVar
+
+import msgspec
+import msgspec.msgpack
+import zmq
+import zmq.asyncio
+
+from irwkv import envs
+from irwkv.config import IrwkvConfig
+from irwkv.config.kv_events import KVEventsConfig
+from irwkv.envs import IRWKV_ENGINE_READY_TIMEOUT_S
+from irwkv.logger import init_logger
+from irwkv.renderers import BaseRenderer
+from irwkv.tasks import SupportedTask
+from irwkv.tracing import instrument
+from irwkv.utils.async_utils import in_loop
+from irwkv.utils.network_utils import (
+    close_sockets,
+    get_open_zmq_inproc_path,
+    make_zmq_socket,
+)
+from irwkv.v1.engine import (
+    EngineCoreOutputs,
+    EngineCoreReadyResponse,
+    EngineCoreRequest,
+    EngineCoreRequestType,
+    PauseMode,
+    UtilityOutput,
+)
+from irwkv.v1.engine.coordinator import DPCoordinator
+from irwkv.v1.engine.core import EngineCore, EngineCoreProc
+from irwkv.v1.engine.exceptions import EngineDeadError
+from irwkv.v1.engine.tensor_ipc import TensorIpcSender
+from irwkv.v1.engine.utils import (
+    CoreEngineActorManager,
+    CoreEngineProcManager,
+    EngineZmqAddresses,
+    get_engine_zmq_bind_addresses,
+    launch_core_engines,
+)
+from irwkv.v1.executor import Executor
+from irwkv.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+
+logger = init_logger(__name__)
+
+AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
+
+_R = TypeVar("_R")  # Return type for collective_rpc
+
+EngineIdentity = bytes
+
+
+class EngineCoreClient(ABC):
+    """EngineCoreClient: subclasses handle different methods for pushing
+        and pulling from the EngineCore for asyncio / multiprocessing.
+
+    Subclasses:
+    * InprocClient: In process EngineCore (for V0-style LLMEngine use)
+    * SyncMPClient: ZMQ + background proc EngineCore (for LLM)
+    * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
+    """
+
+    def get_kv_event_sources(self) -> dict[int, KVEventsConfig]:
+        """KV-event publisher config of each ready engine, keyed by DP rank."""
+        return {}
+
+    @staticmethod
+    def make_client(
+        multiprocess_mode: bool,
+        asyncio_mode: bool,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        renderer: BaseRenderer | None = None,
+    ) -> "EngineCoreClient":
+        # renderer is passed through to the multiprocess clients, which start
+        # the frontend MM warmup (renderer.start_mm_warmup_in_background) once
+        # the engine-core processes have been forked, so warmup overlaps
+        # engine-core load without a live thread at fork() time. In-process
+        # clients do not take a renderer: the engine core is built in this
+        # process, so there is no other process to overlap with and the MM
+        # warmup runs synchronously inside renderer.warmup() instead.
+        # TODO: support this for debugging purposes.
+        if asyncio_mode and not multiprocess_mode:
+            raise NotImplementedError(
+                "Running EngineCore in asyncio without multiprocessing "
+                "is not currently supported."
+            )
+
+        if multiprocess_mode and asyncio_mode:
+            return EngineCoreClient.make_async_mp_client(
+                irwkv_config,
+                executor_class,
+                log_stats,
+                renderer=renderer,
+            )
+
+        if multiprocess_mode and not asyncio_mode:
+            return SyncMPClient(
+                irwkv_config,
+                executor_class,
+                log_stats,
+                renderer=renderer,
+            )
+
+        return InprocClient(irwkv_config, executor_class, log_stats)
+
+    @staticmethod
+    @instrument(span_name="Overall Loading")
+    def make_async_mp_client(
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+    ) -> "AsyncMPClient":
+        parallel_config = irwkv_config.parallel_config
+        client_args = (
+            irwkv_config,
+            executor_class,
+            log_stats,
+            client_addresses,
+            client_count,
+            client_index,
+        )
+        if parallel_config.data_parallel_size > 1:
+            if parallel_config.data_parallel_external_lb:
+                # External load balancer - client per DP rank.
+                return DPAsyncMPClient(
+                    *client_args,
+                    renderer=renderer,
+                )
+            # Internal load balancer - client balances to all DP ranks.
+            return DPLBAsyncMPClient(
+                *client_args,
+                renderer=renderer,
+            )
+        return AsyncMPClient(
+            *client_args,
+            renderer=renderer,
+        )
+
+    @abstractmethod
+    def shutdown(self, timeout: float | None = None) -> None: ...
+
+    def get_output(self) -> EngineCoreOutputs:
+        raise NotImplementedError
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        raise NotImplementedError
+
+    def add_request(self, request: EngineCoreRequest) -> None:
+        raise NotImplementedError
+
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def reset_mm_cache(self) -> None:
+        raise NotImplementedError
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        raise NotImplementedError
+
+    def reset_encoder_cache(self) -> None:
+        raise NotImplementedError
+
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        raise NotImplementedError
+
+    def release_kv_cache_memory(self) -> None:
+        raise NotImplementedError
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        raise NotImplementedError
+
+    def is_sleeping(self) -> bool:
+        raise NotImplementedError
+
+    def execute_dummy_batch(self) -> None:
+        raise NotImplementedError
+
+    def set_weight_version(self, weight_version: str) -> None:
+        raise NotImplementedError
+
+    def get_weight_version(self) -> str:
+        raise NotImplementedError
+
+    async def execute_dummy_batch_async(self) -> None:
+        raise NotImplementedError
+
+    async def set_weight_version_async(self, weight_version: str) -> None:
+        raise NotImplementedError
+
+    async def get_weight_version_async(self) -> str:
+        raise NotImplementedError
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    def save_sharded_state(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        raise NotImplementedError
+
+    async def get_output_async(self) -> EngineCoreOutputs:
+        raise NotImplementedError
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        raise NotImplementedError
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        raise NotImplementedError
+
+    async def profile_async(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    async def reset_mm_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        raise NotImplementedError
+
+    async def reset_encoder_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        raise NotImplementedError
+
+    async def release_kv_cache_memory_async(self) -> None:
+        raise NotImplementedError
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> bool:
+        raise NotImplementedError
+
+    async def is_sleeping_async(self) -> bool:
+        raise NotImplementedError
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        raise NotImplementedError
+
+
+class InprocClient(EngineCoreClient):
+    """InprocClient: client for in-process EngineCore. Intended
+    for use in LLMEngine for V0-style add_request() and step()
+        EngineCore setup in this process (no busy loop).
+
+        * pushes EngineCoreRequest directly into the EngineCore
+        * pulls EngineCoreOutputs by stepping the EngineCore
+    """
+
+    # Takes no renderer: this class has no _start_mm_warmup (only MPClient
+    # does), so a renderer would never be used here. EngineCore is built in
+    # this process and MM warmup runs synchronously inside renderer.warmup().
+    def __init__(
+        self,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        *,
+        executor_fail_callback: Callable | None = None,
+    ):
+        self.engine_core = EngineCore(
+            irwkv_config,
+            executor_class,
+            log_stats,
+            executor_fail_callback=executor_fail_callback,
+        )
+        # Release the executor's workers when the client is collected, as
+        # MPClient does; they hold GPU memory for the life of the process
+        # otherwise. The callback must not reference self, or self would stay
+        # reachable and the finalizer would never run.
+        self._finalizer = weakref.finalize(self, self.engine_core.shutdown)
+
+    def get_output(self) -> EngineCoreOutputs:
+        outputs, _ = self.engine_core.step_fn()
+        return outputs and outputs.get(0) or EngineCoreOutputs()
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.engine_core.get_supported_tasks()
+
+    def add_request(self, request: EngineCoreRequest) -> None:
+        req = self.engine_core.preprocess_add_request(request)
+        self.engine_core.add_request(req)
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        if len(request_ids) > 0:
+            self.engine_core.abort_requests(request_ids)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if self._finalizer.detach() is not None:
+            self.engine_core.shutdown()
+
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        self.engine_core.profile(
+            is_start,
+            profile_prefix,
+            delay_iterations=delay_iterations,
+            max_iterations=max_iterations,
+        )
+
+    def reset_mm_cache(self) -> None:
+        self.engine_core.reset_mm_cache()
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        return self.engine_core.reset_prefix_cache(
+            reset_running_requests, reset_connector
+        )
+
+    def reset_encoder_cache(self) -> None:
+        self.engine_core.reset_encoder_cache()
+
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        if mode == "wait":
+            raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
+        result = self.engine_core.sleep(level, mode)
+        assert result is None
+
+    def release_kv_cache_memory(self) -> None:
+        self.engine_core.release_kv_cache_memory()
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        return self.engine_core.wake_up(tags)
+
+    def is_sleeping(self) -> bool:
+        return self.engine_core.is_sleeping()
+
+    def execute_dummy_batch(self) -> None:
+        self.engine_core.execute_dummy_batch()
+
+    def set_weight_version(self, weight_version: str) -> None:
+        self.engine_core.set_weight_version(weight_version)
+
+    def get_weight_version(self) -> str:
+        return self.engine_core.get_weight_version()
+
+    def save_sharded_state(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        self.engine_core.save_sharded_state(path, pattern, max_size)
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+
+@dataclass
+class BackgroundResources:
+    """Used as a finalizer for clean shutdown, avoiding
+    circular reference back to the client object."""
+
+    ctx: zmq.Context
+    # If CoreEngineProcManager, it manages local engines;
+    # if CoreEngineActorManager, it manages all engines.
+    engine_manager: CoreEngineProcManager | CoreEngineActorManager | None = None
+    coordinator: DPCoordinator | None = None
+    output_socket: zmq.Socket | zmq.asyncio.Socket | None = None
+    input_socket: zmq.Socket | zmq.asyncio.Socket | None = None
+    stats_update_socket: zmq.asyncio.Socket | None = None
+    output_queue_task: asyncio.Task | None = None
+    stats_update_task: asyncio.Task | None = None
+    shutdown_path: str | None = None
+
+    # Set if any of the engines are dead. Here so that the output
+    # processing threads can access it without holding a ref to the client.
+    engine_dead: bool = False
+
+    def __call__(self):
+        """Clean up background resources."""
+        logger.debug_once("[shutdown] MPClient: background resource cleanup start")
+        self.engine_dead = True
+        if self.engine_manager is not None:
+            self.engine_manager.shutdown(
+                timeout=envs.IRWKV_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        if self.coordinator is not None:
+            self.coordinator.shutdown()
+
+        if isinstance(self.output_socket, zmq.asyncio.Socket):
+            # Async case.
+            loop = self.output_queue_task._loop if self.output_queue_task else None
+
+            sockets = (
+                self.output_socket,
+                self.input_socket,
+                self.stats_update_socket,
+            )
+
+            tasks = (self.output_queue_task, self.stats_update_task)
+
+            def close_sockets_and_tasks():
+                close_sockets(sockets)
+                for task in tasks:
+                    if task is not None and not task.done():
+                        with contextlib.suppress(Exception):
+                            task.cancel()
+
+            if loop is not None and not loop.is_closed():
+                if in_loop(loop):
+                    close_sockets_and_tasks()
+                else:
+                    loop.call_soon_threadsafe(close_sockets_and_tasks)
+            else:
+                # Loop has been closed, try to clean up directly.
+                del tasks
+                del close_sockets_and_tasks
+                close_sockets(sockets)
+                del self.output_queue_task
+                del self.stats_update_task
+        else:
+            # Sync case.
+
+            # ZMQ context termination can hang if the sockets
+            # aren't explicitly closed first.
+            close_sockets((self.output_socket, self.input_socket))
+
+            if self.shutdown_path is not None:
+                # We must ensure that the sync output socket is
+                # closed cleanly in its own thread.
+                with self.ctx.socket(zmq.PAIR) as shutdown_sender:
+                    shutdown_sender.connect(self.shutdown_path)
+                    # Send shutdown signal.
+                    shutdown_sender.send(b"")
+
+        logger.debug_once("[shutdown] MPClient: background resource cleanup complete")
+
+    def validate_alive(self, frames: Sequence[zmq.Frame]):
+        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
+            self.engine_dead = True
+            raise EngineDeadError()
+
+
+class MPClient(EngineCoreClient):
+    """MPClient: base client for multi-proc EngineCore.
+    EngineCore runs in a background process busy loop, getting
+    new EngineCoreRequests and returning EngineCoreOutputs
+
+    * pushes EngineCoreRequests via input_socket
+    * pulls EngineCoreOutputs via output_socket
+
+    * AsyncMPClient subclass for AsyncLLM usage
+    * SyncMPClient subclass for LLM usage
+    """
+
+    def __init__(
+        self,
+        asyncio_mode: bool,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        renderer: BaseRenderer | None = None,
+    ):
+        self.irwkv_config = irwkv_config
+        self._renderer: BaseRenderer | None = renderer
+        self._effective_attention_block_sizes: set[int | None] = set()
+        self._kv_event_sources: dict[int, KVEventsConfig] = {}
+
+        # ZMQ setup.
+        sync_ctx = zmq.Context(io_threads=2)
+        self.ctx = zmq.asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
+
+        # This will ensure resources created so far are closed
+        # when the client is garbage collected, even if an
+        # exception is raised mid-construction.
+        self.resources = BackgroundResources(ctx=sync_ctx)
+        self._finalizer = weakref.finalize(self, self.resources)
+        success = False
+        try:
+            parallel_config = irwkv_config.parallel_config
+
+            self.stats_update_address: str | None = None
+            tensor_queue: Queue | None = None
+            if client_addresses:
+                # Engines are managed externally to this client.
+                input_address = client_addresses["input_address"]
+                output_address = client_addresses["output_address"]
+                self.stats_update_address = client_addresses.get("stats_update_address")
+                # Tensor queues passed via client_addresses for multi-API-server case
+                tensor_queue = client_addresses.get("tensor_queue")
+                input_listener = client_addresses.get("input_listener")
+                output_listener = client_addresses.get("output_listener")
+                self.input_socket = self.resources.input_socket = make_zmq_socket(
+                    self.ctx,
+                    input_address,
+                    zmq.ROUTER,
+                    bind=True,
+                    listener=input_listener,
+                )
+                self.resources.output_socket = make_zmq_socket(
+                    self.ctx,
+                    output_address,
+                    zmq.PULL,
+                    listener=output_listener,
+                )
+
+                # Engines are managed externally: this process does not fork
+                # them, so there is no fork race; start the MM warmup now.
+                self._start_mm_warmup()
+            else:
+                # Engines are managed by this client.
+                bind_addresses = get_engine_zmq_bind_addresses(irwkv_config)
+                self.input_socket = self.resources.input_socket = make_zmq_socket(
+                    self.ctx,
+                    bind_addresses.inputs[0],
+                    zmq.ROUTER,
+                    bind=True,
+                )
+                self.resources.output_socket = make_zmq_socket(
+                    self.ctx, bind_addresses.outputs[0], zmq.PULL
+                )
+
+                # EngineZmqAddresses contains only endpoints resolved by the
+                # sockets that own the bind operation.
+                addresses = EngineZmqAddresses(
+                    inputs=[self.input_socket.getsockopt(zmq.LAST_ENDPOINT).decode()],
+                    outputs=[
+                        self.resources.output_socket.getsockopt(
+                            zmq.LAST_ENDPOINT
+                        ).decode()
+                    ],
+                )
+
+                with launch_core_engines(
+                    irwkv_config, executor_class, log_stats, addresses
+                ) as engine_launch:
+                    self.resources.coordinator = engine_launch.coordinator
+                    self.resources.engine_manager = engine_launch.engine_manager
+                    coordinator = engine_launch.coordinator
+                    addresses = engine_launch.addresses
+                    tensor_queue = engine_launch.tensor_queue
+                    # Engine-core processes have now all been forked/started
+                    # (CoreEngineProcManager.proc.start()). It is now safe to
+                    # launch the frontend background MM warmup: it must not
+                    # run while fork() is in flight (a live thread holding a
+                    # lock would deadlock the forked child), but the
+                    # engine-core model load (minutes) that follows is exactly
+                    # what the warmup should overlap with.
+                    self._start_mm_warmup()
+
+                self.stats_update_address = addresses.frontend_stats_publish_address
+                if coordinator is not None:
+                    assert self.stats_update_address == (
+                        coordinator.get_stats_publish_address()
+                    )
+
+            # Serialization setup with tensor queues for multimodal tensor IPC.
+            tensor_ipc_sender: TensorIpcSender | None = None
+            model_config = getattr(irwkv_config, "model_config", None)
+            if model_config is not None and model_config.multimodal_config is not None:
+                mm_tensor_ipc = model_config.multimodal_config.mm_tensor_ipc
+                if mm_tensor_ipc == "torch_shm" and tensor_queue is not None:
+                    tensor_ipc_sender = TensorIpcSender(tensor_queue)
+
+            self.encoder = MsgpackEncoder(oob_tensor_consumer=tensor_ipc_sender)
+            self.decoder = MsgpackDecoder(EngineCoreOutputs)
+
+            dp_size = parallel_config.data_parallel_size
+            dp_rank = parallel_config.data_parallel_index
+            dp_local_size = parallel_config.data_parallel_size_local
+            offline_mode = parallel_config.data_parallel_rank_local is not None
+            # Client manages local+remote EngineCores in pure internal LB case.
+            # Client manages local EngineCores in hybrid and external LB case.
+            num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
+            self.engine_ranks_managed = (
+                [dp_rank] if offline_mode else list(range(dp_rank, dp_rank + num_ranks))
+            )
+            assert parallel_config.data_parallel_size_local <= len(
+                self.engine_ranks_managed
+            )
+
+            # ZMQ identity of each engine that this client will talk to.
+            self.core_engines: list[EngineIdentity] = [
+                rank.to_bytes(2, "little") for rank in self.engine_ranks_managed
+            ]
+
+            # Wait for ready messages from each engine on the input socket.
+            identities = set(self.core_engines)
+            sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            while identities:
+                if not sync_input_socket.poll(
+                    timeout=IRWKV_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
+                ):
+                    raise TimeoutError(
+                        f"Timed out waiting for engine core processes to "
+                        f"start. This is often caused by slow weight loading "
+                        f"for large models. Waited "
+                        f"{IRWKV_ENGINE_READY_TIMEOUT_S}s (configured by "
+                        f"IRWKV_ENGINE_READY_TIMEOUT_S). To increase the "
+                        f"timeout, set the environment variable: "
+                        f"IRWKV_ENGINE_READY_TIMEOUT_S=<seconds>"
+                    )
+                identity, payload = sync_input_socket.recv_multipart()
+                identities.remove(identity)
+                self._apply_ready_response(payload)
+
+            self.core_engine: EngineIdentity = self.core_engines[0]
+            self.utility_results: dict[int, AnyFuture] = {}
+
+            # Start monitoring engine core processes for unexpected failures
+            self.start_engine_core_monitor()
+
+            success = True
+        finally:
+            if not success:
+                self._finalizer()
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown engine manager under timeout and clean up resources."""
+        if self._finalizer.detach() is not None:
+            timeout_str = "default" if timeout is None else f"{timeout}s"
+            logger.info("[shutdown] MPClient: start timeout=%s", timeout_str)
+            if self.resources.engine_manager is not None:
+                logger.info_once("[shutdown] MPClient: stopping engine manager")
+                self.resources.engine_manager.shutdown(timeout=timeout)
+                logger.info_once("[shutdown] MPClient: engine manager stopped")
+            logger.info_once("[shutdown] MPClient: cleaning up background resources")
+            self.resources()
+            logger.info_once("[shutdown] MPClient: complete")
+
+    def _format_exception(self, e: Exception) -> Exception:
+        """If errored, use EngineDeadError so root cause is clear."""
+        return (
+            EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
+        )
+
+    def ensure_alive(self):
+        if self.resources.engine_dead:
+            raise EngineDeadError()
+
+    def dp_engines_running(self) -> bool:
+        return False
+
+    def _start_mm_warmup(self) -> None:
+        # Called once the engine-core process(es) have been created (forked or
+        # externally managed). Overlap the frontend MM warmup with the
+        # engine-core model load. This is a no-op when no renderer was passed
+        # (e.g. text-only serving or tests).
+        if self._renderer is not None:
+            self._renderer.start_mm_warmup_in_background()
+
+    def start_engine_core_monitor(self):
+        """Start a monitor thread for engine core processes."""
+        engine_manager = self.resources.engine_manager
+        if engine_manager is None:
+            # No engine processes to monitor
+            return
+
+        self_ref = weakref.ref(self)
+
+        # Monitor engine core process liveness. If any die unexpectedly,
+        # marks the engine as dead, and shuts down the client.
+        def monitor_engine_cores():
+            engine_manager.monitor_engine_liveness()
+            _self = self_ref()
+            if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
+                return
+            _self.resources.engine_dead = True
+            logger.warning_once(
+                "[shutdown] MPClient: engine core exited unexpectedly; starting cleanup"
+            )
+            _self.shutdown()
+            # Note: For MPClient, we don't have a failure callback mechanism
+            # like MultiprocExecutor, but we set engine_dead flag which will
+            # cause subsequent operations to raise EngineDeadError
+
+        Thread(
+            target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
+        ).start()
+
+    def _apply_ready_response(self, payload: bytes) -> None:
+        """Decode an EngineCoreReadyResponse and sync any post-initialization
+        config changes (e.g. auto-fitted max_model_len) back to the frontend."""
+        irwkv_config = self.irwkv_config
+        response = (
+            msgspec.msgpack.decode(payload, type=EngineCoreReadyResponse)
+            if payload
+            else None
+        )
+        self._effective_attention_block_sizes.add(
+            response.effective_attention_block_size if response is not None else None
+        )
+        sizes = self._effective_attention_block_sizes
+        irwkv_config.cache_config.effective_attention_block_size = (
+            next(iter(sizes)) if len(sizes) == 1 else None
+        )
+        if response is None:
+            return
+        irwkv_config.model_config.max_model_len = min(
+            irwkv_config.model_config.max_model_len, response.max_model_len
+        )
+
+        # Setup KV cache config with initialization state from
+        # engine core process. Sum num_gpu_blocks from all engines in DP case.
+        num_gpu_blocks = irwkv_config.cache_config.num_gpu_blocks or 0
+        num_gpu_blocks += response.num_gpu_blocks
+        irwkv_config.cache_config.num_gpu_blocks = num_gpu_blocks
+
+        # Sync block_size: may be enlarged by _align_hybrid_block_size in the
+        # worker for hybrid Mamba models.
+        cache_config = irwkv_config.cache_config
+        cache_config.block_size = response.block_size
+        cache_config.mamba_block_size = response.mamba_block_size
+        # Keep these as per-engine cache_config_info values; do not sum across DP.
+        cache_config.kv_cache_size_tokens = (
+            getattr(cache_config, "kv_cache_size_tokens", None)
+            if getattr(cache_config, "kv_cache_size_tokens", None) is not None
+            else response.kv_cache_size_tokens
+        )
+        cache_config.kv_cache_max_concurrency = (
+            getattr(cache_config, "kv_cache_max_concurrency", None)
+            if getattr(cache_config, "kv_cache_max_concurrency", None) is not None
+            else response.kv_cache_max_concurrency
+        )
+
+        # In external DP LB mode, the coordinator address that the
+        # front-end procs connect to is obtained by each engine via it's
+        # initial handshake with the rank 0 front-end.
+        if response.dp_stats_address is not None:
+            if self.stats_update_address is None:
+                self.stats_update_address = response.dp_stats_address
+            else:
+                assert response.dp_stats_address == self.stats_update_address
+
+        if response.kv_events_config is not None:
+            self._kv_event_sources[response.data_parallel_rank] = (
+                response.kv_events_config
+            )
+
+    def get_kv_event_sources(self) -> dict[int, KVEventsConfig]:
+        return dict(self._kv_event_sources)
+
+
+def _process_utility_output(
+    output: UtilityOutput, utility_results: dict[int, AnyFuture]
+):
+    """Set the result from a utility method in the waiting future."""
+    future = utility_results.pop(output.call_id)
+    failure_message = output.failure_message
+    try:
+        if failure_message is not None:
+            future.set_exception(Exception(failure_message))
+        else:
+            assert output.result is not None
+            future.set_result(output.result.result)
+    except asyncio.InvalidStateError:
+        # This can happen if the future is cancelled due to the
+        # original calling task being cancelled.
+        if failure_message is not None:
+            logger.error(
+                "Cancelled call to utility method failed with error: %s",
+                failure_message,
+            )
+
+
+class SyncMPClient(MPClient):
+    """Synchronous client for multi-proc EngineCore."""
+
+    @instrument(span_name="SyncMPClient init")
+    def __init__(
+        self,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        renderer: BaseRenderer | None = None,
+    ):
+        super().__init__(
+            asyncio_mode=False,
+            irwkv_config=irwkv_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            renderer=renderer,
+        )
+
+        self.outputs_queue = queue.Queue[EngineCoreOutputs | Exception]()
+
+        # Ensure that the outputs socket processing thread does not have
+        # a ref to the client which prevents gc.
+        ctx = self.ctx
+        out_socket = self.resources.output_socket
+        decoder = self.decoder
+        utility_results = self.utility_results
+        outputs_queue = self.outputs_queue
+
+        shutdown_path = get_open_zmq_inproc_path()
+        resources = self.resources
+        resources.shutdown_path = shutdown_path
+
+        def process_outputs_socket():
+            assert isinstance(out_socket, zmq.Socket)
+            shutdown_socket = ctx.socket(zmq.PAIR)
+            try:
+                shutdown_socket.bind(shutdown_path)
+                poller = zmq.Poller()
+                poller.register(shutdown_socket, zmq.POLLIN)
+                poller.register(out_socket, zmq.POLLIN)
+                while True:
+                    socks = poller.poll()
+                    if not socks:
+                        continue
+                    if len(socks) == 2 or socks[0][0] == shutdown_socket:
+                        # shutdown signal, exit thread.
+                        break
+
+                    frames = out_socket.recv_multipart(copy=False)
+                    resources.validate_alive(frames)
+                    outputs: EngineCoreOutputs = decoder.decode(frames)
+                    if outputs.utility_output:
+                        _process_utility_output(outputs.utility_output, utility_results)
+                    else:
+                        outputs_queue.put_nowait(outputs)
+            except Exception as e:
+                outputs_queue.put_nowait(e)
+            finally:
+                # Close sockets.
+                shutdown_socket.close(linger=0)
+                out_socket.close(linger=0)
+
+        # Process outputs from engine in separate thread.
+        self.output_queue_thread = Thread(
+            target=process_outputs_socket,
+            name="EngineCoreOutputQueueThread",
+            daemon=True,
+        )
+        self.output_queue_thread.start()
+
+        # The thread takes on responsibility for closing the socket.
+        self.resources.output_socket = None
+
+    def get_output(self) -> EngineCoreOutputs:
+        # If an exception arises in process_outputs_socket task,
+        # it is forwarded to the outputs_queue so we can raise it
+        # from this (run_output_handler) task to shut down the server.
+        outputs = self.outputs_queue.get()
+
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        return outputs
+
+    def _send_input(self, request_type: EngineCoreRequestType, request: Any):
+        self.ensure_alive()
+        # (Identity, RequestType, SerializedRequest)
+        msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
+        # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
+        # until it's finished sending them (there is a ref chain from the underlying
+        # memoryview back to the original owning tensor/ndarray).
+        self.input_socket.send_multipart(msg, copy=False)
+
+    def call_utility(self, method: str, *args) -> Any:
+        call_id = uuid.uuid1().int >> 64
+        future: Future[Any] = Future()
+        self.utility_results[call_id] = future
+        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+
+        return future.result()
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.call_utility("get_supported_tasks")
+
+    def add_request(self, request: EngineCoreRequest) -> None:
+        self._send_input(EngineCoreRequestType.ADD, request)
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        self.call_utility(
+            "profile",
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+        )
+
+    def reset_mm_cache(self) -> None:
+        self.call_utility("reset_mm_cache")
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        return self.call_utility(
+            "reset_prefix_cache", reset_running_requests, reset_connector
+        )
+
+    def reset_encoder_cache(self) -> None:
+        self.call_utility("reset_encoder_cache")
+
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        self.call_utility("sleep", level, mode)
+
+    def release_kv_cache_memory(self) -> None:
+        self.call_utility("release_kv_cache_memory")
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        return self.call_utility("wake_up", tags)
+
+    def is_sleeping(self) -> bool:
+        return self.call_utility("is_sleeping")
+
+    def execute_dummy_batch(self) -> None:
+        self.call_utility("execute_dummy_batch")
+
+    def set_weight_version(self, weight_version: str) -> None:
+        self.call_utility("set_weight_version", weight_version)
+
+    def get_weight_version(self) -> str:
+        return self.call_utility("get_weight_version")
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return self.call_utility("collective_rpc", method, timeout, args, kwargs)
+
+    def save_sharded_state(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        self.call_utility("save_sharded_state", path, pattern, max_size)
+
+
+class AsyncMPClient(MPClient):
+    """Asyncio-compatible client for multi-proc EngineCore."""
+
+    @instrument(span_name="AsyncMPClient init")
+    def __init__(
+        self,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+    ):
+        super().__init__(
+            asyncio_mode=True,
+            irwkv_config=irwkv_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            client_addresses=client_addresses,
+            renderer=renderer,
+        )
+
+        self.client_count = client_count
+        self.client_index = client_index
+        self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+
+        try:
+            # If we are running in an asyncio event loop, start the queue task.
+            # Otherwise, it will be started lazily. If it is not started here,
+            # we could miss EXECUTOR_FAILED messages from engine core if they
+            # occur prior to any requests being sent.
+            asyncio.get_running_loop()
+            self._ensure_output_queue_task()
+        except RuntimeError:
+            pass
+
+    def _ensure_output_queue_task(self):
+        resources = self.resources
+        if resources.output_queue_task is not None:
+            return
+
+        # Perform IO in separate task to parallelize as much as possible.
+        # Avoid task having direct reference back to the client.
+        decoder = self.decoder
+        utility_results = self.utility_results
+        outputs_queue = self.outputs_queue
+        output_handler: (
+            Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
+        ) = getattr(self.__class__, "process_engine_outputs", None)
+        _self_ref = weakref.ref(self)
+        output_socket = resources.output_socket
+        assert output_socket is not None
+
+        async def process_outputs_socket():
+            try:
+                while True:
+                    frames = await output_socket.recv_multipart(copy=False)
+                    resources.validate_alive(frames)
+                    outputs: EngineCoreOutputs = decoder.decode(frames)
+                    if outputs.utility_output:
+                        _process_utility_output(outputs.utility_output, utility_results)
+                        continue
+
+                    if output_handler is not None:
+                        assert _self_ref is not None
+                        _self = _self_ref()
+                        if not _self:
+                            # Client has been garbage collected, abort.
+                            return
+                        await output_handler(_self, outputs)
+
+                    if outputs.outputs or outputs.scheduler_stats:
+                        outputs_queue.put_nowait(outputs)
+            except Exception as e:
+                outputs_queue.put_nowait(e)
+            except asyncio.CancelledError:
+                outputs_queue.put_nowait(EngineDeadError())
+
+        resources.output_queue_task = asyncio.create_task(
+            process_outputs_socket(), name="EngineCoreOutputQueueTask"
+        )
+
+    async def get_output_async(self) -> EngineCoreOutputs:
+        self._ensure_output_queue_task()
+        # If an exception arises in process_outputs_socket task,
+        # it is forwarded to the outputs_queue so we can raise it
+        # from this (run_output_handler) task to shut down the server.
+        assert self.outputs_queue is not None
+        outputs = await self.outputs_queue.get()
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        return outputs
+
+    def _send_input(
+        self,
+        request_type: EngineCoreRequestType,
+        request: Any,
+        engine: EngineIdentity | None = None,
+    ) -> Awaitable[Any]:
+        if engine is None:
+            engine = self.core_engine
+
+        message = (request_type.value, *self.encoder.encode(request))
+        return self._send_input_message(message, engine)
+
+    def _send_input_message(
+        self, message: tuple[bytestr, ...], engine: EngineIdentity
+    ) -> Awaitable[Any]:
+        self.ensure_alive()
+        # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
+        # until it's finished sending them (there is a ref chain from the underlying
+        # memoryview back to the original owning tensor/ndarray).
+        return self.input_socket.send_multipart((engine,) + message, copy=False)
+
+    async def call_utility_async(self, method: str, *args) -> Any:
+        return await self._call_utility_async(method, *args, engine=self.core_engine)
+
+    async def call_utility_all_async(self, method: str, *args) -> list[Any]:
+        # Like the Rust client's call_utility: one result per managed engine.
+        return await asyncio.gather(
+            *[
+                self._call_utility_async(method, *args, engine=engine)
+                for engine in self.core_engines
+            ]
+        )
+
+    async def call_utility_consensus_async(self, method: str, *args) -> Any:
+        results = await self.call_utility_all_async(method, *args)
+        if any(result != results[0] for result in results):
+            raise RuntimeError(
+                f"Engines returned different {method} results: {results}"
+            )
+        return results[0]
+
+    async def _call_utility_async(
+        self, method: str, *args, engine: EngineIdentity
+    ) -> Any:
+        call_id = uuid.uuid1().int >> 64
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        message = (
+            EngineCoreRequestType.UTILITY.value,
+            *self.encoder.encode((self.client_index, call_id, method, args)),
+        )
+        await self._send_input_message(message, engine)
+        self._ensure_output_queue_task()
+        return await future
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        return await self.call_utility_async("get_supported_tasks")
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        request.client_index = self.client_index
+        await self._send_input(EngineCoreRequestType.ADD, request)
+        self._ensure_output_queue_task()
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        await self.call_utility_async("pause_scheduler", mode, clear_cache)
+
+    async def resume_scheduler_async(self) -> None:
+        await self.call_utility_async("resume_scheduler")
+
+    async def is_scheduler_paused_async(self) -> bool:
+        return await self.call_utility_consensus_async("is_scheduler_paused")
+
+    async def profile_async(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        await self.call_utility_async(
+            "profile",
+            is_start,
+            profile_prefix,
+            delay_iterations,
+            max_iterations,
+        )
+
+    async def reset_mm_cache_async(self) -> None:
+        await self.call_utility_async("reset_mm_cache")
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        return all(
+            await self.call_utility_all_async(
+                "reset_prefix_cache", reset_running_requests, reset_connector
+            )
+        )
+
+    async def reset_encoder_cache_async(self) -> None:
+        await self.call_utility_async("reset_encoder_cache")
+
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        await self.call_utility_async("sleep", level, mode)
+
+    async def release_kv_cache_memory_async(self) -> None:
+        await self.call_utility_async("release_kv_cache_memory")
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> bool:
+        return all(await self.call_utility_all_async("wake_up", tags))
+
+    async def is_sleeping_async(self) -> bool:
+        return await self.call_utility_consensus_async("is_sleeping")
+
+    async def execute_dummy_batch_async(self) -> None:
+        await self.call_utility_async("execute_dummy_batch")
+
+    async def set_weight_version_async(self, weight_version: str) -> None:
+        await self.call_utility_async("set_weight_version", weight_version)
+
+    async def get_weight_version_async(self) -> str:
+        return await self.call_utility_consensus_async("get_weight_version")
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        await self.call_utility_async("save_sharded_state", path, pattern, max_size)
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return await self.call_utility_async(
+            "collective_rpc", method, timeout, args, kwargs
+        )
+
+    async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
+        per_engine = await self.call_utility_all_async("compute_weight_checksums")
+        return [worker for workers in per_engine for worker in workers]
+
+
+class DPAsyncMPClient(AsyncMPClient):
+    """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
+    EngineCore. Assumes external load-balancing by default."""
+
+    def __init__(
+        self,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+    ):
+        super().__init__(
+            irwkv_config,
+            executor_class,
+            log_stats,
+            client_addresses,
+            client_count,
+            client_index,
+            renderer,
+        )
+
+        # List of [waiting, running, kv_cache_usage] per engine.
+        # Used only by DPLBAsyncMPClient subclass.
+        self.lb_engines: list[list[int | float]] = [
+            [0, 0, 0.0] for _ in self.core_engines
+        ]
+
+        try:
+            # If we are running in an asyncio event loop, start the stats task.
+            # Otherwise, it will be started lazily.
+            asyncio.get_running_loop()
+            self._ensure_stats_update_task()
+        except RuntimeError:
+            pass
+
+    def dp_engines_running(self) -> bool:
+        return any(engine[0] > 0 or engine[1] > 0 for engine in self.lb_engines)
+
+    def _ensure_stats_update_task(self):
+        resources = self.resources
+        if resources.stats_update_task is not None:
+            return
+
+        assert self.stats_update_address is not None
+        stats_addr: str = self.stats_update_address
+        assert len(self.engine_ranks_managed) > 0
+
+        async def run_engine_stats_update_task():
+            with (
+                make_zmq_socket(self.ctx, stats_addr, zmq.XSUB, linger=0) as socket,
+            ):
+                assert isinstance(socket, zmq.asyncio.Socket)
+                self.resources.stats_update_socket = socket
+                # Send subscription message.
+                await socket.send(b"\x01")
+
+                poller = zmq.asyncio.Poller()
+                poller.register(socket, zmq.POLLIN)
+
+                while True:
+                    await poller.poll()
+
+                    buf = None
+                    while True:
+                        # Drain all stats events (we only care about latest).
+                        future: asyncio.Future[bytes] = socket.recv(flags=zmq.NOBLOCK)
+                        if isinstance(future.exception(), zmq.Again):
+                            break
+                        buf = future.result()
+                    if buf is None:
+                        continue
+
+                    # Update local load-balancing state.
+                    counts = msgspec.msgpack.decode(buf)
+                    # Counts are global from the coordinator. Slice to get the
+                    # cores managed by this client.
+                    ranks = self.engine_ranks_managed
+                    count_slice = slice(ranks[0], ranks[-1] + 1)
+                    sliced_counts = counts[count_slice]
+                    self.lb_engines = sliced_counts
+                    logger.debug("Received counts: %s (%s)", sliced_counts, count_slice)
+
+        resources.stats_update_task = asyncio.create_task(
+            run_engine_stats_update_task()
+        )
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        self._ensure_stats_update_task()
+
+        request.client_index = self.client_index
+
+        chosen_engine = self.get_core_engine_for_request(request)
+        to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+
+        await to_await
+
+        self._ensure_output_queue_task()
+
+    def get_core_engine_for_request(self, request: EngineCoreRequest):
+        return self.core_engine
+
+
+class DPLBAsyncMPClient(DPAsyncMPClient):
+    """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
+    EngineCore. Load-balances between multiple engine processes."""
+
+    def __init__(
+        self,
+        irwkv_config: IrwkvConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+    ):
+        self.client_count = client_count
+
+        # To route aborts to the correct engine.
+        self.reqs_in_flight: dict[str, EngineIdentity] = {}
+
+        # Exact per-engine count of this client's unfinished requests.
+        self.engine_inflight: Counter[EngineIdentity] = Counter()
+
+        super().__init__(
+            irwkv_config,
+            executor_class,
+            log_stats,
+            client_addresses,
+            client_count,
+            client_index,
+            renderer,
+        )
+
+        assert len(self.core_engines) > 1
+
+        self.eng_start_index = (
+            len(self.core_engines) * self.client_index
+        ) // client_count
+
+    def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
+        if (engine := self.reqs_in_flight.get(request.request_id)) is not None:
+            # This is for streaming-input session affinity.
+            return engine
+
+        # Engines are in rank order.
+        if (eng_index := request.data_parallel_rank) is None:
+            current_counts = self.lb_engines
+            # TODO use P2C alg for larger DP sizes
+            num_engines = len(current_counts)
+            min_score: float = sys.maxsize
+            eng_index = 0
+            for i in range(num_engines):
+                # Start from client_index to help with balancing when engines
+                # are empty.
+                idx = (self.eng_start_index + i) % num_engines
+                waiting, running, kv_cache_usage = current_counts[idx]
+                # Estimate engine load as the greater of the coordinator's
+                # latest (waiting + running) snapshot and this client's own
+                # in-flight count (scaled by the number of clients). The
+                # in-flight floor is exact and can't be erased by a snapshot
+                # rebind, so a burst spreads round-robin even when snapshots
+                # race with routing decisions; the snapshot raises the score
+                # when other clients or stale requests load the engine.
+                inflight = self.engine_inflight[self.core_engines[idx]]
+                score: float = max(self.client_count * inflight, waiting + running)
+                if waiting:
+                    # Waiting requests are penalized in proportion to KV cache
+                    # pressure: a queue on a KV-bound engine drains slowly, so
+                    # new requests should strongly prefer other engines. With
+                    # low KV usage the queue is transient (e.g. mid-burst) and
+                    # the penalty stays off, preserving exact round-robin.
+                    # Ramps from 0 at <=50% usage to 3x waiting at 100%.
+                    score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+                if score < min_score:
+                    min_score = score
+                    eng_index = idx
+            # Increment local waiting count for better balancing between stats
+            # updates from the coordinator (which happen every 100ms).
+            current_counts[eng_index][0] += self.client_count
+            # Rotate the scan start so that ties (equal scores, e.g. right
+            # after a coordinator stats reset when engines look equally loaded)
+            # don't systematically favor the same engine. This removes the
+            # fixed tie-break bias without affecting load-aware decisions when
+            # scores actually differ.
+            self.eng_start_index = (self.eng_start_index + 1) % num_engines
+
+        chosen_engine = self.core_engines[eng_index]
+        # Record which engine is chosen for this request, to handle aborts.
+        self.reqs_in_flight[request.request_id] = chosen_engine
+        self.engine_inflight[chosen_engine] += 1
+        return chosen_engine
+
+    async def call_utility_async(self, method: str, *args) -> Any:
+        # Only the result from the first engine is returned.
+        return (await self.call_utility_all_async(method, *args))[0]
+
+    @staticmethod
+    async def process_engine_outputs(
+        self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
+    ):
+        if outputs.finished_requests and self.reqs_in_flight:
+            for req_id in outputs.finished_requests:
+                if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
+                    self.engine_inflight[engine] -= 1
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        if not request_ids or self.resources.engine_dead:
+            return
+
+        if len(request_ids) == 1:
+            # Fast-path common case.
+            if engine := self.reqs_in_flight.get(request_ids[0]):
+                await self._abort_requests(request_ids, engine)
+            return
+
+        by_engine = defaultdict[EngineIdentity, list[str]](list)
+        for req_id in request_ids:
+            if engine := self.reqs_in_flight.get(req_id):
+                by_engine[engine].append(req_id)
+        for engine, req_ids in by_engine.items():
+            await self._abort_requests(req_ids, engine)
+
+    async def _abort_requests(
+        self, request_ids: list[str], engine: EngineIdentity
+    ) -> None:
+        await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)

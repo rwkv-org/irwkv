@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import subprocess
+
+import pytest
+
+MODEL_NAME = "rwkv-rs/rwkv7-g1-st"
+
+
+@pytest.mark.benchmark
+def test_bench_latency():
+    command = [
+        "irwkv",
+        "bench",
+        "latency",
+        "--model",
+        MODEL_NAME,
+        "--input-len",
+        "32",
+        "--output-len",
+        "1",
+        "--enforce-eager",
+        "--load-format",
+        "dummy",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, f"Benchmark failed: {result.stderr}"

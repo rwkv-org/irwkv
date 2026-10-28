@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
+import time
+from concurrent.futures import Future
+
+import pytest
+from transformers import AutoTokenizer
+
+from irwkv.config import IrwkvConfig, StructuredOutputsConfig
+from irwkv.config.model import ModelConfig
+from irwkv.config.parallel import ParallelConfig
+from irwkv.sampling_params import SamplingParams, StructuredOutputsParams
+from irwkv.v1.request import Request
+from irwkv.v1.structured_output import StructuredOutputManager
+from irwkv.v1.structured_output.backend_guidance import (
+    GuidanceBackend,
+    process_for_additional_properties,
+)
+from irwkv.v1.structured_output.backend_types import StructuredOutputOptions
+
+TOKENIZER = os.environ.get("IRWKV_RWKV_TEST_MODEL", "rwkv-rs/rwkv7-g1-st")
+
+
+def test_backend_guidance_rollback_terminated():
+    # Test that the backend guidance successfully rollbacks from a
+    # terminated state. This can happen with speculative decoding,
+    # where the draft model proposes EOS and it is verified by the
+    # guidance backend. In that case we are in a stopped state, but
+    # it should be reverted in case EOS is not accepted by the target
+    # model.
+    structured_outputs_config = StructuredOutputsConfig(backend="guidance")
+    irwkv_config = IrwkvConfig(structured_outputs_config=structured_outputs_config)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    backend = GuidanceBackend(
+        irwkv_config,
+        tokenizer=tokenizer,
+        vocab_size=len(tokenizer),
+    )
+
+    grammar = backend.compile_grammar(
+        StructuredOutputOptions.JSON, '{"type": "object"}'
+    )
+
+    prompt = tokenizer.encode('{"a": "b"}', add_special_tokens=False)
+    assert len(prompt) > 1
+    dummy_wrong = tokenizer.encode('{"a"}', add_special_tokens=False)
+    for token in prompt:
+        assert grammar.accept_tokens("", [token])
+    assert not grammar.is_terminated()
+    assert grammar.accept_tokens("", [tokenizer.eos_token_id])
+    assert grammar.is_terminated()
+    # Giving any other token should also be accepted
+    assert grammar.accept_tokens("", dummy_wrong)
+    # Rollback is done from where state was terminated, so from '}' not EOS
+    grammar.rollback(len(prompt) - 1)
+    assert not grammar.is_terminated()
+    assert grammar.validate_tokens([tokenizer.eos_token_id]) == []
+    assert grammar.validate_tokens(dummy_wrong) != dummy_wrong
+    assert grammar.accept_tokens("", prompt[1:])
+    assert not grammar.is_terminated()
+    assert grammar.accept_tokens("", [tokenizer.eos_token_id])
+    assert grammar.is_terminated()
+    # Rollback of <= 0 should not change the terminated state
+    grammar.rollback(0)
+    assert grammar.is_terminated()
+    grammar.rollback(-1)
+    assert grammar.is_terminated()
+
+
+@pytest.mark.parametrize("async_grammar", [True, False])
+def test_grammar_init_async_and_sync(async_grammar):
+    """Test grammar initialization works correctly in both async and sync modes.
+
+    This test validates that the distributed_executor_backend config option
+    correctly controls whether grammar compilation happens asynchronously
+    (via executor.submit) or synchronously. When set to "external_launcher",
+    grammar compilation is synchronous to avoid deadlocks.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    prompt = tokenizer.encode('{"a": "b"}', add_special_tokens=False)
+
+    # Use "external_launcher" for sync mode, None for async mode
+    executor_backend = None if async_grammar else "external_launcher"
+    irwkv_config = IrwkvConfig(
+        model_config=ModelConfig(model=TOKENIZER, tokenizer=TOKENIZER),
+        structured_outputs_config=StructuredOutputsConfig(backend="guidance"),
+        parallel_config=ParallelConfig(distributed_executor_backend=executor_backend),
+    )
+    structured_output_manager = StructuredOutputManager(irwkv_config)
+
+    sampling_params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(
+            json='{"type": "object"}',
+        ),
+    )
+    sampling_params.structured_outputs._backend = "guidance"  # type: ignore[union-attr]
+    sampling_params.update_from_generation_config({}, tokenizer.eos_token_id)
+
+    request = Request(
+        "test_request",
+        prompt_token_ids=prompt,
+        sampling_params=sampling_params,
+    )
+
+    structured_output_manager.grammar_init(request)
+
+    # Check the internal _grammar type immediately after init
+    # Before _check_grammar_completion is called, async mode should have a Future
+    assert request.structured_output_request is not None
+    raw_grammar = request.structured_output_request._grammar
+    if async_grammar:
+        assert isinstance(raw_grammar, Future), (
+            "Async mode should store a Future before completion"
+        )
+    else:
+        assert not isinstance(raw_grammar, Future), (
+            "Sync mode should store the grammar directly, not a Future"
+        )
+
+    # Wait for grammar to be ready (handles both async and sync cases)
+    start_time = time.time()
+    while not request.structured_output_request._check_grammar_completion():
+        if time.time() - start_time > 5:  # 5-second timeout
+            pytest.fail("Grammar compilation timed out")
+        time.sleep(0.01)
+
+    # After completion, _grammar should no longer be a Future
+    assert not isinstance(request.structured_output_request._grammar, Future)
+
+    # Verify grammar is properly initialized and functional
+    grammar = request.structured_output_request.grammar
+    assert grammar is not None and not isinstance(grammar, Exception)
+    assert not grammar.is_terminated()
+
+    # Verify the grammar can accept valid tokens
+    assert grammar.accept_tokens(request.request_id, prompt)
+
+
+def test_process_for_additional_properties_preserves_literals() -> None:
+    """Literal values under const/enum/default/examples must not be rewritten
+    when they contain a 'properties' or 'patternProperties' key (#58695)."""
+    feature = {
+        "type": "Feature",
+        "geometry": None,
+        "properties": {"name": "HQ"},
+        "patternProperties": {"^x": "y"},
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "const_field": {"const": feature},
+            "enum_field": {"enum": [feature]},
+            "default_field": {"type": "object", "default": feature},
+            "examples_field": {"type": "object", "examples": [feature]},
+            "properties": {"type": "string"},
+            "const": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+            },
+        },
+        "$defs": {
+            "item": {
+                "type": "object",
+                "properties": {"label": {"type": "string"}},
+            }
+        },
+    }
+
+    processed = process_for_additional_properties(schema)
+
+    assert processed["additionalProperties"] is False
+    assert processed["$defs"]["item"]["additionalProperties"] is False
+    assert processed["properties"]["const"]["additionalProperties"] is False
+    assert "additionalProperties" not in processed["properties"]
+    assert processed["properties"]["const_field"]["const"] == feature
+    assert processed["properties"]["enum_field"]["enum"] == [feature]
+    assert processed["properties"]["default_field"]["default"] == feature
+    assert processed["properties"]["examples_field"]["examples"] == [feature]
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+def test_disable_additional_properties_accepts_literal_with_properties_key(
+    keyword: str,
+) -> None:
+    """GuidanceBackend with disable_additional_properties=True must accept the
+    original literal value under const/enum and reject injected
+    additionalProperties (#58695)."""
+    feature = {"type": "Feature", "geometry": None, "properties": {"name": "HQ"}}
+    rewritten = {**feature, "additionalProperties": False}
+    schema = {keyword: feature if keyword == "const" else [feature]}
+
+    irwkv_config = IrwkvConfig(
+        structured_outputs_config=StructuredOutputsConfig(
+            backend="guidance",
+            disable_additional_properties=True,
+        )
+    )
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(
+        irwkv_config,
+        tokenizer=tokenizer,
+        vocab_size=len(tokenizer),
+    )
+    grammar = backend.compile_grammar(
+        StructuredOutputOptions.JSON,
+        json.dumps(schema),
+    )
+
+    valid_tokens = tokenizer.encode(json.dumps(feature), add_special_tokens=False) + [
+        tokenizer.eos_token_id
+    ]
+    rewritten_tokens = tokenizer.encode(
+        json.dumps(rewritten), add_special_tokens=False
+    ) + [tokenizer.eos_token_id]
+
+    assert grammar.validate_tokens(valid_tokens) == valid_tokens
+    assert grammar.validate_tokens(rewritten_tokens) != rewritten_tokens

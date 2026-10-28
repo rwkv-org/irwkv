@@ -1,0 +1,43 @@
+[package]
+name = "irwkv-cmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "irwkv-rs"
+path = "src/main.rs"
+
+[features]
+default = []
+native-tls-vendored = ["dep:native-tls-vendored"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+educe.workspace = true
+itertools.workspace = true
+mimalloc.workspace = true
+native-tls-vendored = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror-ext.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+irwkv-bench.workspace = true
+irwkv-build-info.workspace = true
+irwkv-chat.workspace = true
+irwkv-engine-core-client.workspace = true
+irwkv-managed-engine.workspace = true
+irwkv-server.workspace = true
+irwkv-text.workspace = true
+irwkv-tracing.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true
+
+[lints]
+workspace = true

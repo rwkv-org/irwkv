@@ -1,0 +1,11 @@
+-r ../rwkv.txt
+
+pytest
+pytest-asyncio
+pytest-cov
+pytest-forked
+pytest-rerunfailures
+pytest-shard
+pytest-timeout
+httpx
+tblib

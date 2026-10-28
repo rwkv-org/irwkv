@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+use irwkv_engine_core_client::protocol::multimodal::MmFeatures;
+use irwkv_text::{Prompt, TextDecodeOptions, TextRequest};
+
+use super::types::GenerateRequest;
+use super::validate;
+use crate::error::ApiError;
+use crate::utils::{ResolvedRequestContext, merge_ec_transfer_params, merge_kv_transfer_params};
+
+/// Lowered generate request plus the response request ID.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PreparedRequest {
+    pub request_id: String,
+    pub text_request: TextRequest,
+    pub stream: bool,
+    /// Public response rendering options for route-layer helpers.
+    pub options: ResponseOptions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct ResponseOptions {
+    /// Whether the caller asked for the final streamed usage chunk.
+    pub include_usage: bool,
+    /// Whether the caller asked for usage on every streamed chunk.
+    pub include_continuous_usage: bool,
+    /// Requested output logprobs (`sampling_params.logprobs`): `None` omits
+    /// them, `Some(n)` returns `max(n, 1)` candidates per position, `Some(-1)`
+    /// all of them.
+    pub logprobs: Option<i32>,
+    /// Whether the caller requested top-level prompt logprobs.
+    pub include_prompt_logprobs: bool,
+    /// Whether the caller requested final prompt token metadata.
+    pub return_token_ids: bool,
+}
+
+/// Validate and lower one raw generate request into the internal
+/// text-generation format.
+pub(super) fn prepare_generate_request(
+    request: GenerateRequest,
+    served_model_names: &[String],
+    ctx: ResolvedRequestContext,
+    mm_features: Option<MmFeatures>,
+) -> Result<PreparedRequest, ApiError> {
+    validate::validate_request_compat(&request, served_model_names)?;
+
+    let stream = request.stream;
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .and_then(|options| options.include_usage)
+        .unwrap_or(false);
+    let include_continuous_usage = include_usage
+        && request
+            .stream_options
+            .as_ref()
+            .and_then(|options| options.continuous_usage_stats)
+            .unwrap_or(false);
+    let logprobs = request.sampling_params.inner.logprobs;
+    let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
+    let return_token_ids = request.return_token_ids.unwrap_or(false);
+    let mut sampling_params = request.sampling_params.inner;
+    sampling_params.irwkv_xargs = merge_kv_transfer_params(
+        sampling_params.irwkv_xargs,
+        request.kv_transfer_params.as_ref(),
+    );
+    sampling_params.irwkv_xargs = merge_ec_transfer_params(
+        sampling_params.irwkv_xargs,
+        request.ec_transfer_params.as_ref(),
+    );
+
+    let text_request = TextRequest {
+        use_model_stop_strings: true,
+        request_id: ctx.request_id.clone(),
+        prompt: Prompt::TokenIds(request.token_ids),
+        mm_features,
+        sampling_params,
+        decode_options: TextDecodeOptions::default(),
+        intermediate: false,
+        prompt_truncation: None,
+        priority: request.priority,
+        cache_salt: request.cache_salt,
+        add_special_tokens: false,
+        data_parallel_rank: ctx.data_parallel_rank,
+        session_id: ctx.session_id,
+        kv_hints: None,
+        reasoning_parser_kwargs: request.reasoning_parser_kwargs.unwrap_or_default(),
+        reasoning_ended: request.reasoning_ended,
+        arrival_time: None,
+    };
+
+    Ok(PreparedRequest {
+        request_id: ctx.request_id,
+        text_request,
+        stream,
+        options: ResponseOptions {
+            include_usage,
+            include_continuous_usage,
+            logprobs,
+            include_prompt_logprobs,
+            return_token_ids,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use irwkv_text::Prompt;
+    use serde_json::json;
+
+    use super::prepare_generate_request;
+    use crate::routes::inference::generate::types::GenerateRequest;
+    use crate::utils::ResolvedRequestContext;
+
+    fn served(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prepare_generate_request_maps_token_prompt_and_sampling_params() {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22, 33],
+            "priority": -3,
+            "cache_salt": "salt",
+            "sampling_params": {
+                "max_tokens": 7,
+                "logprobs": 2,
+                "prompt_logprobs": 1,
+                "ignore_eos": true
+            },
+            "kv_transfer_params": {
+                "connector": "x"
+            }
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_generate_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            None,
+        )
+        .expect("prepare");
+
+        assert_eq!(
+            prepared.text_request.prompt,
+            Prompt::TokenIds(vec![11, 22, 33])
+        );
+        assert_eq!(prepared.text_request.sampling_params.max_tokens, Some(7));
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(2));
+        assert_eq!(
+            prepared.text_request.sampling_params.prompt_logprobs,
+            Some(1)
+        );
+        assert!(prepared.text_request.sampling_params.ignore_eos);
+        assert_eq!(prepared.text_request.priority, -3);
+        assert_eq!(prepared.text_request.cache_salt.as_deref(), Some("salt"));
+        assert_eq!(
+            prepared
+                .text_request
+                .sampling_params
+                .irwkv_xargs
+                .and_then(|mut xargs| xargs.remove("kv_transfer_params")),
+            Some(json!({"connector": "x"}))
+        );
+    }
+
+    #[test]
+    fn prepare_generate_request_preserves_watermarking_defaults_and_opt_out() {
+        for watermarking in [None, Some(true), Some(false)] {
+            let mut body = json!({
+                "token_ids": [11, 22],
+                "sampling_params": {}
+            });
+            if let Some(watermarking) = watermarking {
+                body["sampling_params"]["watermarking"] = json!(watermarking);
+            }
+            let prepared = prepare_generate_request(
+                serde_json::from_value(body).expect("parse request"),
+                &served(&["test-model"]),
+                ResolvedRequestContext::default(),
+                None,
+            )
+            .expect("prepare request");
+            assert_eq!(
+                prepared.text_request.sampling_params.watermarking,
+                watermarking.unwrap_or(true)
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_generate_request_forwards_thinking_token_budget() {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22, 33],
+            "sampling_params": {
+                "thinking_token_budget": 64
+            }
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_generate_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            None,
+        )
+        .expect("prepare");
+
+        // The raw inference route shares `irwkv_text::SamplingParams`, so the
+        // field is carried through to lowering exactly like the OpenAI routes
+        // (normalization/validation then happens in `lower_sampling_params`).
+        assert_eq!(
+            prepared.text_request.sampling_params.thinking_token_budget,
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn prepare_generate_request_forwards_reasoning_controls() {
+        for (controls, expected) in [
+            (json!({}), (json!({"chat_template_kwargs": {}}), None)),
+            (
+                json!({
+                    "reasoning_ended": false,
+                    "reasoning_parser_kwargs": {
+                        "chat_template_kwargs": {"enable_thinking": true}
+                    }
+                }),
+                (
+                    json!({"chat_template_kwargs": {"enable_thinking": true}}),
+                    Some(false),
+                ),
+            ),
+            (
+                json!({"reasoning_ended": true, "reasoning_parser_kwargs": {}}),
+                (json!({"chat_template_kwargs": {}}), Some(true)),
+            ),
+        ] {
+            let mut body = json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "token_ids": [11, 22, 33],
+                "sampling_params": {}
+            });
+            body.as_object_mut().unwrap().extend(controls.as_object().unwrap().clone());
+            let request: GenerateRequest = serde_json::from_value(body).expect("parse request");
+
+            let prepared = prepare_generate_request(
+                request,
+                &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                ResolvedRequestContext::default(),
+                None,
+            )
+            .expect("prepare");
+
+            assert_eq!(
+                (
+                    serde_json::to_value(&prepared.text_request.reasoning_parser_kwargs).unwrap(),
+                    prepared.text_request.reasoning_ended,
+                ),
+                expected,
+                "controls: {controls}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_generate_request_gates_continuous_usage_on_include_usage() {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "stream": true,
+            "stream_options": {
+                "continuous_usage_stats": true
+            },
+            "sampling_params": {}
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_generate_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            None,
+        )
+        .expect("prepare");
+
+        assert!(!prepared.options.include_usage);
+        assert!(!prepared.options.include_continuous_usage);
+    }
+}

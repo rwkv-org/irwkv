@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import openai
+import pytest
+import pytest_asyncio
+
+from tests.utils import RemoteOpenAIServer
+
+MODEL_NAME = "rwkv-rs/rwkv7-g1-st"
+
+
+@pytest.fixture(scope="module")
+def chat_server_with_force_include_usage():
+    args = [
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "128",
+        "--enforce-eager",
+        "--max-num-seqs",
+        "4",
+        "--enable-force-include-usage",
+    ]
+
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+        yield remote_server
+
+
+@pytest_asyncio.fixture
+async def chat_client_with_force_include_usage(chat_server_with_force_include_usage):
+    async with chat_server_with_force_include_usage.get_async_client() as async_client:
+        yield async_client
+
+
+@pytest.mark.asyncio
+async def test_chat_with_enable_force_include_usage(
+    chat_client_with_force_include_usage: openai.AsyncOpenAI,
+):
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the capital of France?"},
+    ]
+
+    stream = await chat_client_with_force_include_usage.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        max_completion_tokens=10,
+        extra_body=dict(min_tokens=10),
+        temperature=0.0,
+        stream=True,
+    )
+    last_completion_tokens = 0
+    async for chunk in stream:
+        assert chunk.usage.prompt_tokens >= 0
+        assert (
+            last_completion_tokens == 0
+            or chunk.usage.completion_tokens > last_completion_tokens
+            or (
+                not chunk.choices
+                and chunk.usage.completion_tokens == last_completion_tokens
+            )
+        )
+        assert chunk.usage.total_tokens == (
+            chunk.usage.prompt_tokens + chunk.usage.completion_tokens
+        )
+        last_completion_tokens = chunk.usage.completion_tokens

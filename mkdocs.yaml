@@ -1,0 +1,18 @@
+site_name: irwkv
+exclude_docs: |
+  /*
+  !/README.md
+  !/models/
+  /models/*
+  !/models/rwkv.md
+nav:
+  - Home: README.md
+  - RWKV-7: models/rwkv.md
+theme:
+  name: material
+plugins:
+  - search
+markdown_extensions:
+  - tables
+  - fenced_code
+  - attr_list

@@ -1,0 +1,265 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import enum
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import msgspec
+import torch
+
+from irwkv.config.kv_events import KVEventsConfig
+from irwkv.multimodal.inputs import MultiModalFeatureSpec
+from irwkv.sampling_params import SamplingParams
+from irwkv.v1.kv_hints import KvHintsEnvelope
+from irwkv.v1.metrics.stats import (
+    PrefillStats,
+    SchedulerStats,
+)
+from irwkv.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
+from irwkv.v1.serial_utils import UtilityResult
+
+# Type for pause_generation mode parameter.
+# - "abort": Abort all in-flight requests immediately (default).
+# - "wait": Wait for in-flight requests to complete before pausing.
+# - "keep": Freeze requests in queue; they resume on resume_generation().
+PauseMode = Literal["abort", "wait", "keep"]
+
+# These are possible values of RequestOutput.finish_reason,
+# so form part of the external API.
+FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
+
+
+class FinishReason(enum.IntEnum):
+    """Reason a request finished - stop, length, abort, error, or repetition.
+
+    Int rather than Str for more compact serialization.
+
+    stop - a stop string was emitted
+    length - max_tokens was consumed, or max_model_len was reached
+    abort - aborted by client
+    error - retryable request-level internal error (e.g., KV load failure).
+            Invariant: always converted to 500 Internal Server Error.
+    repetition - repetitive token pattern detected (hallucination)
+
+    """
+
+    STOP = 0
+    LENGTH = 1
+    ABORT = 2
+    ERROR = 3
+    REPETITION = 4
+
+    def __str__(self):
+        return FINISH_REASON_STRINGS[self.value]
+
+
+@dataclass
+class EngineCoreReadyResponse:
+    """Sent from EngineCore to each frontend at the end of engine startup.
+
+    Contains post-initialization config that may differ from the original
+    values (e.g. max_model_len after KV cache auto-fitting).
+    """
+
+    max_model_len: int
+    num_gpu_blocks: int
+    block_size: int
+    dp_stats_address: str | None
+    dtype: str
+    irwkv_version: str
+    world_size: int
+    data_parallel_size: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    decode_context_parallel_size: int
+    data_parallel_rank: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    instance_id: str
+    mamba_block_size: int | None = None
+    # KV cache capacity (None for encoder-only/attention-free models).
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
+    kv_events_config: KVEventsConfig | None = None
+    weight_transfer_backend: str | None = None
+    enable_sleep_mode: bool = False
+    # Full-attention block size in tokens after initialization, or unavailable.
+    effective_attention_block_size: int | None = None
+
+
+class EngineCoreRequest(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    request_id: str
+    prompt_token_ids: list[int] | None
+    mm_features: list[MultiModalFeatureSpec] | None
+    sampling_params: SamplingParams | None
+    arrival_time: float
+    cache_salt: str | None
+    data_parallel_rank: int | None
+    prompt_embeds: torch.Tensor | None = None
+
+    # Per-position mask for mixed-mode inputs (e.g chat completion with
+    # prompt_embeds content parts). `True` means the position is a real
+    # token ID; `False` means the position uses a pre-computed entry from
+    # `prompt_embeds`. `None` for pure-tokens and pure-embeds requests.
+    prompt_is_token_ids: list[bool] | None = None
+
+    # Index of the client, used to ensure outputs are sent back to the same
+    # client for this request when scaling out the front-end.
+    client_index: int = 0
+
+    priority: int = 0
+
+    trace_headers: Mapping[str, str] | None = None
+    resumable: bool = False
+
+    # The user-provided request ID. This field is set internally,
+    # copied from the provided request_id that's originally assigned
+    # to the request_id field, see InputProcessor.assign_request_id().
+    # Used in outputs and to support abort(req_id, internal=False).
+    external_req_id: str | None = None
+
+    reasoning_ended: bool | None = None
+    reasoning_parser_kwargs: dict[str, Any] | None = None
+
+    # If True, the request should be added to the scheduler's waiting queue
+    # and immediately aborted, so connector-side cleanup runs via the standard
+    # request_finished hook. Used to free P-side prefill blocks when a
+    # KV-transfer request is rejected on the D node before engine admission.
+    abort_immediately: bool = False
+
+    session_id: str | None = None
+    kv_hints: KvHintsEnvelope | None = None
+
+    @property
+    def params(self) -> SamplingParams:
+        assert self.sampling_params is not None
+        return self.sampling_params
+
+
+class EngineCoreEventType(enum.IntEnum):
+    """The type of engine core request event."""
+
+    QUEUED = 1
+    SCHEDULED = 2
+    PREEMPTED = 3
+
+
+class EngineCoreEvent(msgspec.Struct):
+    """A timestamped engine core event associated with a request.
+
+    The timestamp is a monotonic timestamp and is used by the engine
+    frontend to calculate intervals between engine core events. These
+    timestamps should not be compared with timestamps from other processes.
+    """
+
+    type: EngineCoreEventType
+    timestamp: float
+
+    @classmethod
+    def new_event(
+        cls, event_type: EngineCoreEventType, timestamp: float | None = None
+    ) -> "EngineCoreEvent":
+        timestamp = time.monotonic() if timestamp is None else timestamp
+        return cls(event_type, timestamp)
+
+
+class EngineCoreOutput(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    request_id: str
+    new_token_ids: list[int]
+
+    new_logprobs: LogprobsLists | None = None
+    new_prompt_logprobs_tensors: LogprobsTensors | None = None
+
+    finish_reason: FinishReason | None = None
+    stop_reason: int | str | None = None
+    events: list[EngineCoreEvent] | None = None
+    kv_transfer_params: dict[str, Any] | None = None
+    ec_transfer_params: dict[str, Any] | None = None
+
+    trace_headers: Mapping[str, str] | None = None
+
+    prefill_stats: PrefillStats | None = None
+
+    # The number of NaNs in logits.
+    # A value greater than 0 indicates that the output is corrupted.
+    num_nans_in_logits: int = 0
+    # Multi-modal hashes missing from the P1 receiver cache (P0/P1 drift; see
+    # `MultiModalCacheMissError`). Non-empty => retryable: the frontend drops these
+    # from its sender cache and the request is resent with the data. Appended last
+    # so `array_like` positional serialization stays backward compatible.
+    mm_cache_miss_hashes: list[str] | None = None
+
+    new_sampling_mask: SamplingMaskLists | None = None
+
+    # Per-request spec-decode acceptance; attached only on the final output.
+    # Appended last so `array_like` positional serialization stays compatible.
+
+    # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
+    prompt_token_id_logprobs: torch.Tensor | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.finish_reason is not None
+
+
+class UtilityOutput(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    call_id: int
+
+    # Non-None implies the call failed, result should be None.
+    failure_message: str | None = None
+    result: UtilityResult | None = None
+
+
+class EngineCoreOutputs(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    # NOTE(Nick): We could consider ways to make this more compact,
+    # e.g. columnwise layout
+
+    engine_index: int = 0
+
+    # [num_reqs]
+    outputs: list[EngineCoreOutput] = []
+    scheduler_stats: SchedulerStats | None = None
+    timestamp: float = 0.0
+
+    utility_output: UtilityOutput | None = None
+    finished_requests: set[str] | None = None
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.monotonic()
+
+
+class EngineCoreRequestType(enum.Enum):
+    """Request types defined as hex byte strings, so it can be sent over sockets
+    without separate encoding step.
+    """
+
+    ADD = b"\x00"
+    ABORT = b"\x01"
+    UTILITY = b"\x03"
+    # Sentinel used within EngineCoreProc.
+    EXECUTOR_FAILED = b"\x04"
+    # Sentinel to wake up input_queue.get() during shutdown.
+    WAKEUP = b"\x05"

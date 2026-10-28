@@ -1,0 +1,10 @@
+include LICENSE
+include requirements/rwkv.txt
+include CMakeLists.txt
+include tools/build_rust.py
+
+recursive-include cmake *
+recursive-include csrc *
+
+recursive-include rust *.rs *.toml *.lock *.proto *.json *.jinja README.md
+prune rust/target
