@@ -122,8 +122,19 @@ These must be standalone `GenerationConfig` documents. Omit
 configuration from the model config and drops the RWKV-only penalty fields.
 
 The default template mode selects Open Think. Setting
-`chat_template_kwargs.rwkv_generation_prompt` to `fake_think` selects Fake
-Think. Supplying tools always selects the Tools profile, regardless of the
+`chat_template_kwargs.fake_cot_mode` to `true` selects Fake Think
+and ends the generation prompt with `<think></think`:
+
+```json
+"chat_template_kwargs": {
+  "fake_cot_mode": true
+}
+```
+
+`fake_cot_mode` defaults to `false`, which selects Open Think. The model's
+`chat_template.jinja` must read `fake_cot_mode` directly. Refresh existing
+model artifacts with the template from `transformers-rwkv/temp/rwkv_chat_template.jinja`.
+Supplying tools always selects the Tools profile, regardless of the
 thinking mode. Explicit request sampling fields override the selected profile.
 
 All six controls are executed by

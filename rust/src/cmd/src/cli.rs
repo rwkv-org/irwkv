@@ -300,7 +300,7 @@ pub struct SharedRuntimeArgs {
     /// request values taking precedence. Useful for setting default
     /// behavior for reasoning models.
     ///
-    /// Example: `{"rwkv_generation_prompt": "fake_think"}` to select the
+    /// Example: `{"fake_cot_mode": true}` to select the
     /// fake-think mode from the RWKV-7 chat template.
     #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
     #[serde(default)]

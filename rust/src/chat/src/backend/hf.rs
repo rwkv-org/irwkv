@@ -141,9 +141,7 @@ impl ChatBackend for HfChatBackend {
         };
         let profile = if !request.tool_context.initial_tools.is_empty() {
             &profiles[2]
-        } else if template_kwargs.get("rwkv_generation_prompt").and_then(|v| v.as_str())
-            == Some("fake_think")
-        {
+        } else if template_kwargs.get("fake_cot_mode").and_then(|v| v.as_bool()) == Some(true) {
             &profiles[1]
         } else {
             &profiles[0]
@@ -352,10 +350,7 @@ mod tests {
         let mut request = request_with_user_text("hello");
         request.sampling_params.temperature = Some(0.2);
         request.decode_options.stop_strings = Some(vec!["user".into()]);
-        let kwargs = HashMap::from([(
-            "rwkv_generation_prompt".to_string(),
-            serde_json::json!("fake_think"),
-        )]);
+        let kwargs = HashMap::from([("fake_cot_mode".to_string(), serde_json::json!(true))]);
         backend.apply_sampling_defaults(&mut request, &kwargs);
         assert_eq!(request.sampling_params.temperature, Some(0.2));
         assert_eq!(request.sampling_params.penalty_decay, Some(0.996));

@@ -343,7 +343,7 @@ async def test_same_response_as_chat_completions(client, tokenizer, messages):
     token_ids = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
-        rwkv_generation_prompt="fake_think",
+        fake_cot_mode=True,
         return_dict=True,  # default with Transformers v5
     ).input_ids
 
@@ -372,7 +372,7 @@ async def test_same_response_as_chat_completions(client, tokenizer, messages):
             "temperature": 0.0,
             "stream": False,
             "ignore_eos": ignore_eos,
-            "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
+            "chat_template_kwargs": {"fake_cot_mode": True},
         }
         completions_resp = await client.post("/v1/chat/completions", json=payload)
         completions_data = completions_resp.json()
@@ -407,7 +407,7 @@ async def test_stop_string_workflow(client, tokenizer, messages):
     token_ids = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
-        rwkv_generation_prompt="fake_think",
+        fake_cot_mode=True,
         return_dict=True,  # default with Transformers v5
     ).input_ids
     payload = {
@@ -459,7 +459,7 @@ async def test_stop_string_workflow(client, tokenizer, messages):
         "temperature": 0.0,
         "stream": False,
         "stop": [stop],
-        "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
+        "chat_template_kwargs": {"fake_cot_mode": True},
     }
     completions_resp = await client.post("/v1/chat/completions", json=payload)
     completions_data = completions_resp.json()
@@ -498,7 +498,7 @@ def _structured_chat_body(messages, **overrides) -> dict:
         "messages": messages,
         "max_tokens": 64,
         "temperature": 0.0,
-        "chat_template_kwargs": {"rwkv_generation_prompt": "open_think"},
+        "chat_template_kwargs": {"fake_cot_mode": False},
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -566,7 +566,7 @@ def _chat_prompt_token_ids(tokenizer, messages) -> list[int]:
     return tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
-        rwkv_generation_prompt="fake_think",
+        fake_cot_mode=True,
         return_dict=True,  # default with Transformers v5
     ).input_ids
 
@@ -600,7 +600,7 @@ async def test_text_mode_matches_chat_completions(client, tokenizer, messages):
         "max_tokens": 24,
         "temperature": 0.0,
         "stream": False,
-        "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"},
+        "chat_template_kwargs": {"fake_cot_mode": True},
     }
     chat_resp = await client.post("/v1/chat/completions", json=payload)
     chat_content = chat_resp.json()["choices"][0]["message"]["content"]

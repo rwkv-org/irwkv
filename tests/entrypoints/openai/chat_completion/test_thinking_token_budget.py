@@ -174,9 +174,7 @@ async def test_streaming_with_thinking_disabled_stays_in_content(
         ],
         "max_tokens": 16,
         "temperature": 0.0,
-        "extra_body": {
-            "chat_template_kwargs": {"rwkv_generation_prompt": "fake_think"}
-        },
+        "extra_body": {"chat_template_kwargs": {"fake_cot_mode": True}},
     }
 
     response = await client.chat.completions.create(**request_kwargs)

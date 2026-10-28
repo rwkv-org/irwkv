@@ -98,8 +98,8 @@ def thinking_llm(irwkv_runner):
         yield weakref.proxy(runner.llm)
 
 
-@pytest.mark.parametrize("generation_prompt", ["open_think", "fake_think"])
-def test_chat_extra_kwargs(thinking_llm, generation_prompt):
+@pytest.mark.parametrize("fake_cot_mode", [None, False, True])
+def test_chat_extra_kwargs(thinking_llm, fake_cot_mode):
     messages = [
         {"role": "system", "content": "You are a helpful assistant"},
         {"role": "user", "content": "What is 1+1?"},
@@ -107,7 +107,9 @@ def test_chat_extra_kwargs(thinking_llm, generation_prompt):
 
     outputs = thinking_llm.chat(
         messages,
-        chat_template_kwargs={"rwkv_generation_prompt": generation_prompt},
+        chat_template_kwargs=(
+            {} if fake_cot_mode is None else {"fake_cot_mode": fake_cot_mode}
+        ),
     )
     assert len(outputs) == 1
 
@@ -115,9 +117,7 @@ def test_chat_extra_kwargs(thinking_llm, generation_prompt):
     assert prompt_token_ids is not None
 
     prompt = thinking_llm.get_tokenizer().decode(prompt_token_ids)
-    expected_suffix = (
-        "<think" if generation_prompt == "open_think" else "<think></think"
-    )
+    expected_suffix = "<think></think" if fake_cot_mode else "<think"
     assert prompt.endswith(expected_suffix)
 
 

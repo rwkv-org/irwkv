@@ -218,7 +218,7 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             return self.default_sampling_params
         if getattr(request, "tools", None):
             return profiles["tools"]
-        if (chat_template_kwargs or {}).get("rwkv_generation_prompt") == "fake_think":
+        if (chat_template_kwargs or {}).get("fake_cot_mode", False) is True:
             return profiles["fake_think"]
         return profiles["open_think"]
 
