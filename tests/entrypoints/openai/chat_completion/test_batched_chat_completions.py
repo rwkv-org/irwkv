@@ -454,7 +454,7 @@ async def test_batched_reasoning_wiring_matches_single_chat() -> None:
         )
 
     conversation = [{"role": "user", "content": "What is the capital of France?"}]
-    chat_template_kwargs = {"rwkv_generation_prompt": "fake_think"}
+    chat_template_kwargs = {"fake_cot_mode": True}
 
     single_engine, single_serving = _build_serving(OpenAIServingChat)
     await single_serving.create_chat_completion(
