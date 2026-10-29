@@ -144,61 +144,12 @@ token state. `--generation-config irwkv` explicitly disables artifact profiles.
 
 ## Context compaction client (experimental)
 
-The [compaction client](../../examples/basic/online_serving/openai_chat_completion_client_with_compaction.py)
-prepares a smaller text chat history through ordinary Chat Completions and
-`/tokenize` requests. It is an opt-in client example, not an engine setting or
-a state-reference API. Summarization is lossy and needs model-specific quality
-evaluation before a caller adopts the candidate history.
-
-The client counts the rendered input using the serving model's chat template,
-reserves answer tokens, keeps leading system/developer instructions and recent
-complete turns, and summarizes older turns in bounded batches. A tool call and
-all its results stay in the same turn. A summary is inserted as assistant
-context, never as a new system instruction. Pass the same tools and template
-arguments when counting and when making the subsequent answer request.
-
-```bash
-uv run --no-project --python .venv/bin/python \
-  examples/basic/online_serving/openai_chat_completion_client_with_compaction.py \
-  --base-url http://localhost:8000 --model served-model \
-  --messages history.json --output candidate-history.json \
-  --target-tokens 8192 --max-tokens 512 --keep-last-turns 2 \
-  --chat-template-kwargs '{"fake_cot_mode": true}'
-```
-
-`history.json` is a JSON array of Chat Completions messages. Inspect the candidate
-before using it as a later request's `messages`; keep the original history.
-The model artifact's template must support the supplied arguments. Requests
-use the same server's tokenizer, with no character-count approximation.
-
-For an application that opts into automatic compaction, add `--generate` to
-send an answer request after preparing the history. The JSON printed to stdout
-then includes the ordinary Chat Completions response under `completion`.
-`--output` contains the prepared input history, without appending that response.
-Use `--tools tools.json` to supply a JSON array of tool definitions; the same
-definitions are included in budget counting and the answer request.
-
-The Python entry point is `ChatContext.create_chat_completion(messages, ...)`.
-It returns `(prepared, completion)`, where `prepared.messages` is the context
-to retain for the next turn. The caller appends the assistant response and any
-tool results before continuing. Under-budget histories are sent unchanged;
-over-budget histories are compacted before the answer request. The final budget
-reserves answer tokens and includes the same tool definitions and template
-arguments as the answer request. Summary and answer requests share the caller's
-cache salt. The caller owns history persistence and tool execution. This example
-uses non-streaming requests and does not retry failed generations.
-
-Empty or truncated summaries, malformed tool exchanges, protected content that
-cannot fit, and summaries that still exceed the final budget are rejected.
-The example does not silently truncate text. It supports plain-text content,
-leading instruction messages, and complete function-tool exchanges. A single
-old turn larger than the summary window is rejected rather than split; a large
-current user message is protected and cannot be reduced by this history policy.
-Multimodal content and instructions interleaved into history are unsupported.
-
-Successful `stop` and a smaller token count do not establish factual fidelity.
-Repeated compaction can compound summary errors. Prefix caching only reuses an
-unchanged token prefix; after compaction, the rewritten suffix is recomputed.
+[openai_chat_completion_client_with_compaction.py](../../examples/basic/online_serving/openai_chat_completion_client_with_compaction.py)
+shows client-side history compaction: when `/tokenize` reports more input
+tokens than `--budget`, older turns are replaced by one model-written summary
+while system messages and the last `--keep-last-turns` turns are kept. Start
+the server with `--reasoning-parser rwkv` so the summary excludes reasoning.
+The summary is lossy, and the rewritten suffix cannot reuse the prefix cache.
 
 ## Pipeline parallelism
 
