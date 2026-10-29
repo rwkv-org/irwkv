@@ -86,6 +86,37 @@ class ChatContext:
         self.model = model
         self.template_kwargs = copy.deepcopy(chat_template_kwargs or {})
 
+    async def create_chat_completion(
+        self, messages, *, max_tokens=512, tools=None, cache_salt=None, **kwargs
+    ):
+        """Prepare the history and send one non-streaming answer request.
+
+        Remaining kwargs configure compact(). Return its result together with
+        the completion response; the caller owns subsequent history updates
+        and tool execution. Failures leave the caller's messages unchanged.
+        """
+        result = await self.compact(
+            messages,
+            max_tokens=max_tokens,
+            tools=tools,
+            cache_salt=cache_salt,
+            **kwargs,
+        )
+        payload = {
+            "model": self.model,
+            "messages": result.messages,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "chat_template_kwargs": self.template_kwargs,
+        }
+        if tools:
+            payload["tools"] = tools
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
+        response = await self.client.post("/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        return result, response.json()
+
     async def _count(self, messages, tools=None):
         payload = {
             "model": self.model,
@@ -197,9 +228,13 @@ class ChatContext:
             choice = response.json()["choices"][0]
             message = choice["message"]
             text = message.get("content")
+            if choice.get("finish_reason") != "stop":
+                raise CompactionError(
+                    "Summary did not finish: "
+                    f"finish_reason={choice.get('finish_reason')!r}"
+                )
             if (
-                choice.get("finish_reason") != "stop"
-                or not isinstance(text, str)
+                not isinstance(text, str)
                 or not text.strip()
                 or message.get("tool_calls")
                 or message.get("refusal")
@@ -216,41 +251,49 @@ class ChatContext:
 
 
 async def main(args):
-    if args.messages.resolve() == args.output.resolve() or (
-        args.output.exists() and args.messages.samefile(args.output)
+    inputs = [args.messages] + ([args.tools] if args.tools else [])
+    if any(
+        source.resolve() == args.output.resolve()
+        or (args.output.exists() and source.samefile(args.output))
+        for source in inputs
     ):
-        raise CompactionError(
-            "Write the candidate to a different file from the history"
-        )
+        raise CompactionError("Write the candidate to a different file from the inputs")
     messages = json.loads(args.messages.read_text())
+    tools = json.loads(args.tools.read_text()) if args.tools else None
     headers = {"Authorization": f"Bearer {args.api_key}"}
+    completion = None
     async with httpx.AsyncClient(
         base_url=args.base_url, headers=headers, timeout=300
     ) as client:
         context = ChatContext(
             client, args.model, chat_template_kwargs=args.chat_template_kwargs
         )
-        result = await context.compact(
-            messages,
+        options = dict(
             target_tokens=args.target_tokens,
             max_tokens=args.max_tokens,
             keep_last_turns=args.keep_last_turns,
             summary_window=args.summary_window,
             summary_max_tokens=args.summary_max_tokens,
             cache_salt=args.cache_salt,
+            tools=tools,
         )
+        if args.generate:
+            result, completion = await context.create_chat_completion(
+                messages, **options
+            )
+        else:
+            result = await context.compact(messages, **options)
     args.output.write_text(
         json.dumps(result.messages, ensure_ascii=False, indent=2) + "\n"
     )
-    print(
-        json.dumps(
-            {
-                "input_tokens_before": result.input_tokens_before,
-                "input_tokens_after": result.input_tokens_after,
-                "summary_calls": result.summary_calls,
-            }
-        )
-    )
+    output = {
+        "input_tokens_before": result.input_tokens_before,
+        "input_tokens_after": result.input_tokens_after,
+        "summary_calls": result.summary_calls,
+    }
+    if completion is not None:
+        output["completion"] = completion
+    print(json.dumps(output, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -260,6 +303,12 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True)
     parser.add_argument("--messages", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tools", type=Path, help="JSON file of tool definitions")
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help="Also send a non-streaming answer request with the prepared history",
+    )
     parser.add_argument("--target-tokens", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--keep-last-turns", type=int, default=2)

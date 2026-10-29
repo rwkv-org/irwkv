@@ -23,7 +23,9 @@ async def test_cli_rejects_overwriting_original_history(tmp_path):
     alias = tmp_path / "alias.json"
     alias.hardlink_to(source)
     with pytest.raises(CompactionError, match="different file"):
-        await compaction.main(SimpleNamespace(messages=source, output=alias))
+        await compaction.main(
+            SimpleNamespace(messages=source, output=alias, tools=None)
+        )
     assert source.read_text() == "[]"
 
 
@@ -266,3 +268,50 @@ async def test_concurrent_compactions_do_not_share_summaries():
     assert "tenant-a" in results[0].messages[2]["content"]
     assert "tenant-b" not in results[0].messages[2]["content"]
     assert "tenant-b" in results[1].messages[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_completion_uses_prepared_history_and_the_counted_request_options():
+    server = Server()
+    original = history()
+    before = copy.deepcopy(original)
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(server.handle)
+    ) as client:
+        prepared, completion = await ChatContext(
+            client, "model", chat_template_kwargs={"fake_cot_mode": True}
+        ).create_chat_completion(
+            original,
+            target_tokens=1500,
+            max_tokens=300,
+            tools=tools,
+            cache_salt="tenant-a",
+        )
+    assert original == before
+    assert prepared.summary_calls == 1 and server.generation_count == 2
+    assert completion["choices"][0]["message"]["content"] == server.summary
+    count_path, counted = server.requests[-2]
+    answer_path, answer = server.requests[-1]
+    assert count_path == "/tokenize" and answer_path == "/v1/chat/completions"
+    assert answer["messages"] == counted["messages"] == prepared.messages
+    assert answer["tools"] == counted["tools"] == tools
+    assert answer["chat_template_kwargs"] == counted["chat_template_kwargs"]
+    assert answer["cache_salt"] == "tenant-a" and answer["max_tokens"] == 300
+    assert prepared.input_tokens_after + answer["max_tokens"] <= 1500
+
+
+@pytest.mark.asyncio
+async def test_failed_compaction_does_not_send_an_answer_or_change_history():
+    server = Server(finish="length")
+    original = history()
+    before = copy.deepcopy(original)
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(server.handle)
+    ) as client:
+        with pytest.raises(CompactionError, match="finish_reason='length'"):
+            await ChatContext(client, "model").create_chat_completion(
+                original, target_tokens=1300, max_tokens=300
+            )
+    assert original == before
+    assert server.generation_count == 1

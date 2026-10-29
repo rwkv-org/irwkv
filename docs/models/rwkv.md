@@ -171,6 +171,23 @@ before using it as a later request's `messages`; keep the original history.
 The model artifact's template must support the supplied arguments. Requests
 use the same server's tokenizer, with no character-count approximation.
 
+For an application that opts into automatic compaction, add `--generate` to
+send an answer request after preparing the history. The JSON printed to stdout
+then includes the ordinary Chat Completions response under `completion`.
+`--output` contains the prepared input history, without appending that response.
+Use `--tools tools.json` to supply a JSON array of tool definitions; the same
+definitions are included in budget counting and the answer request.
+
+The Python entry point is `ChatContext.create_chat_completion(messages, ...)`.
+It returns `(prepared, completion)`, where `prepared.messages` is the context
+to retain for the next turn. The caller appends the assistant response and any
+tool results before continuing. Under-budget histories are sent unchanged;
+over-budget histories are compacted before the answer request. The final budget
+reserves answer tokens and includes the same tool definitions and template
+arguments as the answer request. Summary and answer requests share the caller's
+cache salt. The caller owns history persistence and tool execution. This example
+uses non-streaming requests and does not retry failed generations.
+
 Empty or truncated summaries, malformed tool exchanges, protected content that
 cannot fit, and summaries that still exceed the final budget are rejected.
 The example does not silently truncate text. It supports plain-text content,
