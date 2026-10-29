@@ -58,6 +58,28 @@ To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
 This uses irwkv's state-aligned cache blocks and copies recurrent state at block
 boundaries.
 
+For finer prefix reuse, set `--prefix-match-unit` to a divisor of the state
+block size. For example:
+
+```bash
+irwkv serve <model> \
+  --enable-prefix-caching \
+  --block-size 32 --mamba-block-size 32 --prefix-match-unit 8
+```
+
+With a 73-token prompt, this permits a checkpoint after token 72 instead of
+token 64. A repeated request restores that checkpoint into private state and
+processes the remaining token. Different suffixes can share the checkpoint
+without modifying each other's recurrent state. The physical state block size
+and precision are unchanged. Only checkpoints actually saved by the scheduler
+can be reused; the match unit does not save a snapshot at every token boundary.
+
+Prefix caching reuses exact token prefixes. It does not summarize messages,
+retain an unlimited conversation, or provide a persistent session reference.
+If earlier messages are rewritten or summarized, only an unchanged prefix can
+hit the cache; the new suffix must be computed again. Caches are local to the
+running engine and are lost on restart or reset.
+
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 

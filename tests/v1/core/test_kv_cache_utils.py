@@ -2520,6 +2520,46 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+@pytest.mark.parametrize("match_unit", [None, 1, 8, 32, 3, 64])
+@pytest.mark.parametrize("mamba", [False, True])
+def test_single_group_prefix_match_unit(match_unit, mamba):
+    """Only aligned recurrent states can resume inside a physical block."""
+    spec = (
+        MambaSpec(
+            block_size=32,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        if mamba
+        else FullAttentionSpec(
+            block_size=32, num_kv_heads=1, head_size=1, dtype=torch.float32
+        )
+    )
+    kv_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=32, enable_prefix_caching=True, prefix_match_unit=match_unit
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    if match_unit in (3, 64) or (not mamba and match_unit not in (None, 32)):
+        with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
+            kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
+        return
+
+    sizes = kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
+    assert sizes == (32, match_unit or 32)
+    assert kv_cache_utils.resolve_cache_hit_alignment_tokens(
+        kv_config, config, *sizes
+    ) == (match_unit or 32)
+
+
 def test_resolve_dcp_kv_block_size_unwraps_uniform_type_specs():
     attention = FullAttentionSpec(
         block_size=16,

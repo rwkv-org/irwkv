@@ -546,8 +546,9 @@ class SpecGroup(NamedTuple):
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
-    """KV cache coordinator for hybrid models with multiple KV cache types, and
-    thus multiple kv cache groups.
+    """Coordinate different block sizes or aligned recurrent-state checkpoints.
+
+    Also handles a single Mamba group with hashes finer than its state blocks.
     """
 
     def __init__(
@@ -864,7 +865,9 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
         )
-    if len(kv_cache_config.kv_cache_groups) == 1:
+    if len(kv_cache_config.kv_cache_groups) == 1 and not partial_hash_hits_enabled(
+        kv_cache_config.kv_cache_groups, hash_block_size, dcp_world_size
+    ):
         return UnitaryKVCacheCoordinator(
             kv_cache_config,
             max_model_len,

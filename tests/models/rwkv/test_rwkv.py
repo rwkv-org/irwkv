@@ -1390,11 +1390,11 @@ def test_config_accepts_async_scheduling() -> None:
     not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
     reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
-@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("prefix_match_unit", [None, 32, 8])
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
 def test_real_model_batching_preserves_tokens_and_logprobs(
-    irwkv_runner, prefix_caching, state_dtype, temperature
+    irwkv_runner, prefix_match_unit, state_dtype, temperature
 ) -> None:
     """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
@@ -1410,7 +1410,7 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
         penalty_decay=1,
         detokenize=False,
     )
-    prompt = {"prompt_token_ids": list(range(1, 66))}
+    prompt = {"prompt_token_ids": list(range(1, 74))}
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with irwkv_runner(
@@ -1421,16 +1421,26 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             max_num_seqs=4,
             gpu_memory_utilization=0.8,
             num_gpu_blocks_override=64,
+            block_size=32,
             mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,
-            enable_prefix_caching=prefix_caching,
+            enable_prefix_caching=prefix_match_unit is not None,
+            prefix_match_unit=prefix_match_unit,
             enforce_eager=enforce_eager,
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
         ) as runner:
-            single = runner.llm.generate([prompt], params)[0].outputs[0]
-            mixed = runner.llm.generate(
+            cold = runner.llm.generate([prompt], params)[0]
+            hit = runner.llm.generate(
                 [{"prompt_token_ids": [7, 8, 9]}, prompt], params
-            )[1].outputs[0]
+            )[1]
+            assert cold.num_cached_tokens == 0
+            expected_hit = (
+                72 // prefix_match_unit * prefix_match_unit
+                if prefix_match_unit is not None
+                else 0
+            )
+            assert hit.num_cached_tokens == expected_hit
+            single, mixed = cold.outputs[0], hit.outputs[0]
         assert len(single.token_ids) == 4
         assert mixed.token_ids == single.token_ids
         assert mixed.logprobs == single.logprobs
