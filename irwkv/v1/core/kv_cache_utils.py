@@ -882,7 +882,9 @@ def resolve_cache_hit_alignment_tokens(
     ``scheduler_block_size``.
     """
     groups = kv_cache_config.kv_cache_groups
-    if not irwkv_config.cache_config.enable_prefix_caching or not groups:
+    if not irwkv_config.cache_config.enable_prefix_caching or (
+        len(groups) <= 1 and hash_block_size == scheduler_block_size
+    ):
         return scheduler_block_size
     manager_classes = []
     for group in groups:

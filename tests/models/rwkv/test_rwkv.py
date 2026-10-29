@@ -1410,7 +1410,8 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
         penalty_decay=1,
         detokenize=False,
     )
-    prompt = {"prompt_token_ids": list(range(1, 74))}
+    prompt_token_ids = list(range(1, 74))
+    prompt = {"prompt_token_ids": prompt_token_ids}
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with irwkv_runner(
@@ -1434,8 +1435,10 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
                 [{"prompt_token_ids": [7, 8, 9]}, prompt], params
             )[1]
             assert cold.num_cached_tokens == 0
+            # The last prompt token is always recomputed to produce logits.
+            max_hit = len(prompt_token_ids) - 1
             expected_hit = (
-                72 // prefix_match_unit * prefix_match_unit
+                max_hit // prefix_match_unit * prefix_match_unit
                 if prefix_match_unit is not None
                 else 0
             )
