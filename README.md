@@ -1,8 +1,6 @@
-# irwkv
-
 <div align="center">
-
-**infer-rwkv**
+  
+# infer-rwkv
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
