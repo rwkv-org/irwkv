@@ -25,12 +25,18 @@ from irwkv.model_executor.models.rwkv import (
     _load_flashrwkv2,
 )
 from irwkv.sampling_params import SamplingParams
+from irwkv.utils.hashing import sha256
 from irwkv.v1.attention.backend import AttentionCGSupport
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
     RwkvAttentionMetadata,
     RwkvAttentionMetadataBuilder,
+    RwkvStateSpec,
 )
+from irwkv.v1.core.kv_cache_manager import KVCacheManager
+from irwkv.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from irwkv.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from irwkv.v1.request import Request
 from irwkv.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
 
 
@@ -512,6 +518,69 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     assert torch.equal(resets[0], torch.tensor([9], dtype=torch.int32))
     assert np.array_equal(model_state._state_block_columns, np.array([1]))
     assert np.array_equal(model_state._state_num_computed_tokens, np.array([32]))
+
+
+def _block_hashed_request(request_id: str, token_ids: list[int]) -> Request:
+    params = SamplingParams(max_tokens=64)
+    params.update_from_generation_config({}, eos_token_id=0)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=token_ids,
+        sampling_params=params,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec_cls", "cached_blocks", "continuation_hit"),
+    [(MambaSpec, {0}, 16), (RwkvStateSpec, {0, 2}, 48)],
+)
+def test_align_continuation_resumes_from_latest_committed_state(
+    spec_cls, cached_blocks, continuation_hit
+) -> None:
+    """A finished RWKV turn keeps only its latest committed state, so the next
+    turn resumes there instead of at the previous prompt boundary."""
+    init_none_hash(sha256)
+    spec = spec_cls(
+        block_size=16, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["state"], spec)],
+            prefix_cache_retention_interval=0,
+        ),
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    turn = _block_hashed_request("turn", list(range(1, 21)))
+    for chunk in (16, 4):
+        assert manager.allocate_slots(turn, chunk) is not None
+        turn.num_computed_tokens += chunk
+        manager.new_step_starts()
+    # Decode consumes each sampled token in the following step; the final
+    # sampled token is never consumed, so 51 of 52 tokens reach the state.
+    for token in range(100, 131):
+        turn.append_output_token_ids(token)
+        assert manager.allocate_slots(turn, 1) is not None
+        turn.num_computed_tokens += 1
+        manager.new_step_starts()
+    turn.append_output_token_ids(131)
+    manager.free(turn)
+
+    pool = manager.block_pool
+    assert {
+        i
+        for i, block_hash in enumerate(turn.block_hashes)
+        if pool.get_cached_block(block_hash, kv_cache_group_ids=[0]) is not None
+    } == cached_blocks
+    continuation = _block_hashed_request(
+        "continuation", [*turn.all_token_ids, *range(200, 210)]
+    )
+    _, num_computed_tokens, _ = manager.get_computed_blocks(continuation)
+    assert num_computed_tokens == continuation_hit
 
 
 def _config() -> SimpleNamespace:
@@ -1438,6 +1507,61 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             assert single.token_ids == reference.token_ids
             assert single.logprobs == reference.logprobs
         reference = single
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_real_model_continuation_matches_full_history_prefill(
+    irwkv_runner, state_dtype
+) -> None:
+    """Resuming the next turn from the previous turn's committed state matches
+    prefilling the whole history: S(P + delta) == Advance(S(P), delta)."""
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    params = SamplingParams(
+        temperature=0.0,
+        top_k=1,
+        max_tokens=40,
+        ignore_eos=True,
+        logprobs=3,
+        presence_penalty=0,
+        frequency_penalty=0,
+        penalty_decay=1,
+        detokenize=False,
+    )
+    prompt = list(range(1, 66))
+    replies = {}
+    continuations = {}
+    for prefix_caching in (False, True):
+        with irwkv_runner(
+            model_path,
+            dtype="bfloat16",
+            max_model_len=256,
+            max_num_seqs=4,
+            gpu_memory_utilization=0.8,
+            num_gpu_blocks_override=64,
+            mamba_ssm_cache_dtype=state_dtype,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=prefix_caching,
+        ) as runner:
+            reply = runner.llm.generate([{"prompt_token_ids": prompt}], params)[0]
+            history = [*prompt, *reply.outputs[0].token_ids, *range(70, 80)]
+            replies[prefix_caching] = reply.outputs[0]
+            continuations[prefix_caching] = runner.llm.generate(
+                [{"prompt_token_ids": history}], params
+            )[0]
+
+    assert replies[True].token_ids == replies[False].token_ids
+    # The reply's last token is sampled but never consumed, so the first turn
+    # commits 65 + 40 - 1 = 104 tokens, last aligned at 96.
+    assert continuations[True].num_cached_tokens == 96
+    assert not continuations[False].num_cached_tokens
+    resumed = continuations[True].outputs[0]
+    prefilled = continuations[False].outputs[0]
+    assert resumed.token_ids == prefilled.token_ids
+    assert resumed.logprobs == prefilled.logprobs
 
 
 def test_reasoning_end_handles_markers_split_across_tokens():

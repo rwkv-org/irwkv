@@ -29,6 +29,10 @@ class RwkvStateSpec(MambaSpec):
     def requires_block_zeroing(self) -> bool:
         return True
 
+    @property
+    def retains_latest_checkpoint(self) -> bool:
+        return True
+
 
 class RwkvAttentionBackend(AttentionBackend):
     @staticmethod
