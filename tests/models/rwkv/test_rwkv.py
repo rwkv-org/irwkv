@@ -1390,11 +1390,14 @@ def test_config_accepts_async_scheduling() -> None:
     not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
     reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
-@pytest.mark.parametrize("prefix_match_unit", [None, 32, 8])
+@pytest.mark.parametrize(
+    ("prefix_caching", "prefix_match_unit"),
+    [(False, None), (True, None), (True, 32), (True, 8)],
+)
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
 def test_real_model_batching_preserves_tokens_and_logprobs(
-    irwkv_runner, prefix_match_unit, state_dtype, temperature
+    irwkv_runner, prefix_caching, prefix_match_unit, state_dtype, temperature
 ) -> None:
     """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
@@ -1425,7 +1428,7 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             block_size=32,
             mamba_ssm_cache_dtype=state_dtype,
             enable_chunked_prefill=True,
-            enable_prefix_caching=prefix_match_unit is not None,
+            enable_prefix_caching=prefix_caching,
             prefix_match_unit=prefix_match_unit,
             enforce_eager=enforce_eager,
             compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
@@ -1437,11 +1440,8 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             assert cold.num_cached_tokens == 0
             # The last prompt token is always recomputed to produce logits.
             max_hit = len(prompt_token_ids) - 1
-            expected_hit = (
-                max_hit // prefix_match_unit * prefix_match_unit
-                if prefix_match_unit is not None
-                else 0
-            )
+            hit_unit = prefix_match_unit or 32
+            expected_hit = max_hit // hit_unit * hit_unit if prefix_caching else 0
             assert hit.num_cached_tokens == expected_hit
             single, mixed = cold.outputs[0], hit.outputs[0]
         assert len(single.token_ids) == 4
