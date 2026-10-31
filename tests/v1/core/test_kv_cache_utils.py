@@ -2520,6 +2520,66 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+def _single_group_configs(spec, match_unit):
+    kv_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=32, enable_prefix_caching=True, prefix_match_unit=match_unit
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    return kv_config, config
+
+
+_ALIGNED_MAMBA_32 = MambaSpec(
+    block_size=32, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+)
+_FULL_ATTENTION_32 = FullAttentionSpec(
+    block_size=32, num_kv_heads=1, head_size=1, dtype=torch.float32
+)
+
+
+@pytest.mark.parametrize(
+    ("spec", "match_unit", "expected"),
+    [
+        (_ALIGNED_MAMBA_32, None, 32),
+        (_ALIGNED_MAMBA_32, 32, 32),
+        (_ALIGNED_MAMBA_32, 8, 8),
+        (_ALIGNED_MAMBA_32, 1, 1),
+        (_FULL_ATTENTION_32, None, 32),
+        (_FULL_ATTENTION_32, 32, 32),
+    ],
+)
+def test_single_group_prefix_match_unit(spec, match_unit, expected):
+    """A single aligned recurrent state can resume inside a physical block."""
+    kv_config, config = _single_group_configs(spec, match_unit)
+    sizes = kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
+    assert sizes == (32, expected)
+    assert (
+        kv_cache_utils.resolve_cache_hit_alignment_tokens(kv_config, config, *sizes)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "match_unit"),
+    [
+        (_ALIGNED_MAMBA_32, 3),
+        (_ALIGNED_MAMBA_32, 64),
+        (_FULL_ATTENTION_32, 8),
+    ],
+)
+def test_single_group_rejects_invalid_prefix_match_unit(spec, match_unit):
+    kv_config, config = _single_group_configs(spec, match_unit)
+    with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
+        kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
+
+
 def test_resolve_dcp_kv_block_size_unwraps_uniform_type_specs():
     attention = FullAttentionSpec(
         block_size=16,

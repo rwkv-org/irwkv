@@ -772,9 +772,8 @@ def resolve_kv_cache_block_sizes(
       group's effective block size. Attention groups are scaled by DCP;
       Mamba groups keep their full per-rank state and are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
-      is computed. Single group: equals scheduler block size, and any other
-      ``cache_config.prefix_match_unit`` is rejected while block hashing is
-      active. Multiple groups:
+      is computed. Single group: equals scheduler block size, unless an aligned
+      Mamba group explicitly requests finer prefix matching. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
       group block sizes; every group's block size must be divisible by it.
       Returns the scheduler block size (i.e. disables finer hashing) if block
@@ -784,7 +783,12 @@ def resolve_kv_cache_block_sizes(
     dcp = irwkv_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:
+    single_mamba_partial_hits = (
+        len(groups) == 1
+        and cache_config.prefix_match_unit is not None
+        and partial_hash_hits_enabled(groups, cache_config.prefix_match_unit, dcp)
+    )
+    if len(groups) <= 1 and not single_mamba_partial_hits:
         if groups and not groups[0].kv_cache_spec.dcp_sharded:
             dcp = 1
         bs = cache_config.block_size * dcp
@@ -878,7 +882,9 @@ def resolve_cache_hit_alignment_tokens(
     ``scheduler_block_size``.
     """
     groups = kv_cache_config.kv_cache_groups
-    if not irwkv_config.cache_config.enable_prefix_caching or len(groups) <= 1:
+    if not irwkv_config.cache_config.enable_prefix_caching or (
+        len(groups) <= 1 and hash_block_size == scheduler_block_size
+    ):
         return scheduler_block_size
     manager_classes = []
     for group in groups:
