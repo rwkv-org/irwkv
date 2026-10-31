@@ -42,6 +42,35 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rwkv_session_hit_only_schedules_uncached_suffix(async_scheduling):
+    scheduler = create_scheduler(async_scheduling=async_scheduling)
+    request = create_requests(1, num_tokens=33)[0]
+    request.rwkv_num_cached_tokens = 29
+    request.skip_reading_prefix_cache = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 4}
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 29
+    assert request.prefill_stats.num_external_cached_tokens == 29
+
+
+def test_rwkv_different_adapters_wait_for_the_running_cohort():
+    scheduler = create_scheduler()
+    first, other, same = create_requests(3)
+    first.rwkv_adapter_key = same.rwkv_adapter_key = "adapter-v1:1"
+    other.rwkv_adapter_key = "adapter-v2:1"
+    for request in (first, other, same):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {first.request_id, same.request_id}
+    assert list(scheduler.waiting) == [other]
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

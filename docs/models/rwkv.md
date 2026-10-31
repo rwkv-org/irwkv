@@ -207,6 +207,117 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+## Uploads and session snapshots
+
+The Python server provides RAM-resident uploads:
+
+| Operation | Endpoint |
+| --- | --- |
+| Upload initial state | `POST /v1/state/upload` |
+| List or delete initial states | `GET /v1/state/list`, `POST /v1/state/delete` |
+| Upload, list or delete adapters | `POST`, `GET`, `DELETE /v1/adapters` |
+| Inspect session snapshots and cache hits | `GET /v1/state/status` |
+| Delete a session snapshot | `POST /v1/state/session/delete` |
+
+Uploads use multipart form data with one `file` field. Adapter uploads also
+require `adapter_id`. Both PyTorch tensor checkpoints (`weights_only=True`)
+and safetensors are accepted, up to 512 MiB per upload. Initial states use
+`blocks.N.att.time_state` tensors for every model layer, matching the
+RWKV Lightning state export. Shift states start at zero. LoRA/NoRA tensors
+use PEFT names and must match the server's configured `rwkv_lora` rank,
+targets, alpha, and NoRA mode. Uploads do not change the base model weights.
+
+Lightning's native BF16 `adapter-final.pth` is also supported when it embeds
+an `archive/nora.json` manifest. Upload validates its tensor names, shapes,
+and content digest, then maps `blocks.N.*.weight.A/B` into the existing
+adapter storage. Lightning NoRA normalizes A only at initialization and
+trains the raw factors afterward. Set `use_nora` to `false` for these exports
+to use the raw A/B forward path; `true` would normalize A again at every
+forward and change the trained adapter. PEFT NoRA retains its existing
+per-forward normalization behavior.
+
+For a native rank-16, alpha-16 NoRA export targeting all six decoder
+projections, start the server with:
+
+```bash
+irwkv serve <model> --dtype bfloat16 --enable-chunked-prefill \
+  --hf-overrides '{
+    "rwkv_lora": {
+      "r": 16,
+      "lora_alpha": 16,
+      "use_nora": false,
+      "target_modules": [
+        "r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value"
+      ]
+    }
+  }'
+```
+
+Adapter storage must be configured before model loading and CUDA Graph
+capture; a server started without `rwkv_lora` needs a restart. Use the base
+checkpoint recorded by the training run: matching tensor shapes alone do
+not establish base-model compatibility. If the model configuration declares
+`rwkv_base_fingerprint`, native uploads must match it.
+
+```bash
+curl -F file=@state.pth http://localhost:8000/v1/state/upload
+curl -F adapter_id=my-adapter -F file=@adapter_model.safetensors \
+  http://localhost:8000/v1/adapters
+```
+
+Select uploads using the existing `irwkv_xargs` request extension:
+
+```json
+{
+  "session_id": "conversation-1",
+  "irwkv_xargs": {
+    "state_id": "<uploaded-state-id>",
+    "adapter_id": "my-adapter",
+    "adapter_version": "<uploaded-version>",
+    "adapter_scale": 1.0
+  }
+}
+```
+
+Only `session_id` is needed for ordinary session caching. Send the complete
+conversation history on each turn. Each finished request replaces its
+session's single CPU snapshot, including both shift tensors and WKV state.
+The next turn restores it when its computed token history is an exact prefix
+of the new prompt. Any remaining tokens, including the last generated token
+that has not yet entered the recurrent state, run normally. A changed prefix,
+adapter version or scale, initial state, cache salt, or model weight version
+causes a miss. Keep `state_id` consistent between turns when using an uploaded
+initial state. Prompt-logprob requests recompute the prompt.
+
+The cache keeps at most `IRWKV_RWKV_SESSION_CACHE_SIZE` session snapshots
+(default 128), with only the latest CPU snapshot retained for each session.
+When the limit is exceeded, the least recently used snapshot is evicted.
+Set the environment variable before starting the server; for example, to
+retain at most 64 session snapshots:
+
+```bash
+IRWKV_RWKV_SESSION_CACHE_SIZE=64 irwkv serve <model> \
+  --dtype bfloat16 \
+  --enable-chunked-prefill
+```
+
+Set it to `0` to disable session snapshots. This setting limits snapshot
+count; there is currently no total RAM byte limit. Uploaded initial states
+and LoRA/NoRA adapters are excluded from the session snapshot count and
+remain in RAM until deleted or the worker stops.
+
+Status reports `session_cache_hits`, `session_cache_misses`, `ram_bytes`, and
+the computed token count for each snapshot. Deleting an upload preserves
+references held by already admitted requests. Cache reset also invalidates
+session snapshots.
+
+Requests with different adapters or scales execute in separate batches.
+Adapters are copied into existing GPU storage, preserving captured graph
+addresses. This path supports synchronous and asynchronous scheduling with
+DP=1, token prompts, and no KV-transfer connector. Concurrent requests for the
+same session are rejected. Offline callers can use the same selection fields,
+including `session_id`, through `SamplingParams.extra_args`.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes

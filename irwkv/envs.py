@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     IRWKV_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     IRWKV_RWKV_TUNING_MODE: Literal["inspect", "require", "tune"] = "tune"
     IRWKV_RWKV_TUNING_LEGACY_DIR: str | None = None
+    IRWKV_RWKV_SESSION_CACHE_SIZE: int = 128
     IRWKV_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     IRWKV_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     IRWKV_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1510,6 +1511,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "IRWKV_RWKV_TUNING_MODE", "tune", ["inspect", "require", "tune"]
     ),
     "IRWKV_RWKV_TUNING_LEGACY_DIR": lambda: os.getenv("IRWKV_RWKV_TUNING_LEGACY_DIR"),
+    "IRWKV_RWKV_SESSION_CACHE_SIZE": lambda: int(
+        os.getenv("IRWKV_RWKV_SESSION_CACHE_SIZE", "128")
+    ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
     # CuTe-DSL NVFP4 linear kernel is selected. Empty: skip nothing.
@@ -1999,6 +2003,7 @@ def compile_factors() -> dict[str, object]:
         "IRWKV_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "IRWKV_RWKV_TUNING_MODE",
         "IRWKV_RWKV_TUNING_LEGACY_DIR",
+        "IRWKV_RWKV_SESSION_CACHE_SIZE",
         "IRWKV_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "IRWKV_HTTP_TIMEOUT_KEEP_ALIVE",
         "IRWKV_EXECUTE_MODEL_TIMEOUT_SECONDS",

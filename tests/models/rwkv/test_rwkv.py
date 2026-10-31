@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import io
+import json
 import os
 import sys
+import zipfile
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -31,7 +35,11 @@ from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionMetadata,
     RwkvAttentionMetadataBuilder,
 )
-from irwkv.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
+from irwkv.v1.worker.gpu.model_states.rwkv import (
+    RwkvModelState,
+    RwkvSampler,
+)
+from irwkv.v1.worker.gpu.model_states.rwkv_cache import RwkvRuntimeCache
 
 
 class _FakeStateHandle:
@@ -158,6 +166,15 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
     assert torch.all(handle.state[2] == 2)
     assert torch.all(cmix[2] == 4)
 
+    snapshot = state_layer.export_state(1)
+    state_layer.reset_state_slots([1])
+    state_layer.import_state(2, snapshot)
+    assert torch.all(tmix[1] == 0)
+    assert torch.all(tmix[2] == 1)
+    assert torch.all(handle.state[2] == 2)
+    assert torch.all(cmix[2] == 4)
+    assert all(t.device.type == "cpu" for t in snapshot)
+
     state_layer.reset_state_slots(destination)
     assert torch.count_nonzero(tmix[2]) == 0
     assert torch.count_nonzero(handle.state[2]) == 0
@@ -184,7 +201,7 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
         assert isinstance(layer_handle, _FakeStateHandle)
         handles.append(layer_handle)
     assert all(
-        len(layer_handle.materialized) == 1
+        len(layer_handle.materialized) == 2
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
@@ -957,6 +974,12 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
     assert model.lm_head.lora_scale == 2.0
     assert model.lm_head.use_nora
 
+    from irwkv.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    loaded = model.load_weights(base.named_parameters())
+    DefaultModelLoader.__new__(DefaultModelLoader).track_weights_loading(model, loaded)
+    assert all(not parameter.any() for parameter in adapters.values())
+
     weights = {name: torch.randn(shape) for name, shape in expected.items()}
     storage = {name: param.data_ptr() for name, param in adapters.items()}
     assert model.load_weights(weights.items()) == set(expected)
@@ -964,6 +987,252 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
         assert param.data_ptr() == storage[name]
         assert param.dtype == torch.float32
         assert torch.equal(param, weights[name])
+
+
+def _checkpoint_bytes(values: dict[str, torch.Tensor]) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(values, buffer)
+    return buffer.getvalue()
+
+
+@pytest.mark.usefixtures("_single_rank")
+def test_lightning_nora_preserves_trained_factors_and_checks_manifest():
+    targets = {
+        "att.receptance.weight": "linear_attn.r_proj",
+        "att.key.weight": "linear_attn.k_proj",
+        "att.value.weight": "linear_attn.v_proj",
+        "att.output.weight": "linear_attn.o_proj",
+        "ffn.key.weight": "mlp.key",
+        "ffn.value.weight": "mlp.value",
+    }
+    config = {
+        "r": 4,
+        "lora_alpha": 4,
+        "use_nora": False,
+        "target_modules": [
+            "r_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "mlp.key",
+            "mlp.value",
+        ],
+    }
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(config))
+    parameters = {k: p for k, p in model.named_parameters() if ".lora_" in k}
+    values = {}
+    expected = {}
+    manifest: dict[str, Any] = {
+        "format_version": 1,
+        "method": "nora",
+        "layout": "low_rank_ba",
+        "kind": "inference_adapter",
+        "initialization": "nora_init",
+        "dtype": "bfloat16",
+        "rank": 4,
+        "alpha": 4.0,
+        "scale": 1.0,
+        "base_fingerprint": "0" * 64,
+        "targets": [],
+    }
+    for layer in range(2):
+        for native, module in targets.items():
+            entry: dict[str, Any] = {"layer": layer, "target": native}
+            for factor, key, shape_key in (
+                ("B", "name", "shape"),
+                ("A", "a_name", "a_shape"),
+            ):
+                name = f"model.layers.{layer}.{module}.lora_{factor}.weight"
+                value = torch.full_like(parameters[name], 0.25, dtype=torch.bfloat16)
+                source = f"blocks.{layer}.{native}.{factor}"
+                values[source] = value
+                expected[name] = value.float()
+                entry[key], entry[shape_key] = source, list(value.shape)
+                if factor == "A":
+                    entry["in_features"] = value.shape[1]
+            manifest["targets"].append(entry)
+    digest = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    )
+    for entry in manifest["targets"]:
+        for key in ("name", "a_name"):
+            digest.update(values[entry[key]].view(torch.uint8).numpy().tobytes())
+    manifest["content_version"] = digest.hexdigest()
+
+    def checkpoint():
+        buffer = io.BytesIO(_checkpoint_bytes(values))
+        with zipfile.ZipFile(buffer, "a") as archive:
+            archive.writestr("archive/nora.json", json.dumps(manifest))
+        return buffer.getvalue()
+
+    cache = RwkvRuntimeCache(model)
+    info = cache.upload_adapter("native", checkpoint())
+    cache.prepare(
+        {"request_id": "r", "token_ids": [1], "options": {"adapter_id": "native"}}
+    )
+    cache.activate_adapter(["r"])
+    assert all(
+        torch.equal(parameter, expected[name]) for name, parameter in parameters.items()
+    )
+    values[manifest["targets"][0]["name"]] = values[manifest["targets"][0]["name"]] * 2
+    with pytest.raises(ValueError, match="digest"):
+        cache.upload_adapter("bad", checkpoint())
+    assert cache.manage("status", {})["adapters"] == [info]
+    model.config.rwkv_lora["use_nora"] = True
+    with pytest.raises(ValueError, match="only at initialization"):
+        cache.upload_adapter("renormalized", checkpoint())
+
+
+def test_session_restores_after_slot_zeroing_and_snapshots_before_reuse(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    config = _state_irwkv_config()
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    layer.bind_kv_cache(torch.zeros((3, 1, 1, spec.page_size_bytes), dtype=torch.int8))
+    snapshot = (
+        torch.ones(2, 128, dtype=torch.bfloat16),
+        torch.full((2, 128), 2, dtype=torch.bfloat16),
+        torch.full((2, 2, 64, 64), 3, dtype=torch.float32),
+    )
+    cache = RwkvRuntimeCache(SimpleNamespace())
+    cache.prepare({"request_id": "r", "session_id": "s", "token_ids": list(range(35))})
+    state = object.__new__(RwkvModelState)
+    state.runtime_cache = cache
+    state._align_mode = True
+    state._block_size = 16
+    state._state_layer = layer
+    state._rwkv_group_id = 0
+    state._state_block_columns = np.array([-1], dtype=np.int32)
+    state._state_num_computed_tokens = np.array([30], dtype=np.int64)
+    state._pending_restores = {0: snapshot}
+    state._request_slots = {}
+    state._request_indices = {"r": 0}
+    state.device = torch.device("cpu")
+    state.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([34])),
+        all_token_ids=SimpleNamespace(gpu=torch.arange(35).reshape(1, -1)),
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["r"],
+        idx_mapping_np=np.array([0]),
+        num_scheduled_tokens=np.array([4]),
+    )
+    state.preprocess_state(
+        batch, (torch.tensor([[0, 0, 2]], dtype=torch.int32),), None, torch.empty(0)
+    )
+    assert all(torch.equal(a, b) for a, b in zip(layer.export_state(2), snapshot))
+    state.cache_finished_requests(["r"])
+    layer.reset_state_slots([2])
+    assert cache.sessions["s"].token_ids == list(range(34))
+    assert all(torch.equal(a, b) for a, b in zip(cache.sessions["s"].state, snapshot))
+    assert state._state_num_computed_tokens[0] == 34
+
+
+def test_session_snapshot_only_reuses_the_exact_computed_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("IRWKV_RWKV_SESSION_CACHE_SIZE", "1")
+    cache = RwkvRuntimeCache(SimpleNamespace())
+    data = {
+        "request_id": "first",
+        "session_id": "conversation",
+        "token_ids": [1, 2],
+        "weight_version": "v1",
+    }
+    assert cache.prepare(data)["num_cached_tokens"] == 0
+    snapshot = (torch.ones(2), torch.ones(2), torch.ones(2))
+    cache.save_session("first", [1, 2, 3], snapshot)
+    hit = {**data, "request_id": "second", "token_ids": [1, 2, 3, 4]}
+    assert cache.prepare(hit)["num_cached_tokens"] == 3
+    assert cache.requests["second"].state is snapshot
+    for changed in (
+        {"token_ids": [1, 9, 3, 4]},
+        {"token_ids": [1, 2, 3]},
+        {"weight_version": "v2"},
+        {"cache_salt": "another-tenant"},
+        {"skip_session": True},
+    ):
+        assert cache.prepare({**hit, **changed})["num_cached_tokens"] == 0
+    cache.prepare({**data, "request_id": "other", "session_id": "other"})
+    cache.save_session("other", [5], snapshot)
+    assert list(cache.sessions) == ["other"]
+    assert cache.manage("delete_session", {"session_id": "other"})["deleted"]
+    assert cache.requests["other"].session_id is None
+
+
+@pytest.mark.usefixtures("_single_rank")
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_uploaded_adapter_switches_in_place_and_pins_inflight_versions(
+    use_nora,
+) -> None:
+    model = RwkvForCausalLM(
+        irwkv_config=_tiny_model_irwkv_config({**_LORA, "use_nora": use_nora})
+    )
+    parameters = {k: v for k, v in model.named_parameters() if ".lora_" in k}
+    pointers = {k: v.data_ptr() for k, v in parameters.items()}
+    cache = RwkvRuntimeCache(model)
+    weights = {k: torch.ones_like(v) for k, v in parameters.items()}
+    version = cache.upload_adapter("adapter", _checkpoint_bytes(weights))["version"]
+    data = {
+        "request_id": "first",
+        "token_ids": [1, 2],
+        "session_id": "conversation",
+        "options": {"adapter_id": "adapter", "adapter_scale": 0.5},
+    }
+    cache.prepare(data)
+    cache.activate_adapter(["first"])
+    for name, parameter in parameters.items():
+        assert torch.all(parameter == (0.5 if ".lora_B." in name else 1))
+        assert parameter.data_ptr() == pointers[name]
+    cache.save_session("first", [1, 2], (torch.ones(1),))
+    assert (
+        cache.prepare({**data, "request_id": "hit", "token_ids": [1, 2, 3]})[
+            "num_cached_tokens"
+        ]
+        == 2
+    )
+    assert (
+        cache.prepare(
+            {
+                **data,
+                "request_id": "scale",
+                "token_ids": [1, 2, 3],
+                "options": {"adapter_id": "adapter", "adapter_scale": 1.0},
+            }
+        )["num_cached_tokens"]
+        == 0
+    )
+    cache.upload_adapter(
+        "adapter", _checkpoint_bytes({k: v * 2 for k, v in weights.items()})
+    )
+    with pytest.raises(ValueError, match="adapter_version"):
+        cache.prepare(
+            {**data, "options": {"adapter_id": "adapter", "adapter_version": version}}
+        )
+    cache.activate_adapter(["base"])
+    assert all(not parameter.any() for parameter in parameters.values())
+    cache.manage("delete_adapter", {"adapter_id": "adapter"})
+    cache.activate_adapter(["first"])
+    assert torch.all(parameters["lm_head.lora_B.weight"] == 0.5)
+    assert cache.uploads == 3
+
+
+@pytest.mark.usefixtures("_single_rank")
+def test_uploaded_state_converts_reference_layout_and_rejects_bad_shapes() -> None:
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(None))
+    cache = RwkvRuntimeCache(model)
+    tensor = torch.arange(2 * 64 * 64, dtype=torch.float32).reshape(2, 64, 64)
+    values = {f"blocks.{i}.att.time_state": tensor + i for i in range(2)}
+    payload = _checkpoint_bytes(values)
+    info = cache.manage("validate_upload_state", {"payload": payload})
+    assert not cache.states
+    assert cache.upload_state(payload) == info
+    shifts, cmix, wkv = cache.states[info["state_id"]]
+    assert not shifts.any() and not cmix.any()
+    assert torch.equal(wkv[0], tensor.transpose(-1, -2))
+    assert wkv.device.type == "cpu"
+    with pytest.raises(ValueError, match="shape"):
+        cache.upload_state(_checkpoint_bytes({k: v[0] for k, v in values.items()}))
+    assert len(cache.states) == 1
 
 
 def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
