@@ -91,19 +91,18 @@ AttnTypeStr = Literal[
 
 
 _RWKV_SAMPLING_PROFILE_FILES = {
+    "open_think": "generation_config.json",
     "fake_think": "fake_think_generation_config.json",
     "tools": "tools_generation_config.json",
 }
-_RWKV_SAMPLING_FIELDS = frozenset(
-    {
-        "temperature",
-        "top_p",
-        "top_k",
-        "presence_penalty",
-        "frequency_penalty",
-        "penalty_decay",
-    }
-)
+_RWKV_SAMPLING_FIELDS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "penalty_decay",
+}
 
 
 def load_rwkv_sampling_profiles(
@@ -115,24 +114,20 @@ def load_rwkv_sampling_profiles(
     ):
         return None
 
-    profiles = {"open_think": default_sampling_params}
+    profiles = {}
     for profile, config_file_name in _RWKV_SAMPLING_PROFILE_FILES.items():
-        profiles[profile] = model_config.get_diff_sampling_param(
-            config_file_name=config_file_name
+        params = (
+            default_sampling_params
+            if profile == "open_think"
+            else model_config.get_diff_sampling_param(config_file_name=config_file_name)
         )
-
-    for profile, params in profiles.items():
         missing = _RWKV_SAMPLING_FIELDS.difference(params)
         if missing:
-            config_file_name = (
-                "generation_config.json"
-                if profile == "open_think"
-                else _RWKV_SAMPLING_PROFILE_FILES[profile]
-            )
             raise ValueError(
                 f"RWKV {config_file_name} is missing Rapid-Sampling fields: "
                 + ", ".join(sorted(missing))
             )
+        profiles[profile] = params
     return profiles
 
 

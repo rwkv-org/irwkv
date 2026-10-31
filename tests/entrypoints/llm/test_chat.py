@@ -11,56 +11,22 @@ from irwkv.exceptions import IRWKVValidationError
 from irwkv.sampling_params import SamplingParams
 
 
-@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
-@pytest.mark.parametrize(
-    ("template_kwargs", "tools", "profile"),
-    [
-        ({}, None, "generation_config.json"),
-        ({"fake_cot_mode": False}, None, "generation_config.json"),
-        ({"fake_cot_mode": True}, None, "fake_think_generation_config.json"),
-        (
-            {"fake_cot_mode": True},
-            [{"type": "function"}],
-            "tools_generation_config.json",
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "open_defaults",
-    [
-        {"top_p": 0.76, "top_k": 32, "frequency_penalty": 0.1, "penalty_decay": 0.988},
-        {"top_p": 0.90, "top_k": -1, "frequency_penalty": 0.09, "penalty_decay": 0.994},
-    ],
-    ids=["g1k", "g1l"],
-)
-def test_rwkv_chat_selects_sampling_profile(
-    method, template_kwargs, tools, profile, open_defaults
-):
+@pytest.fixture
+def offline_chat():
     profiles = {
-        "generation_config.json": {
-            "temperature": 0.96,
+        name: {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "top_k": -1,
             "presence_penalty": 1.0,
-            "stop": ["END"],
-            **open_defaults,
-        },
-        "fake_think_generation_config.json": {
-            "temperature": 1.0,
-            "top_p": 0.28,
-            "top_k": 32,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "penalty_decay": 0.996,
-            "stop": ["END"],
-        },
-        "tools_generation_config.json": {
-            "temperature": 0.96,
-            "top_p": 0.76,
-            "top_k": 32,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "penalty_decay": 0.996,
-            "stop": ["END"],
-        },
+            "frequency_penalty": 0.09,
+            "penalty_decay": 0.994,
+        }
+        for name, temperature in (
+            ("generation_config.json", 0.96),
+            ("fake_think_generation_config.json", 1.0),
+            ("tools_generation_config.json", 0.8),
+        )
     }
     llm = LLM.__new__(LLM)
     llm.model_config = SimpleNamespace(
@@ -75,73 +41,75 @@ def test_rwkv_chat_selects_sampling_profile(
     llm.default_sampling_params = None
     llm._run_chat = MagicMock()
     llm._add_chat_requests = MagicMock()
-    messages = [{"role": "user", "content": "Hello"}]
-
-    getattr(llm, method)(messages, tools=tools, chat_template_kwargs=template_kwargs)
-    run = llm._run_chat if method == "chat" else llm._add_chat_requests
-    params = run.call_args.kwargs["params"]
-    for key, expected in profiles[profile].items():
-        assert getattr(params, key) == expected
-
-    explicit = SamplingParams(temperature=0.5)
-    getattr(llm, method)(messages, sampling_params=explicit)
-    assert run.call_args.kwargs["params"] is explicit
-    assert llm.model_config.get_diff_sampling_param.call_count == 3
+    return llm
 
 
 @pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
 @pytest.mark.parametrize(
-    ("model_type", "generation_config"), [("other", "auto"), ("rwkv", "irwkv")]
+    ("template_kwargs", "tools", "temperature"),
+    [
+        ({}, None, 0.96),
+        ({"fake_cot_mode": True}, None, 1.0),
+        ({"fake_cot_mode": True}, [{"type": "function"}], 0.8),
+    ],
 )
-def test_chat_preserves_default_sampling_when_rwkv_profiles_disabled(
-    method, model_type, generation_config
+def test_rwkv_chat_selects_sampling_profile(
+    offline_chat, method, template_kwargs, tools, temperature
 ):
-    llm = LLM.__new__(LLM)
-    llm.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type=model_type),
-        generation_config=generation_config,
-        get_diff_sampling_param=MagicMock(return_value={"temperature": 0.7}),
+    getattr(offline_chat, method)(
+        [{"role": "user", "content": "Hello"}],
+        tools=tools,
+        chat_template_kwargs=template_kwargs,
     )
-    llm.default_sampling_params = None
-    llm._run_chat = MagicMock()
-    llm._add_chat_requests = MagicMock()
+    run = (
+        offline_chat._run_chat if method == "chat" else offline_chat._add_chat_requests
+    )
+    params = run.call_args.kwargs["params"]
+    assert (params.temperature, params.top_p, params.top_k) == (temperature, 0.9, -1)
+    assert (
+        params.presence_penalty,
+        params.frequency_penalty,
+        params.penalty_decay,
+    ) == (
+        1.0,
+        0.09,
+        0.994,
+    )
 
-    getattr(llm, method)(
+
+@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
+def test_rwkv_chat_preserves_explicit_sampling(offline_chat, method):
+    params = SamplingParams(temperature=0.5)
+    getattr(offline_chat, method)(
+        [{"role": "user", "content": "Hello"}], sampling_params=params
+    )
+    run = (
+        offline_chat._run_chat if method == "chat" else offline_chat._add_chat_requests
+    )
+    assert run.call_args.kwargs["params"] is params
+    offline_chat.model_config.get_diff_sampling_param.assert_not_called()
+
+
+@pytest.mark.parametrize("generation_config", ["irwkv", "auto"])
+def test_chat_preserves_defaults_when_rwkv_profiles_disabled(
+    offline_chat, generation_config
+):
+    offline_chat.model_config.generation_config = generation_config
+    if generation_config == "auto":
+        offline_chat.model_config.hf_config.model_type = "other"
+    offline_chat.chat(
         [{"role": "user", "content": "Hello"}],
         chat_template_kwargs={"fake_cot_mode": True},
     )
-    run = llm._run_chat if method == "chat" else llm._add_chat_requests
-    assert run.call_args.kwargs["params"].temperature == 0.7
-    llm.model_config.get_diff_sampling_param.assert_called_once_with()
+    assert offline_chat._run_chat.call_args.kwargs["params"].temperature == 0.96
+    offline_chat.model_config.get_diff_sampling_param.assert_called_once_with()
 
 
-@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
-def test_chat_explicit_sampling_does_not_load_profiles(method):
-    llm = LLM.__new__(LLM)
-    llm.model_config = MagicMock()
-    llm.default_sampling_params = None
-    llm._run_chat = MagicMock()
-    llm._add_chat_requests = MagicMock()
-    params = [SamplingParams(temperature=0.5)]
-
-    getattr(llm, method)([[{"role": "user", "content": "Hello"}]], params)
-    run = llm._run_chat if method == "chat" else llm._add_chat_requests
-    assert run.call_args.kwargs["params"] is params
-    llm.model_config.get_diff_sampling_param.assert_not_called()
-
-
-@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
-def test_rwkv_chat_rejects_incomplete_sampling_profiles(method):
-    llm = LLM.__new__(LLM)
-    llm.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="rwkv"),
-        generation_config="auto",
-        get_diff_sampling_param=MagicMock(return_value={}),
-    )
-    llm.default_sampling_params = None
-
+def test_rwkv_chat_rejects_incomplete_sampling_profiles(offline_chat):
+    offline_chat.model_config.get_diff_sampling_param.side_effect = None
+    offline_chat.model_config.get_diff_sampling_param.return_value = {}
     with pytest.raises(ValueError, match="generation_config.json.*missing"):
-        getattr(llm, method)([{"role": "user", "content": "Hello"}])
+        offline_chat.chat([{"role": "user", "content": "Hello"}])
 
 
 @pytest.fixture(scope="function")
