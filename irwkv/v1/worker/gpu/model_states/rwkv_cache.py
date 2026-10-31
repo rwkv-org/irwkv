@@ -16,6 +16,8 @@ import torch
 from torch import nn
 
 from irwkv import envs
+from irwkv.model_executor.models.config import RwkvForCausalLMConfig
+from irwkv.utils.cache import LRUCache
 
 
 @dataclass
@@ -23,6 +25,20 @@ class RwkvSessionState:
     identity: tuple[Any, ...]
     token_ids: list[int]
     state: tuple[torch.Tensor, ...]
+    ready: torch.cuda.Event | None = None
+    token_buffer: torch.Tensor | None = None
+    num_tokens: torch.Tensor | None = None
+
+    def poll(self) -> bool:
+        if self.ready is None:
+            return True
+        if not self.ready.query():
+            return False
+        assert self.num_tokens is not None and self.token_buffer is not None
+        self.token_ids = self.token_buffer[: int(self.num_tokens.item())].tolist()
+        self.ready = None
+        self.token_buffer = self.num_tokens = None
+        return True
 
 
 @dataclass
@@ -43,19 +59,83 @@ class RwkvRuntimeCache:
     def __init__(self, model: nn.Module) -> None:
         self.model = model
         self.states: dict[str, tuple[torch.Tensor, ...]] = {}
-        self.adapters: dict[str, tuple[str, dict[str, torch.Tensor]]] = {}
+        self.adapters: LRUCache[str, tuple[str, dict[str, torch.Tensor]]] = LRUCache(16)
         self.sessions: OrderedDict[str, RwkvSessionState] = OrderedDict()
         self.requests: dict[str, RwkvRuntimeRequest] = {}
         self.capacity = max(0, envs.IRWKV_RWKV_SESSION_CACHE_SIZE)
+        self.upload_capacity = max(0, envs.IRWKV_RWKV_UPLOAD_MAX_BYTES)
         self.hits = 0
         self.misses = 0
         self.uploads = 0
         self._active_adapter = ""
         self._base_adapter: dict[str, torch.Tensor] | None = None
 
+    def _check_upload_enabled(self) -> None:
+        if not envs.IRWKV_ALLOW_RUNTIME_RWKV_UPDATING:
+            raise ValueError(
+                "runtime uploads require IRWKV_ALLOW_RUNTIME_RWKV_UPDATING=1"
+            )
+
+    @staticmethod
+    def _tensor_bytes(tensors: Sequence[torch.Tensor]) -> int:
+        return sum(
+            {
+                t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+                for t in tensors
+            }.values()
+        )
+
+    def _upload_tensors(
+        self, *, state_id: str | None = None, adapter_ids: Sequence[str] = ()
+    ) -> list[torch.Tensor]:
+        states = {
+            id(state): state for key, state in self.states.items() if key != state_id
+        }
+        adapters = {
+            id(adapter): adapter
+            for key, (_, adapter) in self.adapters.cache.items()
+            if key not in adapter_ids
+        }
+        for request in self.requests.values():
+            if request.initial_state is not None:
+                states[id(request.initial_state)] = request.initial_state
+            if request.adapter is not None:
+                adapters[id(request.adapter)] = request.adapter
+        return [t for state in states.values() for t in state] + [
+            t for adapter in adapters.values() for t in adapter.values()
+        ]
+
+    def _reserve_upload(
+        self, key: str, tensors: Sequence[torch.Tensor], *, adapter: bool, publish: bool
+    ) -> None:
+        removed = [key] if adapter else []
+        remaining = [k for k in self.adapters.order if k not in removed]
+        while (
+            len(remaining) + int(adapter) > 16
+            or self._tensor_bytes(
+                self._upload_tensors(
+                    state_id=None if adapter else key, adapter_ids=removed
+                )
+                + list(tensors)
+            )
+            > self.upload_capacity
+        ):
+            if not remaining:
+                raise ValueError(
+                    "runtime upload capacity exceeded; delete unused uploads"
+                )
+            removed.append(remaining.pop(0))
+        if publish:
+            for adapter_id in removed:
+                self.adapters.pop(adapter_id, None)
+
     @staticmethod
     def _load(payload: bytes) -> dict[str, torch.Tensor]:
         try:
+            if payload[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                    if sum(entry.file_size for entry in archive.infolist()) > 512 << 20:
+                        raise ValueError("expanded tensor checkpoint exceeds 512 MiB")
             if payload[:2] == b"PK" or payload[:1] == b"\x80":
                 values = torch.load(
                     io.BytesIO(payload), map_location="cpu", weights_only=True
@@ -80,6 +160,7 @@ class RwkvRuntimeCache:
         return values
 
     def upload_state(self, payload: bytes, *, publish: bool = True) -> dict[str, Any]:
+        self._check_upload_enabled()
         values = self._load(payload)
         config = self.model.config
         expected = {
@@ -108,8 +189,12 @@ class RwkvRuntimeCache:
         state_id = "state-" + hashlib.sha256(payload).hexdigest()
         if not torch.isfinite(wkv).all():
             raise ValueError("state overflows the configured recurrent-state dtype")
+        state = (shift, shift.clone(), wkv)
+        if torch.cuda.is_available():
+            state = tuple(t.pin_memory() for t in state)
+        self._reserve_upload(state_id, state, adapter=False, publish=publish)
         if publish:
-            self.states[state_id] = (shift, shift.clone(), wkv)
+            self.states[state_id] = state
         return {
             "state_id": state_id,
             "object": "rwkv.state",
@@ -117,30 +202,51 @@ class RwkvRuntimeCache:
         }
 
     def upload_adapter(
-        self, adapter_id: str, payload: bytes, *, publish: bool = True
+        self,
+        adapter_id: str,
+        payload: bytes,
+        *,
+        adapter_config: dict[str, Any] | None = None,
+        publish: bool = True,
     ) -> dict[str, Any]:
+        self._check_upload_enabled()
         if not adapter_id:
             raise ValueError("missing adapter_id")
         if getattr(self.model.config, "rwkv_lora", None) is None:
             raise ValueError(
                 "start the model with rwkv_lora to upload LoRA/NoRA adapters"
             )
-        values = self._load_lightning_adapter(payload, self._load(payload))
-        values = {
+        raw_values = self._load(payload)
+        values = self._load_lightning_adapter(payload, raw_values)
+        metadata = b""
+        if values is raw_values:
+            self._validate_adapter_config(adapter_config)
+            metadata = json.dumps(adapter_config, sort_keys=True).encode()
+        normalized = {
             name.removeprefix("base_model.model.").replace(
                 ".default.weight", ".weight"
             ): v
             for name, v in values.items()
         }
+        if len(normalized) != len(values):
+            raise ValueError("duplicate normalized adapter tensor names")
+        values = normalized
         parameters = {
             name: p for name, p in self.model.named_parameters() if ".lora_" in name
         }
         local = {}
         for name, parameter in parameters.items():
             value = values.get(name)
-            if value is None or value.shape != parameter.shape:
+            if (
+                value is None
+                or value.shape != parameter.shape
+                or not value.is_floating_point()
+                or value.layout != torch.strided
+            ):
                 raise ValueError(f"missing or incompatible adapter tensor: {name}")
             local[name] = value.to(dtype=torch.float32, copy=True).contiguous()
+            if parameter.is_cuda:
+                local[name] = local[name].pin_memory()
         valid_names = set(parameters)
         # Other pipeline stages own the remaining adapter tensors.
         for name in values:
@@ -162,10 +268,58 @@ class RwkvRuntimeCache:
             ):
                 continue
             raise ValueError(f"unexpected adapter tensor: {name}")
-        version = hashlib.sha256(payload).hexdigest()
+        if any(not torch.isfinite(v).all() for v in local.values()):
+            raise ValueError("adapter overflows float32 storage")
+        version = hashlib.sha256(payload + metadata).hexdigest()
+        self._reserve_upload(
+            adapter_id, list(local.values()), adapter=True, publish=publish
+        )
         if publish:
             self.adapters[adapter_id] = (version, local)
         return {"adapter_id": adapter_id, "version": version}
+
+    def _validate_adapter_config(self, metadata: dict[str, Any] | None) -> None:
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "PEFT uploads require adapter_config.json including use_nora"
+            )
+        config = self.model.config.rwkv_lora
+        selected: dict[str, Any] = {
+            key: metadata.get(key) for key in RwkvForCausalLMConfig.LORA_KEYS
+        }
+        RwkvForCausalLMConfig.verify_lora_config(selected)
+        if any(selected[key] != config[key] for key in ("r", "lora_alpha", "use_nora")):
+            raise ValueError("PEFT rank, lora_alpha and use_nora must match rwkv_lora")
+        if set(selected["target_modules"]) != set(config["target_modules"]):
+            raise ValueError("PEFT target_modules must match rwkv_lora")
+        if (
+            metadata.get("peft_type", "LORA") != "LORA"
+            or metadata.get("bias", "none") != "none"
+            or any(
+                metadata.get(key)
+                for key in (
+                    "use_rslora",
+                    "use_dora",
+                    "fan_in_fan_out",
+                    "rank_pattern",
+                    "alpha_pattern",
+                    "modules_to_save",
+                    "lora_bias",
+                    "layer_replication",
+                    "layers_to_transform",
+                    "layers_pattern",
+                )
+            )
+        ):
+            raise ValueError(
+                "unsupported PEFT scaling, layout, bias or module overrides"
+            )
+        expected_base = getattr(self.model.config, "rwkv_base_fingerprint", None)
+        if (
+            expected_base is not None
+            and metadata.get("base_fingerprint") != expected_base
+        ):
+            raise ValueError("PEFT base_fingerprint does not match the model")
 
     def _load_lightning_adapter(
         self, payload: bytes, values: dict[str, torch.Tensor]
@@ -292,7 +446,13 @@ class RwkvRuntimeCache:
             adapter_key = f"{version}:{float(scale).hex()}"
             if scale != 1:
                 adapter = {
-                    name: value * scale if ".lora_B." in name else value
+                    name: (
+                        (value * scale).pin_memory()
+                        if value.is_pinned()
+                        else value * scale
+                    )
+                    if ".lora_B." in name
+                    else value
                     for name, value in adapter.items()
                 }
                 if any(not torch.isfinite(value).all() for value in adapter.values()):
@@ -309,6 +469,9 @@ class RwkvRuntimeCache:
             data.get("cache_salt"),
             data.get("weight_version"),
         )
+        retained = self._upload_tensors() + list((adapter or {}).values())
+        if self._tensor_bytes(retained) > self.upload_capacity:
+            raise ValueError("runtime upload capacity exceeded by adapter_scale")
         session_id = data.get("session_id")
         state = initial_state
         cached_tokens = 0
@@ -318,6 +481,7 @@ class RwkvRuntimeCache:
             if (
                 not data.get("skip_session", False)
                 and snapshot is not None
+                and snapshot.poll()
                 and snapshot.identity == identity
                 and 0 < len(snapshot.token_ids) < len(tokens)
                 and tokens[: len(snapshot.token_ids)] == snapshot.token_ids
@@ -328,6 +492,11 @@ class RwkvRuntimeCache:
                 self.hits += 1
             else:
                 self.misses += 1
+            # Each admitted branch reads an immutable snapshot; the newest
+            # admission alone may publish, independent of completion order.
+            for previous in self.requests.values():
+                if previous.session_id == session_id:
+                    previous.session_id = None
         self.requests[data["request_id"]] = RwkvRuntimeRequest(
             session_id,
             identity,
@@ -360,23 +529,35 @@ class RwkvRuntimeCache:
         }
         if self._base_adapter is None:
             self._base_adapter = {
-                name: p.to(device="cpu", copy=True) for name, p in parameters.items()
+                name: p.detach().clone() for name, p in parameters.items()
             }
         weights = requests[0].adapter if requests[0] is not None else None
         weights = weights if weights is not None else self._base_adapter
         for name, parameter in parameters.items():
-            parameter.data.copy_(weights[name])
+            parameter.data.copy_(weights[name], non_blocking=True)
         self._active_adapter = key
         self.uploads += 1
         return needs_state
 
     def save_session(
-        self, req_id: str, token_ids: list[int], state: tuple[torch.Tensor, ...]
+        self,
+        req_id: str,
+        token_ids: list[int],
+        state: tuple[torch.Tensor, ...],
+        *,
+        ready: torch.cuda.Event | None = None,
+        token_buffer: torch.Tensor | None = None,
+        num_tokens: torch.Tensor | None = None,
     ) -> None:
         request = self.requests[req_id]
-        if request.session_id and self.capacity and token_ids and not request.saved:
+        if (
+            request.session_id
+            and self.capacity
+            and (token_ids or ready)
+            and not request.saved
+        ):
             self.sessions[request.session_id] = RwkvSessionState(
-                request.identity, token_ids, state
+                request.identity, token_ids, state, ready, token_buffer, num_tokens
             )
             self.sessions.move_to_end(request.session_id)
             while len(self.sessions) > self.capacity:
@@ -388,12 +569,19 @@ class RwkvRuntimeCache:
             return self.upload_state(data["payload"], publish=False)
         if operation == "validate_upload_adapter":
             return self.upload_adapter(
-                data["adapter_id"], data["payload"], publish=False
+                data["adapter_id"],
+                data["payload"],
+                adapter_config=data.get("adapter_config"),
+                publish=False,
             )
         if operation == "upload_state":
             return self.upload_state(data["payload"])
         if operation == "upload_adapter":
-            return self.upload_adapter(data["adapter_id"], data["payload"])
+            return self.upload_adapter(
+                data["adapter_id"],
+                data["payload"],
+                adapter_config=data.get("adapter_config"),
+            )
         if operation == "delete_state":
             return {"deleted": self.states.pop(data["state_id"], None) is not None}
         if operation == "delete_adapter":
@@ -427,6 +615,8 @@ class RwkvRuntimeCache:
             self.requests.pop(data["request_id"], None)
             return {"cancelled": True}
         if operation == "status":
+            for snapshot in self.sessions.values():
+                snapshot.poll()
             tensors = [tensor for state in self.states.values() for tensor in state]
             tensors.extend(
                 tensor
@@ -438,6 +628,12 @@ class RwkvRuntimeCache:
                 for snapshot in self.sessions.values()
                 for tensor in snapshot.state
             )
+            tensors.extend(
+                t
+                for snapshot in self.sessions.values()
+                for t in (snapshot.token_buffer, snapshot.num_tokens)
+                if t is not None
+            )
             for request in self.requests.values():
                 tensors.extend(request.state or ())
                 tensors.extend(request.initial_state or ())
@@ -446,6 +642,7 @@ class RwkvRuntimeCache:
             storages = {
                 tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
                 for tensor in tensors
+                if tensor.device.type == "cpu"
             }
             return {
                 "ram_bytes": sum(storages.values()),
@@ -461,6 +658,9 @@ class RwkvRuntimeCache:
                 "session_cache_hits": self.hits,
                 "session_cache_misses": self.misses,
                 "session_cache_capacity": self.capacity,
+                "upload_capacity_bytes": self.upload_capacity,
+                "upload_bytes": self._tensor_bytes(self._upload_tensors()),
+                "adapter_capacity": 16,
                 "uploads": self.uploads,
             }
         raise ValueError(f"unknown RWKV cache operation: {operation}")

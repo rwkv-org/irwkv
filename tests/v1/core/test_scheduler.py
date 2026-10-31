@@ -71,6 +71,33 @@ def test_rwkv_different_adapters_wait_for_the_running_cohort():
     assert list(scheduler.waiting) == [other]
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_rwkv_adapter_waiter_stops_later_arrivals_from_extending_cohort(
+    async_scheduling, policy
+):
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling, scheduling_policy=policy
+    )
+    first, other = create_requests(2)
+    other.rwkv_adapter_key = "adapter"
+    if policy == "priority":
+        other.priority = -1
+    scheduler.add_request(first)
+    scheduler.schedule()
+    scheduler.add_request(other)
+    for step in range(3):
+        newer = create_requests(1, req_ids=[f"new-{step}"])[0]
+        newer.arrival_time = other.arrival_time + step + 1
+        scheduler.add_request(newer)
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) <= {first.request_id}
+        assert newer in scheduler.waiting
+    scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {other.request_id}
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

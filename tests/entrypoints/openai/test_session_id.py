@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,8 @@ from irwkv.entrypoints.openai.completion.protocol import CompletionRequest
 from irwkv.entrypoints.openai.responses.protocol import ResponsesRequest
 
 
-def test_rwkv_upload_and_session_management_use_the_engine_cache():
+def test_rwkv_upload_and_session_management_use_the_engine_cache(monkeypatch):
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
     import torch
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -55,10 +57,39 @@ def test_rwkv_upload_and_session_management_use_the_engine_cache():
         "deleted"
     ]
     assert client.get("/v1/state/list").json()["data"] == []
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "0")
+    assert client.post("/v1/state/upload").status_code == 403
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
     assert (
         client.post("/v1/adapters", files={"file": ("adapter.pth", b"bad")}).status_code
         == 400
     )
+    metadata = {"r": 4, "lora_alpha": 4, "use_nora": True, "target_modules": ["r_proj"]}
+    model.config.rwkv_lora = metadata
+    parameters = {
+        "model.layers.0.linear_attn.r_proj.lora_A.weight": torch.ones(4, 64),
+        "model.layers.0.linear_attn.r_proj.lora_B.weight": torch.zeros(64, 4),
+    }
+    model.named_parameters = lambda: parameters.items()
+    adapter = io.BytesIO()
+    torch.save(parameters, adapter)
+    response = client.post(
+        "/v1/adapters",
+        data={"adapter_id": "valid"},
+        files={"file": ("adapter.pth", adapter.getvalue())},
+    )
+    assert response.status_code == 400
+    assert "adapter_config" in response.json()["detail"]
+    response = client.post(
+        "/v1/adapters",
+        data={"adapter_id": "valid"},
+        files={
+            "file": ("adapter.pth", adapter.getvalue()),
+            "adapter_config": ("adapter_config.json", json.dumps(metadata)),
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["adapter_id"] == "valid"
 
     async def failed_collective_rpc(method, args):
         return [{"error": "adapter rank does not match the server"}]
@@ -107,6 +138,19 @@ def test_get_session_id_accepts_body_field(openai_request):
     )
 
     assert session_id == "body-session"
+
+
+@pytest.mark.parametrize(
+    "kind", [ChatCompletionRequest, CompletionRequest, ResponsesRequest]
+)
+def test_session_snapshot_opt_in_preserves_boolean_type(kind):
+    fields = {
+        ChatCompletionRequest: {"messages": [{"role": "user", "content": "hi"}]},
+        CompletionRequest: {"prompt": "hi"},
+        ResponsesRequest: {"input": "hi"},
+    }
+    request = kind(model="rwkv", irwkv_xargs={"session_snapshot": True}, **fields[kind])
+    assert request.irwkv_xargs["session_snapshot"] is True
 
 
 def test_get_session_id_accepts_session_header():

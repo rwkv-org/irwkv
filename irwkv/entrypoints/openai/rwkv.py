@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RWKV state, adapter upload, and session snapshot management routes."""
 
+import asyncio
+import json
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from starlette.datastructures import UploadFile
+
+from irwkv import envs
 
 router = APIRouter()
 
@@ -46,9 +50,27 @@ async def _rwkv_identifier(raw_request: Request, name: str) -> dict[str, Any]:
 
 
 async def _rwkv_upload(raw_request: Request, operation: str):
-    async with raw_request.form() as form:
+    if not envs.IRWKV_ALLOW_RUNTIME_RWKV_UPDATING:
+        raise HTTPException(
+            403, "runtime uploads require IRWKV_ALLOW_RUNTIME_RWKV_UPDATING=1"
+        )
+    lock = getattr(raw_request.app.state, "rwkv_upload_lock", None)
+    if lock is None:
+        lock = raw_request.app.state.rwkv_upload_lock = asyncio.Lock()
+    async with lock:
+        return await _rwkv_upload_locked(raw_request, operation)
+
+
+async def _rwkv_upload_locked(raw_request: Request, operation: str):
+    async with raw_request.form(
+        max_files=2 if operation == "upload_adapter" else 1,
+        max_fields=2,
+        max_part_size=64 << 10,
+    ) as form:
         files = [
-            value for _, value in form.multi_items() if isinstance(value, UploadFile)
+            value
+            for key, value in form.multi_items()
+            if key != "adapter_config" and isinstance(value, UploadFile)
         ]
         if len(files) != 1:
             raise HTTPException(400, "upload requires exactly one file")
@@ -62,6 +84,16 @@ async def _rwkv_upload(raw_request: Request, operation: str):
             if not isinstance(adapter_id, str) or not adapter_id:
                 raise HTTPException(400, "missing adapter_id")
             data["adapter_id"] = adapter_id
+            metadata = form.get("adapter_config")
+            if isinstance(metadata, UploadFile):
+                metadata = await metadata.read((64 << 10) + 1)
+            if metadata is not None:
+                if len(metadata) > 64 << 10:
+                    raise HTTPException(400, "adapter_config exceeds 64 KiB")
+                try:
+                    data["adapter_config"] = json.loads(metadata)
+                except (ValueError, UnicodeDecodeError) as error:
+                    raise HTTPException(400, "invalid adapter_config JSON") from error
         await _rwkv_rpc(raw_request, "validate_" + operation, data)
         return await _rwkv_rpc(raw_request, operation, data)
 

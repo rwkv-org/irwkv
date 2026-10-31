@@ -103,6 +103,8 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             raise ValueError("rwkv_lora.lora_alpha must be a finite number")
         if not isinstance(lora["use_nora"], bool):
             raise ValueError("rwkv_lora.use_nora must be a bool")
+        if lora["use_nora"] and alpha != rank:
+            raise ValueError("RWKV NoRA requires alpha/rank=1")
         modules = lora["target_modules"]
         if (
             not isinstance(modules, (list, tuple))

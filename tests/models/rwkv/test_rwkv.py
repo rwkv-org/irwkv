@@ -882,7 +882,7 @@ def test_first_eager_shape_tunes_without_changing_request_state(
 
 _LORA = {
     "r": 4,
-    "lora_alpha": 8,
+    "lora_alpha": 4,
     "use_nora": True,
     "target_modules": ["r_proj", "o_proj", "mlp.value", "lm_head"],
 }
@@ -934,6 +934,7 @@ def test_config_accepts_rwkv_lora() -> None:
         ({**_LORA, "r": 0}, "positive integer"),
         ({**_LORA, "r": True}, "positive integer"),
         ({**_LORA, "lora_alpha": "8"}, "finite number"),
+        ({**_LORA, "lora_alpha": 8}, "alpha/rank=1"),
         ({**_LORA, "use_nora": 1}, "must be a bool"),
         ({**_LORA, "target_modules": []}, "target_modules"),
         ({**_LORA, "target_modules": ["q_proj"]}, "target_modules"),
@@ -971,7 +972,7 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
     assert {name: tuple(param.shape) for name, param in adapters.items()} == expected
     assert all(param.dtype == torch.float32 for param in adapters.values())
     assert all(not param.any() for param in adapters.values())
-    assert model.lm_head.lora_scale == 2.0
+    assert model.lm_head.lora_scale == 1.0
     assert model.lm_head.use_nora
 
     from irwkv.model_executor.model_loader.default_loader import DefaultModelLoader
@@ -996,7 +997,8 @@ def _checkpoint_bytes(values: dict[str, torch.Tensor]) -> bytes:
 
 
 @pytest.mark.usefixtures("_single_rank")
-def test_lightning_nora_preserves_trained_factors_and_checks_manifest():
+def test_lightning_nora_preserves_trained_factors_and_checks_manifest(monkeypatch):
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
     targets = {
         "att.receptance.weight": "linear_attn.r_proj",
         "att.key.weight": "linear_attn.k_proj",
@@ -1129,6 +1131,52 @@ def test_session_restores_after_slot_zeroing_and_snapshots_before_reuse(monkeypa
     assert state._state_num_computed_tokens[0] == 34
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_session_async_snapshot_preserves_state_and_tokens_before_slot_reuse(
+    monkeypatch,
+):
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    config = _state_irwkv_config()
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    layer.bind_kv_cache(
+        torch.zeros((2, 1, 1, spec.page_size_bytes), dtype=torch.int8, device="cuda")
+    )
+    expected = (
+        torch.ones(2, 128, dtype=torch.bfloat16),
+        torch.full((2, 128), 2, dtype=torch.bfloat16),
+        torch.full((2, 2, 64, 64), 3, dtype=torch.float32),
+    )
+    layer.import_state(1, expected)
+    cache = RwkvRuntimeCache(SimpleNamespace())
+    cache.prepare({"request_id": "r", "session_id": "s", "token_ids": [1, 2, 3]})
+    state = object.__new__(RwkvModelState)
+    state.device = torch.device("cuda")
+    state.runtime_cache = cache
+    state._state_layer = layer
+    state._request_slots = {"r": torch.tensor([1], device="cuda", dtype=torch.int32)}
+    state._request_indices = {"r": 0}
+    state._snapshot_copy_stream = None
+    state.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([2], device="cuda")),
+        all_token_ids=SimpleNamespace(gpu=torch.tensor([[1, 2, 3]], device="cuda")),
+    )
+    sync_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        state.cache_finished_requests(["r"])
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_mode)
+    layer.reset_state_slots([1])
+    state.req_states.all_token_ids.gpu.zero_()
+    snapshot = cache.sessions["s"]
+    snapshot.ready.synchronize()
+    assert snapshot.poll()
+    assert snapshot.token_ids == [1, 2]
+    assert all(torch.equal(a, b) for a, b in zip(snapshot.state, expected))
+    assert all(t.is_pinned() for t in snapshot.state)
+
+
 def test_session_snapshot_only_reuses_the_exact_computed_prefix(monkeypatch) -> None:
     monkeypatch.setenv("IRWKV_RWKV_SESSION_CACHE_SIZE", "1")
     cache = RwkvRuntimeCache(SimpleNamespace())
@@ -1159,11 +1207,80 @@ def test_session_snapshot_only_reuses_the_exact_computed_prefix(monkeypatch) -> 
     assert cache.requests["other"].session_id is None
 
 
+@pytest.mark.parametrize("finish_order", [("older", "newer"), ("newer", "older")])
+def test_parallel_session_branches_only_publish_latest_admission(finish_order):
+    cache = RwkvRuntimeCache(SimpleNamespace())
+    state = (torch.ones(1),)
+    data = {"session_id": "shared", "token_ids": [1, 2]}
+    cache.prepare({**data, "request_id": "seed"})
+    cache.save_session("seed", [1], state)
+    for req_id in ("older", "newer"):
+        assert cache.prepare({**data, "request_id": req_id})["num_cached_tokens"] == 1
+    assert cache.requests["older"].state is cache.requests["newer"].state
+    for req_id in finish_order:
+        cache.save_session(req_id, [1, 3 if req_id == "older" else 4], state)
+    assert cache.sessions["shared"].token_ids == [1, 4]
+
+
+@pytest.mark.usefixtures("_single_rank")
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        {"r": 2},
+        {"lora_alpha": 9},
+        {"use_nora": False},
+        {"use_rslora": True},
+        {"rank_pattern": {"r_proj": 2}},
+        {"target_modules": ["r_proj"]},
+    ],
+)
+def test_peft_upload_rejects_missing_or_incompatible_metadata(metadata, monkeypatch):
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(_LORA))
+    cache = RwkvRuntimeCache(model)
+    weights = {
+        k: torch.ones_like(v) for k, v in model.named_parameters() if ".lora_" in k
+    }
+    metadata = None if metadata is None else {**_LORA, **metadata}
+    with pytest.raises(ValueError):
+        cache.upload_adapter("bad", _checkpoint_bytes(weights), adapter_config=metadata)
+    assert not cache.adapters
+
+
+@pytest.mark.usefixtures("_single_rank")
+def test_uploaded_adapters_evict_lru_and_bound_pinned_versions(monkeypatch):
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(_LORA))
+    cache = RwkvRuntimeCache(model)
+    payload = _checkpoint_bytes(
+        {k: torch.ones_like(v) for k, v in model.named_parameters() if ".lora_" in k}
+    )
+    for i in range(16):
+        cache.upload_adapter(str(i), payload, adapter_config=_LORA)
+    cache.prepare(
+        {"request_id": "active", "token_ids": [1], "options": {"adapter_id": "0"}}
+    )
+    cache.upload_adapter("16", payload, adapter_config=_LORA)
+    assert "0" in cache.adapters and "1" not in cache.adapters
+    assert len(cache.adapters) == 16
+    cache.manage("delete_adapter", {"adapter_id": "0"})
+    assert cache.requests["active"].adapter is not None
+    cache.upload_capacity = cache._tensor_bytes(
+        list(cache.requests["active"].adapter.values())
+    )
+    with pytest.raises(ValueError, match="capacity"):
+        cache.upload_adapter("new", payload, adapter_config=_LORA)
+    assert "new" not in cache.adapters
+
+
 @pytest.mark.usefixtures("_single_rank")
 @pytest.mark.parametrize("use_nora", [False, True])
 def test_uploaded_adapter_switches_in_place_and_pins_inflight_versions(
     use_nora,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
     model = RwkvForCausalLM(
         irwkv_config=_tiny_model_irwkv_config({**_LORA, "use_nora": use_nora})
     )
@@ -1171,7 +1288,9 @@ def test_uploaded_adapter_switches_in_place_and_pins_inflight_versions(
     pointers = {k: v.data_ptr() for k, v in parameters.items()}
     cache = RwkvRuntimeCache(model)
     weights = {k: torch.ones_like(v) for k, v in parameters.items()}
-    version = cache.upload_adapter("adapter", _checkpoint_bytes(weights))["version"]
+    version = cache.upload_adapter(
+        "adapter", _checkpoint_bytes(weights), adapter_config=model.config.rwkv_lora
+    )["version"]
     data = {
         "request_id": "first",
         "token_ids": [1, 2],
@@ -1202,7 +1321,9 @@ def test_uploaded_adapter_switches_in_place_and_pins_inflight_versions(
         == 0
     )
     cache.upload_adapter(
-        "adapter", _checkpoint_bytes({k: v * 2 for k, v in weights.items()})
+        "adapter",
+        _checkpoint_bytes({k: v * 2 for k, v in weights.items()}),
+        adapter_config=model.config.rwkv_lora,
     )
     with pytest.raises(ValueError, match="adapter_version"):
         cache.prepare(
@@ -1217,7 +1338,10 @@ def test_uploaded_adapter_switches_in_place_and_pins_inflight_versions(
 
 
 @pytest.mark.usefixtures("_single_rank")
-def test_uploaded_state_converts_reference_layout_and_rejects_bad_shapes() -> None:
+def test_uploaded_state_converts_reference_layout_and_rejects_bad_shapes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_RWKV_UPDATING", "1")
     model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(None))
     cache = RwkvRuntimeCache(model)
     tensor = torch.arange(2 * 64 * 64, dtype=torch.float32).reshape(2, 64, 64)
@@ -1233,6 +1357,10 @@ def test_uploaded_state_converts_reference_layout_and_rejects_bad_shapes() -> No
     with pytest.raises(ValueError, match="shape"):
         cache.upload_state(_checkpoint_bytes({k: v[0] for k, v in values.items()}))
     assert len(cache.states) == 1
+    cache.upload_capacity = cache.manage("status", {})["upload_bytes"]
+    with pytest.raises(ValueError, match="capacity"):
+        cache.upload_state(_checkpoint_bytes({k: v + 1 for k, v in values.items()}))
+    assert list(cache.states) == [info["state_id"]]
 
 
 def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1300,25 +1428,25 @@ def test_lora_passes_raw_adapters_to_flashrwkv2(monkeypatch, rwkv_lora) -> None:
     assert adapter_calls["infer_tmix_wkv_prepare_forward_varlen"] == {
         "receptance_lora_a": id(attention.r_proj.lora_A.weight),
         "receptance_lora_b": id(attention.r_proj.lora_B.weight),
-        "receptance_lora_scale": 2.0,
+        "receptance_lora_scale": 1.0,
         "receptance_use_nora": True,
     }
     assert adapter_calls["infer_tmix_readout_forward_varlen"] == {
         "output_lora_a": id(attention.o_proj.lora_A.weight),
         "output_lora_b": id(attention.o_proj.lora_B.weight),
-        "output_lora_scale": 2.0,
+        "output_lora_scale": 1.0,
         "output_use_nora": True,
     }
     assert adapter_calls["infer_cmix_forward_varlen"] == {
         "value_lora_a": id(feed_forward.value.lora_A.weight),
         "value_lora_b": id(feed_forward.value.lora_B.weight),
-        "value_lora_scale": 2.0,
+        "value_lora_scale": 1.0,
         "value_use_nora": True,
     }
     assert adapter_calls["infer_head_linear_all_forward_varlen"] == {
         "lora_a": id(model.lm_head.lora_A.weight),
         "lora_b": id(model.lm_head.lora_B.weight),
-        "lora_scale": 2.0,
+        "lora_scale": 1.0,
         "use_nora": True,
     }
 

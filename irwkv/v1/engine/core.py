@@ -457,7 +457,12 @@ class EngineCore:
         options = params.extra_args or {}
         if request.session_id is None and isinstance(options.get("session_id"), str):
             request.session_id = options["session_id"] or None
-        if not request.session_id and not any(
+        snapshot = options.get("session_snapshot", False)
+        if not isinstance(snapshot, bool):
+            raise ValueError("session_snapshot must be a bool")
+        if snapshot and not request.session_id:
+            raise ValueError("session_snapshot requires session_id")
+        if not snapshot and not any(
             key in options
             for key in ("state_id", "adapter_id", "adapter_version", "adapter_scale")
         ):
@@ -472,15 +477,9 @@ class EngineCore:
             raise ValueError(
                 "RWKV session snapshots cannot be combined with KV transfer"
             )
-        scheduler = cast("Scheduler", self.scheduler)
-        if request.session_id and any(
-            r.session_id == request.session_id and not r.is_finished()
-            for r in scheduler.requests.values()
-        ):
-            raise ValueError("a request is already active for this session_id")
         data = {
             "request_id": request.request_id,
-            "session_id": request.session_id,
+            "session_id": request.session_id if snapshot else None,
             "token_ids": request.prompt_token_ids,
             "options": options,
             "cache_salt": request.cache_salt,

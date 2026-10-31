@@ -734,6 +734,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+            rwkv_running = self._is_rwkv and bool(self.running)
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -765,6 +766,10 @@ class Scheduler(SchedulerInterface):
                 if self._is_rwkv and any(
                     r.rwkv_adapter_key != request.rwkv_adapter_key for r in self.running
                 ):
+                    # Drain an existing cohort before admitting more of it.
+                    # A newly selected cohort may fill its batch this step.
+                    if rwkv_running:
+                        break
                     skip_request(request_queue)
                     continue
 

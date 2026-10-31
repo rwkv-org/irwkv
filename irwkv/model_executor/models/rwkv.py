@@ -403,8 +403,10 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         for handle in self._wkv_handles:
             handle.materialize_slots_(indices)
 
-    def export_state(self, slot_id: int | torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Copy one materialized recurrent state to independent host storage."""
+    def export_state(
+        self, slot_id: int | torch.Tensor, *, device: str = "cpu"
+    ) -> tuple[torch.Tensor, ...]:
+        """Copy one materialized recurrent state to independent storage."""
         indices = self._slot_tensor(
             slot_id if isinstance(slot_id, torch.Tensor) else [slot_id]
         )
@@ -419,7 +421,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         return tuple(
             pool.index_select(1, indices.long())
             .squeeze(1)
-            .to(device="cpu")
+            .to(device=device)
             .contiguous()
             for pool in pools
             if pool is not None
@@ -453,7 +455,9 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         for pool, value in zip(pools, state):
             assert pool is not None
             pool.index_copy_(
-                1, indices.long(), value.to(device=pool.device).unsqueeze(1)
+                1,
+                indices.long(),
+                value.to(device=pool.device, non_blocking=True).unsqueeze(1),
             )
 
     def _prepare_live_ticket(self, metadata: RwkvAttentionMetadata) -> object:

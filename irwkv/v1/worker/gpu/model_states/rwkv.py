@@ -404,6 +404,7 @@ class RwkvModelState(DefaultModelState):
         self._request_slots: dict[str, torch.Tensor] = {}
         self._pending_restores: dict[int, tuple[torch.Tensor, ...]] = {}
         self._preempted: set[str] = set()
+        self._snapshot_copy_stream: torch.cuda.Stream | None = None
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -478,6 +479,33 @@ class RwkvModelState(DefaultModelState):
                 continue
             req_index = self._request_indices[req_id]
             assert self.req_states is not None
+            if self.device.type == "cuda":
+                # Gather on the execution stream before a slot can be reused.
+                state = self._state_layer.export_state(slot, device="cuda")
+                count = self.req_states.num_computed_tokens.gpu[req_index].clone()
+                tokens = self.req_states.all_token_ids.gpu[req_index].clone()
+                if self._snapshot_copy_stream is None:
+                    self._snapshot_copy_stream = torch.cuda.Stream(device=self.device)
+                copy_stream = self._snapshot_copy_stream
+                copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                ready = torch.cuda.Event()
+                with torch.cuda.stream(copy_stream):
+                    host = []
+                    for tensor in (*state, count, tokens):
+                        buffer = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                        buffer.copy_(tensor, non_blocking=True)
+                        tensor.record_stream(copy_stream)
+                        host.append(buffer)
+                    ready.record(copy_stream)
+                self.runtime_cache.save_session(
+                    req_id,
+                    [],
+                    tuple(host[:-2]),
+                    ready=ready,
+                    num_tokens=host[-2],
+                    token_buffer=host[-1],
+                )
+                continue
             num_tokens = int(self.req_states.num_computed_tokens.gpu[req_index].item())
             token_ids = self.req_states.all_token_ids.gpu[
                 req_index, :num_tokens
