@@ -73,6 +73,11 @@ continuation, so divergent suffixes do not modify each other. Only checkpoints
 actually saved by the scheduler can be reused; the match unit controls hashing
 granularity, not how often states are stored.
 
+A chat follow-up re-renders history without the previous generation prompt
+(`<think` or `<think></think`). RWKV therefore also stores the state at the
+last checkpoint before the prompt's final four tokens, so the next turn resumes
+there instead of a turn earlier.
+
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
