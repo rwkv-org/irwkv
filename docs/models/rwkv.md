@@ -124,13 +124,16 @@ Preserve the original namespace until the new process passes coverage checks.
 ## Decoding defaults
 
 RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
-three standalone generation configs:
+three standalone generation configs. These are the G1l and G1l-preview defaults:
 
 | Request mode | Config file | temperature | top_p | top_k | presence | frequency | decay |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Open Think | `generation_config.json` | 0.96 | 0.76 | 32 | 1.0 | 0.1 | 0.988 |
+| Open Think | `generation_config.json` | 0.96 | 0.90 | -1 | 1.0 | 0.09 | 0.994 |
 | Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 0.996 |
 | Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 0.996 |
+
+Earlier checkpoints may specify different values; irwkv uses the selected
+model artifact’s configuration. `top_k=-1` disables top-k filtering.
 
 These must be standalone `GenerationConfig` documents. Omit
 `_from_model_config` or set it to `false`; otherwise Transformers rebuilds the
@@ -146,11 +149,13 @@ and ends the generation prompt with `<think></think`:
 }
 ```
 
-`fake_cot_mode` defaults to `false`, which selects Open Think. The model's
-`chat_template.jinja` must read `fake_cot_mode` directly. Refresh existing
-model artifacts with the template from `transformers-rwkv/temp/rwkv_chat_template.jinja`.
+`fake_cot_mode` defaults to `false`, which selects Open Think. Model artifacts
+use the [`transformers-rwkv` chat template](https://github.com/rwkv-rs/transformers-rwkv/blob/83447dd9935ccce8cbec2693853e76a1c9c2212f/temp/rwkv_chat_template.jinja).
 Supplying tools always selects the Tools profile, regardless of the
 thinking mode. Explicit request sampling fields override the selected profile.
+The same profile selection applies to `LLM.chat()` and `LLM.enqueue_chat()`
+when `sampling_params` is omitted; explicitly supplied `sampling_params` are
+used as provided.
 
 All six controls are executed by
 `infer_sampling_six_parameter_forward_varlen`; `frequency_penalty` is the

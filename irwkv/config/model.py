@@ -90,6 +90,64 @@ AttnTypeStr = Literal[
 ]
 
 
+_RWKV_SAMPLING_PROFILE_FILES = {
+    "fake_think": "fake_think_generation_config.json",
+    "tools": "tools_generation_config.json",
+}
+_RWKV_SAMPLING_FIELDS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+        "penalty_decay",
+    }
+)
+
+
+def load_rwkv_sampling_profiles(
+    model_config: "ModelConfig", default_sampling_params: dict[str, Any]
+) -> dict[str, dict[str, Any]] | None:
+    if (
+        model_config.hf_config.model_type != "rwkv"
+        or model_config.generation_config == "irwkv"
+    ):
+        return None
+
+    profiles = {"open_think": default_sampling_params}
+    for profile, config_file_name in _RWKV_SAMPLING_PROFILE_FILES.items():
+        profiles[profile] = model_config.get_diff_sampling_param(
+            config_file_name=config_file_name
+        )
+
+    for profile, params in profiles.items():
+        missing = _RWKV_SAMPLING_FIELDS.difference(params)
+        if missing:
+            config_file_name = (
+                "generation_config.json"
+                if profile == "open_think"
+                else _RWKV_SAMPLING_PROFILE_FILES[profile]
+            )
+            raise ValueError(
+                f"RWKV {config_file_name} is missing Rapid-Sampling fields: "
+                + ", ".join(sorted(missing))
+            )
+    return profiles
+
+
+def select_rwkv_sampling_profile(
+    profiles: dict[str, dict[str, Any]],
+    tools: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if tools:
+        return profiles["tools"]
+    if (chat_template_kwargs or {}).get("fake_cot_mode", False) is True:
+        return profiles["fake_think"]
+    return profiles["open_think"]
+
+
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class ModelConfig:
     """Configuration for the model."""

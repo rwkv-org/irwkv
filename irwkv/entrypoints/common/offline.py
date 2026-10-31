@@ -450,7 +450,7 @@ class OfflineInferenceMixin:
                 added_request_ids.append(request_id)
         except Exception as e:
             if added_request_ids:
-                self.llm_engine.abort_request(added_request_ids, internal=True)
+                self.llm_engine.abort_request(added_request_ids)
             raise e
 
         return added_request_ids
@@ -467,12 +467,13 @@ class OfflineInferenceMixin:
 
         request_id = str(next(self.request_counter))
 
-        return self.llm_engine.add_request(
+        self.llm_engine.add_request(
             request_id,
             prompt,
             params,
             priority=priority,
         )
+        return request_id
 
     def _run_engine(
         self,

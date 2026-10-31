@@ -2,7 +2,7 @@
 # pinned native extension lazily for the visible CUDA architecture.
 
 torch==2.13.0
-transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@f93dd4e01e0b565ef0390f76c6726d1d121ebbab
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@83447dd9935ccce8cbec2693853e76a1c9c2212f
 tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python
 FlashRWKV2==0.1.0a17
 ninja

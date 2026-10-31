@@ -1573,6 +1573,7 @@ def test_reasoning_parser_completes_marker_from_prompt(
 def test_structured_output_keeps_content_merged_with_reasoning_end():
     from irwkv.reasoning import ReasoningParserManager
     from irwkv.v1.structured_output import StructuredOutputManager
+    from irwkv.v1.structured_output.backend_types import StructuredOutputGrammar
     from tests.parser.engine.conftest import make_mock_tokenizer
 
     tokenizer = make_mock_tokenizer(
@@ -1581,7 +1582,7 @@ def test_structured_output_keeps_content_merged_with_reasoning_end():
     )
     tokenizer.encode.side_effect = lambda text, **kwargs: [9] if text == "{" else []
     parser = ReasoningParserManager.get_reasoning_parser("rwkv")(tokenizer)
-    grammar = MagicMock()
+    grammar = MagicMock(spec=StructuredOutputGrammar)
     grammar.accept_tokens.return_value = True
     grammar.validate_tokens.side_effect = lambda tokens: tokens
     grammar.is_terminated.return_value = False
@@ -1611,9 +1612,11 @@ def test_structured_output_keeps_content_merged_with_reasoning_end():
 
 
 def test_guidance_uses_rwkv_byte_vocabulary():
+    from transformers import TokenizersBackend
+
     from irwkv.v1.structured_output.backend_guidance import GuidanceBackend
 
-    tokenizer = MagicMock()
+    tokenizer = MagicMock(spec=TokenizersBackend)
     tokenizer.backend_tokenizer.model = type("RwkvTrie", (), {})()
     tokenizer.get_vocab.return_value = {
         "<eos>": 0,
