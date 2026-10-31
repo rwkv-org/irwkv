@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 from collections.abc import AsyncGenerator
 from unittest.mock import MagicMock
 
@@ -41,6 +42,8 @@ MODEL_NAME = "rwkv-rs/rwkv7-g1-st"
 @pytest.fixture(scope="module")
 def default_server_args():
     return [
+        "--served-model-name",
+        MODEL_NAME,
         # use half precision for speed and memory savings in CI environment
         "--max-model-len",
         "2048",
@@ -52,7 +55,10 @@ def default_server_args():
 
 @pytest.fixture(scope="module")
 def server(default_server_args):
-    with RemoteOpenAIServer(MODEL_NAME, default_server_args) as remote_server:
+    model = os.environ.get("IRWKV_RWKV_TEST_MODEL")
+    if not model:
+        pytest.skip("IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint")
+    with RemoteOpenAIServer(model, default_server_args) as remote_server:
         yield remote_server
 
 

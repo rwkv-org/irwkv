@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Sequence
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
@@ -24,6 +25,8 @@ from irwkv.config.model import (
     ModelDType,
     RunnerOption,
     TokenizerMode,
+    load_rwkv_sampling_profiles,
+    select_rwkv_sampling_profile,
 )
 from irwkv.engine.arg_utils import EngineArgs
 from irwkv.entrypoints.chat_utils import (
@@ -379,6 +382,27 @@ class LLM(BeamSearchOfflineMixin, RLOfflineMixin, OfflineInferenceMixin):
             return SamplingParams.from_optional(**self.default_sampling_params)
         return SamplingParams()
 
+    @cached_property
+    def _rwkv_sampling_profiles(self) -> dict[str, dict[str, Any]] | None:
+        if self.default_sampling_params is None:
+            self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        return load_rwkv_sampling_profiles(
+            self.model_config, self.default_sampling_params
+        )
+
+    def _get_default_chat_sampling_params(
+        self,
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> SamplingParams:
+        profiles = self._rwkv_sampling_profiles
+        if profiles is None:
+            return self.get_default_sampling_params()
+        params = select_rwkv_sampling_profile(
+            profiles, bool(tools), chat_template_kwargs
+        )
+        return SamplingParams.from_optional(**params)
+
     def generate(
         self,
         prompts: PromptType | Sequence[PromptType],
@@ -622,7 +646,9 @@ class LLM(BeamSearchOfflineMixin, RLOfflineMixin, OfflineInferenceMixin):
 
         """
         if sampling_params is None:
-            sampling_params = self.get_default_sampling_params()
+            sampling_params = self._get_default_chat_sampling_params(
+                tools, chat_template_kwargs
+            )
 
         return self._run_chat(
             messages=messages,
@@ -688,7 +714,9 @@ class LLM(BeamSearchOfflineMixin, RLOfflineMixin, OfflineInferenceMixin):
 
         """
         if sampling_params is None:
-            sampling_params = self.get_default_sampling_params()
+            sampling_params = self._get_default_chat_sampling_params(
+                tools, chat_template_kwargs
+            )
 
         return self._add_chat_requests(
             messages=messages,
