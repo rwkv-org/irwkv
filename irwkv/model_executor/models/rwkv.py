@@ -261,13 +261,9 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         spec = self.get_kv_cache_spec(self._irwkv_config)
-        if not kv_cache.is_contiguous():
-            raise ValueError("RWKV state allocation must be contiguous")
-        total_bytes = kv_cache.numel() * kv_cache.element_size()
-        if total_bytes % spec.page_size_bytes:
-            raise ValueError("RWKV state allocation has a partial page")
-        self._num_slots = total_bytes // spec.page_size_bytes
-        raw = kv_cache.view(torch.int8).view(-1)
+        self._num_slots = kv_cache.shape[0]
+        total_bytes = self._num_slots * spec.state_content_size_bytes
+        raw = kv_cache.as_strided((total_bytes,), (1,)).view(torch.int8)
         offset = 0
         layer_count = self.num_local_layers
         slot_count = self._num_slots

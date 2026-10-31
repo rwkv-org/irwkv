@@ -16,7 +16,7 @@ from irwkv.v1.attention.backend import (
 )
 from irwkv.v1.attention.backends.registry import MambaAttentionBackendEnum
 from irwkv.v1.attention.backends.utils import mamba_get_block_table_tensor
-from irwkv.v1.kv_cache_interface import KVCacheLayout, MambaSpec
+from irwkv.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec, MambaSpec
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,19 @@ class RwkvStateSpec(MambaSpec):
     @property
     def requires_block_zeroing(self) -> bool:
         return True
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        # PP stages can hold different layer counts but need the same slot IDs.
+        return all(
+            isinstance(spec, RwkvStateSpec)
+            and spec.mamba_cache_mode == self.mamba_cache_mode
+            and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
+            and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.tp_replicated == self.tp_replicated
+            for spec in kv_cache_specs.values()
+        )
 
 
 class RwkvAttentionBackend(AttentionBackend):
