@@ -25,6 +25,16 @@ def register_api_routers(
 
     register_models_api_router(app)
 
+    if (
+        model_config is not None
+        and getattr(model_config.hf_config, "model_type", None) == "rwkv"
+    ):
+        from irwkv.entrypoints.openai.rwkv import (
+            attach_router as register_rwkv_api_router,
+        )
+
+        register_rwkv_api_router(app)
+
     from irwkv.entrypoints.serve.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )

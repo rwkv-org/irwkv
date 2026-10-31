@@ -182,6 +182,8 @@ class Request:
         # trace_headers
         self.trace_headers = trace_headers
         self.session_id = session_id
+        self.rwkv_num_cached_tokens = 0
+        self.rwkv_adapter_key = ""
         self.kv_hints = kv_hints
 
         # True if this request is scheduled as a non-final prefill chunk.

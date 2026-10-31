@@ -63,6 +63,7 @@ class MockModelConfig:
     def __init__(self):
         self.hf_config = Namespace()
         self.hf_config.num_labels = 1
+        self.hf_config.model_type = "rwkv"
 
 
 @pytest.fixture(params=get_args(SupportedTask))

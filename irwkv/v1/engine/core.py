@@ -15,7 +15,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
-from typing import Any, TypeVar, cast, get_args
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
 
 import msgspec
 import zmq
@@ -88,6 +88,9 @@ from irwkv.v1.structured_output import StructuredOutputManager
 from irwkv.v1.utils import compute_iteration_details
 from irwkv.version import __version__ as IRWKV_VERSION
 
+if TYPE_CHECKING:
+    from irwkv.v1.core.sched.scheduler import Scheduler
+
 logger = init_logger(__name__)
 
 
@@ -123,6 +126,7 @@ class EngineCore:
         self.log_stats = log_stats
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
+        self._rwkv_cache_used = False
 
         # Setup Model.
         self.model_executor = executor_class(irwkv_config)
@@ -435,11 +439,65 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
+        self._prepare_rwkv_request(request)
         self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
+
+    def _prepare_rwkv_request(self, request: Request) -> None:
+        if (
+            getattr(self.irwkv_config.model_config.hf_config, "model_type", None)
+            != "rwkv"
+        ):
+            return
+        params = request.sampling_params
+        assert params is not None
+        options = params.extra_args or {}
+        if request.session_id is None and isinstance(options.get("session_id"), str):
+            request.session_id = options["session_id"] or None
+        snapshot = options.get("session_snapshot", False)
+        if not isinstance(snapshot, bool):
+            raise ValueError("session_snapshot must be a bool")
+        if snapshot and not request.session_id:
+            raise ValueError("session_snapshot requires session_id")
+        if not snapshot and not any(
+            key in options
+            for key in ("state_id", "adapter_id", "adapter_version", "adapter_scale")
+        ):
+            return
+        if (
+            request.prompt_embeds is not None
+            or request.mm_features
+            or request.resumable
+        ):
+            raise ValueError("RWKV snapshots require non-streaming token prompts")
+        if self.scheduler.get_kv_connector() is not None:
+            raise ValueError(
+                "RWKV session snapshots cannot be combined with KV transfer"
+            )
+        data = {
+            "request_id": request.request_id,
+            "session_id": request.session_id if snapshot else None,
+            "token_ids": request.prompt_token_ids,
+            "options": options,
+            "cache_salt": request.cache_salt,
+            "skip_session": params.prompt_logprobs is not None,
+        }
+        results: list[dict[str, Any]] = self.collective_rpc(
+            "rwkv_cache", args=("prepare", data)
+        )
+        if len({r["num_cached_tokens"] for r in results}) > 1:
+            # Pipeline stages must restore the same token frontier.
+            data["skip_session"] = True
+            results = self.collective_rpc("rwkv_cache", args=("prepare", data))
+        request.rwkv_num_cached_tokens = results[0]["num_cached_tokens"]
+        request.rwkv_adapter_key = results[0]["adapter_key"]
+        request.skip_reading_prefix_cache = True
+        request.cache_salt = f"rwkv:{request.request_id}:{request.cache_salt}"
+        request.block_hashes.clear()
+        request.update_block_hashes()
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -733,9 +791,14 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
+        success = self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+        if success and getattr(self, "_rwkv_cache_used", False):
+            self.collective_rpc("rwkv_cache", args=("clear", {}))
+            for request in cast("Scheduler", self.scheduler).requests.values():
+                request.rwkv_num_cached_tokens = 0
+        return success
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -927,7 +990,33 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        if method == "rwkv_cache":
+            if self.irwkv_config.parallel_config.data_parallel_size != 1:
+                raise ValueError(
+                    "RWKV uploads and session snapshots currently require DP=1"
+                )
+            self._rwkv_cache_used = True
+            operation, data = args
+            data = {
+                **data,
+                "finished_req_ids": list(
+                    cast("Scheduler", self.scheduler).finished_req_ids
+                ),
+                "weight_version": self._weight_version,
+            }
+            args = (operation, data)
+        results = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        if method == "rwkv_cache":
+            typed_results = cast(list[dict[str, Any]], results)
+            errors = [result["error"] for result in typed_results if "error" in result]
+            if errors and args[0] in ("prepare", "clear"):
+                if args[0] == "prepare":
+                    self.model_executor.collective_rpc(
+                        "rwkv_cache",
+                        args=("cancel", {"request_id": args[1]["request_id"]}),
+                    )
+                raise ValueError(errors[0])
+        return results
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
@@ -1483,7 +1572,10 @@ class EngineCoreProc(EngineCore):
             req = request
             if self._reject_add_in_shutdown(req):
                 return
-            self.add_request(req)
+            try:
+                self.add_request(req)
+            except (ValueError, KeyError):
+                self._handle_request_preproc_error(req)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:

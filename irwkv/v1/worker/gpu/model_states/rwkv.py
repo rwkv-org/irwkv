@@ -18,11 +18,13 @@ from irwkv.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from irwkv.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from irwkv.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from irwkv.v1.worker.gpu.model_states.default import DefaultModelState
+from irwkv.v1.worker.gpu.model_states.rwkv_cache import RwkvRuntimeCache
 from irwkv.v1.worker.gpu.sample.bad_words import BadWordsState
 from irwkv.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from irwkv.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 from irwkv.v1.worker.gpu.sample.output import SamplerOutput
 from irwkv.v1.worker.gpu.sample.sampler import Sampler
+from irwkv.v1.worker.gpu.states import RequestState
 
 
 class _RwkvSamplingGraph:
@@ -396,6 +398,13 @@ class RwkvModelState(DefaultModelState):
         self._rwkv_group_id: int | None = None
         self._sampler: RwkvSampler | None = None
         self._model = model
+        self.runtime_cache = RwkvRuntimeCache(model)
+        self.req_states: RequestState | None = None
+        self._request_indices: dict[str, int] = {}
+        self._request_slots: dict[str, torch.Tensor] = {}
+        self._pending_restores: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._preempted: set[str] = set()
+        self._snapshot_copy_stream: torch.cuda.Stream | None = None
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -433,15 +442,77 @@ class RwkvModelState(DefaultModelState):
             new_req_data.num_computed_tokens - 1
         ) // self._block_size
         self._state_num_computed_tokens[req_index] = new_req_data.num_computed_tokens
+        self._request_indices[new_req_data.req_id] = req_index
+        request = self.runtime_cache.requests.get(new_req_data.req_id)
+        if request is not None and request.state is not None:
+            self._pending_restores[req_index] = request.state
+            self._state_block_columns[req_index] = -1
 
     def preempt_request(self, req_id: str) -> None:
+        self._preempted.add(req_id)
         if self._sampler is not None:
             self._sampler.preempt_request(req_id)
 
     def remove_request(self, req_id: str) -> None:
+        if req_id in self._preempted:
+            self._preempted.remove(req_id)
+        else:
+            self.cache_finished_requests([req_id])
+            self.runtime_cache.requests.pop(req_id, None)
+        req_index = self._request_indices.pop(req_id, None)
+        if req_index is not None:
+            self._pending_restores.pop(req_index, None)
+        self._request_slots.pop(req_id, None)
         super().remove_request(req_id)
         if self._sampler is not None:
             self._sampler.remove_request(req_id)
+
+    def cache_finished_requests(self, request_ids: Sequence[str]) -> None:
+        """Save before the scheduler can recycle a finished request's slot."""
+        for req_id in request_ids:
+            request = self.runtime_cache.requests.get(req_id)
+            slot = self._request_slots.get(req_id)
+            if request is None or request.saved or slot is None:
+                continue
+            if not request.session_id or not self.runtime_cache.capacity:
+                request.saved = True
+                continue
+            req_index = self._request_indices[req_id]
+            assert self.req_states is not None
+            if self.device.type == "cuda":
+                # Gather on the execution stream before a slot can be reused.
+                state = self._state_layer.export_state(slot, device="cuda")
+                count = self.req_states.num_computed_tokens.gpu[req_index].clone()
+                tokens = self.req_states.all_token_ids.gpu[req_index].clone()
+                if self._snapshot_copy_stream is None:
+                    self._snapshot_copy_stream = torch.cuda.Stream(device=self.device)
+                copy_stream = self._snapshot_copy_stream
+                copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                ready = torch.cuda.Event()
+                with torch.cuda.stream(copy_stream):
+                    host = []
+                    for tensor in (*state, count, tokens):
+                        buffer = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                        buffer.copy_(tensor, non_blocking=True)
+                        tensor.record_stream(copy_stream)
+                        host.append(buffer)
+                    ready.record(copy_stream)
+                self.runtime_cache.save_session(
+                    req_id,
+                    [],
+                    tuple(host[:-2]),
+                    ready=ready,
+                    num_tokens=host[-2],
+                    token_buffer=host[-1],
+                )
+                continue
+            num_tokens = int(self.req_states.num_computed_tokens.gpu[req_index].item())
+            token_ids = self.req_states.all_token_ids.gpu[
+                req_index, :num_tokens
+            ].tolist()
+            self.runtime_cache.save_session(
+                req_id, token_ids, self._state_layer.export_state(slot)
+            )
 
     def reset_kv_cache_blocks(self, block_ids: Sequence[int]) -> bool:
         self._state_layer.reset_state_slots(block_ids)
@@ -470,7 +541,14 @@ class RwkvModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        if not self._align_mode or input_batch.num_reqs == 0:
+        if input_batch.num_reqs == 0:
+            return
+
+        runtime_cache = getattr(self, "runtime_cache", None)
+        needs_state = runtime_cache is not None and runtime_cache.activate_adapter(
+            input_batch.req_ids
+        )
+        if not self._align_mode and not needs_state:
             return
 
         num_reqs = input_batch.num_reqs
@@ -478,7 +556,11 @@ class RwkvModelState(DefaultModelState):
         computed = self._state_num_computed_tokens[req_indices]
         query_lens = input_batch.num_scheduled_tokens[:num_reqs]
         old_columns = self._state_block_columns[req_indices]
-        new_columns = (computed + query_lens - 1) // self._block_size
+        new_columns = (
+            (computed + query_lens - 1) // self._block_size
+            if self._align_mode
+            else np.zeros(num_reqs, dtype=np.int64)
+        )
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
         if reset_rows_np.size:
@@ -508,6 +590,19 @@ class RwkvModelState(DefaultModelState):
                 row_indices, destination_columns
             ].contiguous()
             self._state_layer.copy_state_slots(source_indices, destination_indices)
+        if runtime_cache is not None:
+            for row, req_index in enumerate(req_indices):
+                req_id = input_batch.req_ids[row]
+                state = self._pending_restores.pop(int(req_index), None)
+                request = runtime_cache.requests.get(req_id)
+                if state is None and (request is None or not request.session_id):
+                    continue
+                column = int(new_columns[row])
+                slot = block_table[row, column : column + 1]
+                if req_id not in self._request_slots or old_columns[row] != column:
+                    self._request_slots[req_id] = slot.clone()
+                if state is not None:
+                    self._state_layer.import_state(slot, state)
         self._state_block_columns[req_indices] = new_columns
         self._state_num_computed_tokens[req_indices] = computed + query_lens
         del num_computed_tokens

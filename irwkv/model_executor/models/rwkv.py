@@ -403,6 +403,63 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         for handle in self._wkv_handles:
             handle.materialize_slots_(indices)
 
+    def export_state(
+        self, slot_id: int | torch.Tensor, *, device: str = "cpu"
+    ) -> tuple[torch.Tensor, ...]:
+        """Copy one materialized recurrent state to independent storage."""
+        indices = self._slot_tensor(
+            slot_id if isinstance(slot_id, torch.Tensor) else [slot_id]
+        )
+        self.materialize_state_slots(indices)
+        pools = (
+            self._tmix_shift_pool,
+            self._cmix_shift_pool,
+            self._wkv_state_pool,
+        )
+        if any(pool is None for pool in pools):
+            raise RuntimeError("RWKV state pool has not been bound")
+        return tuple(
+            pool.index_select(1, indices.long())
+            .squeeze(1)
+            .to(device=device)
+            .contiguous()
+            for pool in pools
+            if pool is not None
+        )
+
+    def import_state(
+        self, slot_id: int | torch.Tensor, state: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Restore a host snapshot into the existing caller-backed state slot."""
+        pools = (
+            self._tmix_shift_pool,
+            self._cmix_shift_pool,
+            self._wkv_state_pool,
+        )
+        if len(state) != len(pools):
+            raise ValueError("RWKV snapshot requires two shift tensors and WKV state")
+        for pool, value in zip(pools, state):
+            if pool is None:
+                raise RuntimeError("RWKV state pool has not been bound")
+            if (
+                value.shape != (pool.shape[0], *pool.shape[2:])
+                or value.dtype != pool.dtype
+            ):
+                raise ValueError(
+                    "RWKV snapshot shape or dtype does not match the model"
+                )
+        indices = self._slot_tensor(
+            slot_id if isinstance(slot_id, torch.Tensor) else [slot_id]
+        )
+        self.reset_state_slots(indices)
+        for pool, value in zip(pools, state):
+            assert pool is not None
+            pool.index_copy_(
+                1,
+                indices.long(),
+                value.to(device=pool.device, non_blocking=True).unsqueeze(1),
+            )
+
     def _prepare_live_ticket(self, metadata: RwkvAttentionMetadata) -> object:
         flashrwkv2 = _load_flashrwkv2()
         assert metadata.num_active_tokens is not None
@@ -1094,7 +1151,13 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if getattr(self.config, "rwkv_lora", None) is not None:
+            # Adapters absent from a base checkpoint are initialized to zero.
+            loaded.update(
+                name for name, _ in self.named_parameters() if ".lora_" in name
+            )
+        return loaded
 
     def process_weights_after_loading(self) -> None:
         self.model.process_weights_after_loading()

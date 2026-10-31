@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -32,6 +33,33 @@ MODEL_NAME = os.environ.get("IRWKV_RWKV_TEST_MODEL", "rwkv-rs/rwkv7-g1-st")
 PROMPT_TOKENS = [326] * 12
 
 _REQUEST_COUNTER = 0
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_rwkv_parallel_session_requests_require_opt_in_for_snapshots(snapshot):
+    from irwkv.v1.request import Request
+
+    core = object.__new__(EngineCore)
+    core.irwkv_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="rwkv")),
+        parallel_config=SimpleNamespace(data_parallel_size=1 if snapshot else 2),
+    )
+    core.scheduler = MagicMock()
+    core.scheduler.get_kv_connector.return_value = None if snapshot else object()
+    core.collective_rpc = MagicMock(
+        return_value=[{"num_cached_tokens": 0, "adapter_key": ""}]
+    )
+    for _ in range(2):
+        data = make_request()
+        data.session_id = "shared-session"
+        data.sampling_params.extra_args = {"session_snapshot": snapshot}
+        request = Request.from_engine_core_request(data, None)
+        core._prepare_rwkv_request(request)
+        assert request.session_id == "shared-session"
+    if snapshot:
+        assert core.collective_rpc.call_count == 2
+    else:
+        core.collective_rpc.assert_not_called()
 
 
 def make_request() -> EngineCoreRequest:

@@ -42,6 +42,62 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rwkv_session_hit_only_schedules_uncached_suffix(async_scheduling):
+    scheduler = create_scheduler(async_scheduling=async_scheduling)
+    request = create_requests(1, num_tokens=33)[0]
+    request.rwkv_num_cached_tokens = 29
+    request.skip_reading_prefix_cache = True
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 4}
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 29
+    assert request.prefill_stats.num_external_cached_tokens == 29
+
+
+def test_rwkv_different_adapters_wait_for_the_running_cohort():
+    scheduler = create_scheduler()
+    first, other, same = create_requests(3)
+    first.rwkv_adapter_key = same.rwkv_adapter_key = "adapter-v1:1"
+    other.rwkv_adapter_key = "adapter-v2:1"
+    for request in (first, other, same):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {first.request_id, same.request_id}
+    assert list(scheduler.waiting) == [other]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_rwkv_adapter_waiter_stops_later_arrivals_from_extending_cohort(
+    async_scheduling, policy
+):
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling, scheduling_policy=policy
+    )
+    first, other = create_requests(2)
+    other.rwkv_adapter_key = "adapter"
+    if policy == "priority":
+        other.priority = -1
+    scheduler.add_request(first)
+    scheduler.schedule()
+    scheduler.add_request(other)
+    for step in range(3):
+        newer = create_requests(1, req_ids=[f"new-{step}"])[0]
+        newer.arrival_time = other.arrival_time + step + 1
+        scheduler.add_request(newer)
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) <= {first.request_id}
+        assert newer in scheduler.waiting
+    scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {other.request_id}
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

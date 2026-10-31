@@ -86,6 +86,9 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.irwkv_config = irwkv_config
+        self._is_rwkv = (
+            getattr(irwkv_config.model_config.hf_config, "model_type", None) == "rwkv"
+        )
         self.scheduler_config = irwkv_config.scheduler_config
         self.cache_config = irwkv_config.cache_config
         self.model_uses_mrope = irwkv_config.model_config.uses_mrope
@@ -731,6 +734,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+            rwkv_running = self._is_rwkv and bool(self.running)
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -758,6 +762,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if self._is_rwkv and any(
+                    r.rwkv_adapter_key != request.rwkv_adapter_key for r in self.running
+                ):
+                    # Drain an existing cohort before admitting more of it.
+                    # A newly selected cohort may fill its batch this step.
+                    if rwkv_running:
+                        break
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -865,14 +879,23 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
+                    if request.rwkv_num_cached_tokens:
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                        num_external_computed_tokens = request.rwkv_num_cached_tokens
+                        num_computed_tokens = request.rwkv_num_cached_tokens
                     assert num_computed_tokens <= request.num_tokens
                     # DSV41 SWA bounded replay: a KV load that carries the
                     # window is taken as is; any other hit no longer than the
                     # replayed window would be recomputed in full and save
                     # nothing.
-                    window_loaded = bool(
-                        num_external_computed_tokens
-                    ) and self._load_restores_replay_window(request)
+                    window_loaded = (
+                        self.connector is not None
+                        and bool(num_external_computed_tokens)
+                        and self._load_restores_replay_window(request)
+                    )
                     if (
                         not window_loaded
                         and 0 < num_computed_tokens <= self.prefix_replay_tokens

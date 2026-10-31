@@ -1289,6 +1289,22 @@ class Worker(WorkerBase):
         # worker will always be healthy as long as it's running.
         return
 
+    @torch.inference_mode()
+    def rwkv_cache(self, operation: str, data: dict[str, Any]) -> dict[str, Any]:
+        from irwkv.v1.worker.gpu.model_states.rwkv import RwkvModelState
+
+        state = self.model_runner.model_state
+        if not isinstance(state, RwkvModelState):
+            raise ValueError("RWKV uploads and session snapshots require an RWKV model")
+        try:
+            state.req_states = self.model_runner.req_states
+            state.cache_finished_requests(data.get("finished_req_ids", ()))
+            if operation == "prepare":
+                return state.runtime_cache.prepare(data)
+            return state.runtime_cache.manage(operation, data)
+        except (ValueError, KeyError, TypeError) as error:
+            return {"error": str(error)}
+
     def save_sharded_state(
         self,
         path: str,
