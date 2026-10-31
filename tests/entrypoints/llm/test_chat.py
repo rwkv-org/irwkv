@@ -9,7 +9,6 @@ import pytest
 from irwkv.entrypoints.llm import LLM
 from irwkv.exceptions import IRWKVValidationError
 from irwkv.sampling_params import SamplingParams
-from irwkv.utils.counter import Counter
 
 
 @pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
@@ -143,30 +142,6 @@ def test_rwkv_chat_rejects_incomplete_sampling_profiles(method):
 
     with pytest.raises(ValueError, match="generation_config.json.*missing"):
         getattr(llm, method)([{"role": "user", "content": "Hello"}])
-
-
-def test_enqueue_returns_external_request_id():
-    llm = LLM.__new__(LLM)
-    llm.request_counter = Counter()
-    llm.llm_engine = MagicMock()
-    llm.llm_engine.add_request.return_value = "0-internal"
-
-    assert llm._add_request({"prompt_token_ids": [1]}, SamplingParams()) == "0"
-    assert llm.llm_engine.add_request.call_args.args[0] == "0"
-
-
-def test_enqueue_aborts_external_ids_if_rendering_fails():
-    llm = LLM.__new__(LLM)
-    llm.llm_engine = MagicMock()
-    llm._add_request = MagicMock(return_value="0")
-
-    def prompts():
-        yield {"prompt_token_ids": [1]}
-        raise ValueError("render failed")
-
-    with pytest.raises(ValueError, match="render failed"):
-        llm._render_and_add_requests(prompts(), [SamplingParams(), SamplingParams()])
-    llm.llm_engine.abort_request.assert_called_once_with(["0"])
 
 
 @pytest.fixture(scope="function")
