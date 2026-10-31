@@ -121,6 +121,15 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+        self.continuation_tail_tokens = max(
+            (
+                group.kv_cache_spec.continuation_tail_tokens
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode == "align"
+            ),
+            default=0,
+        )
 
     def get_num_blocks_to_allocate(
         self,
@@ -284,7 +293,14 @@ class KVCacheCoordinator(ABC):
         A hit is the shortest across all groups, so every group retains state
         at each position. A resend of the identical prompt is capped at
         ``num_tokens - 1`` because its last token is recomputed for logits.
+        A follow-up turn that replaces the prompt's last
+        ``continuation_tail_tokens`` resumes before that tail.
         """
+        if self.continuation_tail_tokens:
+            return (
+                request.num_prompt_tokens - 1,
+                request.num_prompt_tokens - self.continuation_tail_tokens,
+            )
         return (request.num_prompt_tokens - 1,)
 
     def get_num_cacheable_tokens(self, num_computed_tokens: int) -> int:

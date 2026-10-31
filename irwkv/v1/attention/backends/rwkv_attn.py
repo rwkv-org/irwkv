@@ -29,6 +29,12 @@ class RwkvStateSpec(MambaSpec):
     def requires_block_zeroing(self) -> bool:
         return True
 
+    @property
+    def continuation_tail_tokens(self) -> int:
+        # The next chat turn replaces the generation prompt: two tokens for
+        # "<think", four for "<think></think".
+        return 4
+
 
 class RwkvAttentionBackend(AttentionBackend):
     @staticmethod

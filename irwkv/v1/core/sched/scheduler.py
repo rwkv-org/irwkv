@@ -330,6 +330,12 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
         )
+        self.mamba_continuation_tail_tokens = (
+            self.kv_cache_manager.coordinator.continuation_tail_tokens
+            if self.need_mamba_block_aligned_split
+            and self.cache_config.enable_prefix_caching
+            else 0
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -444,6 +450,14 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        # State before a replaceable prompt tail (the chat generation prompt).
+        continuation_stop = (
+            (request.num_prompt_tokens - self.mamba_continuation_tail_tokens)
+            // ckpt_block_size
+            * ckpt_block_size
+            if self.mamba_continuation_tail_tokens
+            else 0
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -459,6 +473,7 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
+            continuation_stop,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

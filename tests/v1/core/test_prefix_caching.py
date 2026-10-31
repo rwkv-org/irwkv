@@ -26,6 +26,7 @@ from irwkv.multimodal.inputs import (
 )
 from irwkv.sampling_params import SamplingParams
 from irwkv.utils.hashing import sha256, sha256_cbor
+from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
 from irwkv.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from irwkv.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
 from irwkv.v1.core.kv_cache_utils import (
@@ -225,6 +226,85 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
     assert sibling_hit.blocks[0][-1] is checkpoint
     manager.block_pool.free_blocks(retained)
     manager.free(child)
+
+
+@pytest.mark.parametrize(
+    ("spec_cls", "hash_block_size", "num_prompt_tokens", "chunks", "follow_up_hit"),
+    [
+        (MambaSpec, 32, 65, [64, 1], 0),
+        (RwkvStateSpec, 32, 65, [32, 32, 1], 32),
+        (MambaSpec, 8, 81, [64, 16, 1], 64),
+        (RwkvStateSpec, 8, 81, [64, 8, 8, 1], 72),
+    ],
+)
+def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
+    spec_cls, hash_block_size, num_prompt_tokens, chunks, follow_up_hit
+):
+    """A chat follow-up re-renders history without the previous generation
+    prompt ("<think"), so it diverges a few tokens before the prompt end. RWKV
+    also stops prefill and keeps the state before that tail, while an identical
+    resend still resumes at the prompt end."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    spec_cls(
+                        block_size=block_size,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+    )
+    scheduler = SimpleNamespace(
+        block_size=block_size,
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=128,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=hash_block_size < block_size,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_continuation_tail_tokens=manager.coordinator.continuation_tail_tokens,
+    )
+    prompt = list(range(num_prompt_tokens))
+    turn = make_request("turn", prompt, hash_block_size, sha256)
+    scheduled = []
+    while turn.num_computed_tokens < num_prompt_tokens:
+        chunk = Scheduler._mamba_block_aligned_split(
+            self=scheduler,
+            request=turn,
+            num_new_tokens=num_prompt_tokens - turn.num_computed_tokens,
+        )
+        assert manager.allocate_slots(turn, chunk) is not None
+        _, retained = manager.take_kv_cache_block_copies()
+        manager.block_pool.free_blocks(retained)
+        turn.num_computed_tokens += chunk
+        manager.new_step_starts()
+        scheduled.append(chunk)
+    manager.free(turn)
+    assert scheduled == chunks
+
+    follow_up = make_request(
+        "follow_up", [*prompt[:-2], 1000, 1001], hash_block_size, sha256
+    )
+    follow_up_blocks, num_computed, _ = manager.get_computed_blocks(follow_up)
+    assert num_computed == follow_up_hit
+    resend = make_request("resend", prompt, hash_block_size, sha256)
+    resend_blocks, num_computed, _ = manager.get_computed_blocks(resend)
+    assert num_computed == (num_prompt_tokens - 1) // hash_block_size * hash_block_size
+    if follow_up_hit:
+        assert follow_up_blocks.blocks[0][-1] is not resend_blocks.blocks[0][-1]
 
 
 def make_kv_cache_config_hybrid_model(
@@ -1003,6 +1083,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_continuation_tail_tokens=0,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
