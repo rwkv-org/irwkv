@@ -23,7 +23,7 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a17`. FlashRWKV2 exposes the public
+commits and `FlashRWKV2==0.1.0a18`. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
