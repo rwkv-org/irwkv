@@ -23,7 +23,7 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a17`. FlashRWKV2 exposes the public
+commits and `FlashRWKV2==0.1.0a18`. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -97,7 +97,7 @@ Preparation uses the loaded model weights, configured state dtype, and each
 actual graph shape, including the separate head/sampling graphs. Model tuning
 uses fully active metadata and startup state slots, which are reset before
 capture. The report records each selected configuration, fingerprint, device
-class, profile path, and hit/missing/tuned/revalidated status. Same-class GPUs
+class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
 and new worker processes reuse profiles through FlashRWKV2's locking and
 compatibility checks.
 
@@ -115,11 +115,12 @@ After preparation, restart with `IRWKV_RWKV_TUNING_MODE=require` to verify loadi
 and capture in a fresh process. Eager workloads can use FlashRWKV2's public
 `prepare_tuning` with representative forward calls and disposable state.
 
-For a legacy namespace, add
-`IRWKV_RWKV_TUNING_LEGACY_DIR=/path/to/tuning/<legacy-namespace>` to the explicit
-`tune` run. FlashRWKV2 revalidates matching old configurations against the
-current operators before publishing them; it tunes missing shapes normally.
-Preserve the original namespace until the new process passes coverage checks.
+On RTX 4090 and PRO 6000 GPUs, FlashRWKV2 uses deterministic configurations for
+supported BF16 projections and head-size-64 WKV with FP32 state. These dispatches
+report `fixed` and do not search or time configurations. Preparation still compiles
+their reachable kernel variants before capture. FP16 recurrent state and other
+unsupported layouts retain verified profiles and bounded tuning. After upgrading,
+run preparation again; compatible TileLang binaries remain reusable.
 
 ## Decoding defaults
 
