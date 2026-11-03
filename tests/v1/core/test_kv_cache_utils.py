@@ -1461,6 +1461,55 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
     ]
 
 
+@pytest.mark.parametrize("local_layers", [(31, 30), (32, 32)])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("blocks_per_rank", [(9, 13), (13, 9)])
+def test_rwkv_pp_state_uses_one_block_per_request(
+    local_layers, state_dtype, blocks_per_rank
+):
+    from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
+
+    config = IrwkvConfig(model_config=_model_config(max_model_len=512))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    config.cache_config.prefix_cache_retention_interval = None
+    config.cache_config.mamba_cache_mode = "none"
+    specs = [
+        RwkvStateSpec(
+            block_size=16,
+            shapes=((layers, 4096), (layers, 4096), (layers, 64, 64, 64)),
+            dtypes=(torch.bfloat16, torch.bfloat16, state_dtype),
+        )
+        for layers in local_layers
+    ]
+    workers = [{f"stage{rank}.state": spec} for rank, spec in enumerate(specs)]
+    configs = get_kv_cache_configs(
+        config,
+        workers,
+        [spec.page_size_bytes * blocks for spec, blocks in zip(specs, blocks_per_rank)],
+    )
+    for worker, spec in zip(configs, specs):
+        assert worker.num_blocks == 9
+        assert len(worker.kv_cache_groups) == 1
+        assert worker.kv_cache_tensors[0].size == 9 * spec.page_size_bytes
+        assert get_max_concurrency_for_kv_cache_config(config, worker) == 9
+
+    scheduler = generate_scheduler_kv_cache_config(configs)
+    assert len(scheduler.kv_cache_groups) == 1
+    assert get_max_concurrency_for_kv_cache_config(config, scheduler) == 9
+    manager = KVCacheManager(
+        kv_cache_config=scheduler,
+        max_model_len=512,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    for index in range(8):
+        blocks = manager.allocate_slots(make_request(str(index), [1]), 1)
+        assert blocks is not None
+        assert len(blocks.get_block_ids()) == 1
+        assert len(blocks.get_block_ids()[0]) == 1
+    assert manager.allocate_slots(make_request("full", [1]), 1) is None
+
+
 def test_project_kv_cache_groups_to_worker():
     spec_a = new_kv_cache_spec()
     spec_b = new_kv_cache_spec(num_kv_heads=4)
@@ -2518,6 +2567,66 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     assert kv_cache_utils.resolve_kv_cache_block_sizes(
         kv_cache_config, irwkv_config
     ) == (544, 136)
+
+
+def _single_group_configs(spec, match_unit):
+    kv_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=32, enable_prefix_caching=True, prefix_match_unit=match_unit
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    return kv_config, config
+
+
+_ALIGNED_MAMBA_32 = MambaSpec(
+    block_size=32, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+)
+_FULL_ATTENTION_32 = FullAttentionSpec(
+    block_size=32, num_kv_heads=1, head_size=1, dtype=torch.float32
+)
+
+
+@pytest.mark.parametrize(
+    ("spec", "match_unit", "expected"),
+    [
+        (_ALIGNED_MAMBA_32, None, 32),
+        (_ALIGNED_MAMBA_32, 32, 32),
+        (_ALIGNED_MAMBA_32, 8, 8),
+        (_ALIGNED_MAMBA_32, 1, 1),
+        (_FULL_ATTENTION_32, None, 32),
+        (_FULL_ATTENTION_32, 32, 32),
+    ],
+)
+def test_single_group_prefix_match_unit(spec, match_unit, expected):
+    """A single aligned recurrent state can resume inside a physical block."""
+    kv_config, config = _single_group_configs(spec, match_unit)
+    sizes = kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
+    assert sizes == (32, expected)
+    assert (
+        kv_cache_utils.resolve_cache_hit_alignment_tokens(kv_config, config, *sizes)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "match_unit"),
+    [
+        (_ALIGNED_MAMBA_32, 3),
+        (_ALIGNED_MAMBA_32, 64),
+        (_FULL_ATTENTION_32, 8),
+    ],
+)
+def test_single_group_rejects_invalid_prefix_match_unit(spec, match_unit):
+    kv_config, config = _single_group_configs(spec, match_unit)
+    with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
+        kv_cache_utils.resolve_kv_cache_block_sizes(kv_config, config)
 
 
 def test_resolve_dcp_kv_block_size_unwraps_uniform_type_specs():

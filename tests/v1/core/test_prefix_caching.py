@@ -173,6 +173,60 @@ def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks():
     assert all(block.ref_cnt == 0 for block in old_blocks[:-1])
 
 
+def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
+    """A suffix request must not mutate the shared sub-block checkpoint."""
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=32,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=8,
+    )
+    parent = make_request("parent", list(range(73)), 8, sha256)
+    [checkpoint] = manager.block_pool.get_new_blocks(1)
+    manager.block_pool.cache_partial_block(
+        request=parent,
+        block=checkpoint,
+        num_tokens=72,
+        kv_cache_group_id=0,
+        block_size=32,
+    )
+    manager.block_pool.free_blocks([checkpoint])
+    child = make_request("child", list(range(72)) + [999], 8, sha256)
+    hit, num_computed, _ = manager.get_computed_blocks(child)
+    assert num_computed == 72
+    assert hit.blocks[0][-1] is checkpoint
+    allocated = manager.allocate_slots(
+        child, 1, num_new_computed_tokens=num_computed, new_computed_blocks=hit
+    )
+    assert allocated is not None
+    private = manager.get_blocks(child.request_id).blocks[0][-1]
+    assert private is not checkpoint
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert [(copy.src_block_id, copy.dst_block_id) for copy in copies] == [
+        (checkpoint.block_id, private.block_id)
+    ]
+    sibling = make_request("sibling", list(range(72)) + [888], 8, sha256)
+    sibling_hit, sibling_computed, _ = manager.get_computed_blocks(sibling)
+    assert sibling_computed == 72
+    assert sibling_hit.blocks[0][-1] is checkpoint
+    manager.block_pool.free_blocks(retained)
+    manager.free(child)
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,
