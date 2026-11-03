@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -69,9 +70,9 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a17"
+    module.__version__ = "0.1.0a18"
     module.get_tuning_cache_dir = lambda: None
-    module.prepare_tuning = lambda calls, **kwargs: [call() for call in calls]
+    module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
@@ -120,7 +121,10 @@ def _state_irwkv_config(state_dtype: str = "float32") -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
-def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -> None:
+@pytest.mark.parametrize("padded_page", [False, True])
+def test_state_spec_and_caller_backed_slot_lifecycle(
+    monkeypatch, state_dtype, padded_page
+) -> None:
     monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
     irwkv_config = _state_irwkv_config(state_dtype)
     state_layer = RwkvStateLayer(irwkv_config, 2, "model.layers.0.rwkv_state")
@@ -136,8 +140,10 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
     assert spec.num_prefill_checkpoint_blocks == 0
 
     num_slots = 3
-    raw = torch.zeros((num_slots, 1, 1, spec.page_size_bytes), dtype=torch.int8)
-    state_layer.bind_kv_cache(raw)
+    page_size = spec.page_size_bytes
+    allocation_page_size = page_size * 3 // 2 if padded_page else page_size
+    raw = torch.zeros((num_slots, 1, 1, allocation_page_size), dtype=torch.int8)
+    state_layer.bind_kv_cache(raw[..., :page_size])
     tmix, handle, cmix = state_layer.get_layer_state(0)
     assert handle.state.shape == (num_slots, 2, 64, 64)
     assert handle.state.dtype == getattr(torch, state_dtype)
@@ -176,6 +182,7 @@ def test_state_spec_and_caller_backed_slot_lifecycle(monkeypatch, state_dtype) -
     assert torch.all(tmix[0] == 1) and torch.all(tmix[1] == 5)
     assert torch.all(handle.state[0] == 2) and torch.all(handle.state[1] == 6)
     assert torch.all(cmix[0] == 4) and torch.all(cmix[1] == 8)
+    assert torch.count_nonzero(raw.view(-1)[num_slots * page_size :]) == 0
 
     state_layer.materialize_state_slots(source)
     handles = []
@@ -657,7 +664,7 @@ def test_graph_warmup_checks_coverage_without_repeating_state_updates(
     updates = []
     output = torch.ones(2, 4)
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         modes.append(mode)
         for call in calls:
             call()
@@ -686,7 +693,7 @@ def test_graph_warmup_checks_coverage_without_repeating_state_updates(
 def test_graph_warmup_propagates_missing_profile_diagnostic(monkeypatch) -> None:
     module: Any = _fake_flashrwkv2()
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         assert mode == "require"
         raise RuntimeError("missing verified tuning profile: tmix/wkv7")
 
@@ -744,7 +751,7 @@ def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fai
             pool.index_fill_(0, context.state_indices.long(), 1)
         return torch.ones(4, 2)
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         modes.append(mode)
         for call in calls:
             call()
@@ -824,7 +831,7 @@ def test_first_eager_shape_tunes_without_changing_request_state(
             pool.fill_(value)
         return input_ids
 
-    def prepare(calls, *, mode, legacy_dir):
+    def prepare(calls, *, mode):
         modes.append(mode)
         for call in calls:
             call()
@@ -1453,6 +1460,58 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
         reference = single
 
 
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL") or torch.accelerator.device_count() < 2,
+    reason="a local RWKV checkpoint and two GPUs are required",
+)
+def test_real_model_uneven_pipeline_matches_single_gpu(irwkv_runner, monkeypatch):
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    with open(os.path.join(model_path, "config.json")) as config_file:
+        num_layers = json.load(config_file)["num_hidden_layers"]
+    first_stage = num_layers // 2 - 1
+    params = SamplingParams(
+        temperature=0,
+        max_tokens=8,
+        ignore_eos=True,
+        logprobs=1,
+        detokenize=False,
+    )
+    prompts = [
+        {"prompt_token_ids": list(range(1, 34))},
+        {"prompt_token_ids": list(range(7, 54))},
+    ]
+    outputs = []
+    monkeypatch.delenv("IRWKV_PP_LAYER_PARTITION", raising=False)
+    for pp_size in (1, 2):
+        if pp_size == 2:
+            monkeypatch.setenv(
+                "IRWKV_PP_LAYER_PARTITION", f"{first_stage},{num_layers - first_stage}"
+            )
+        with irwkv_runner(
+            model_path,
+            dtype="bfloat16",
+            pipeline_parallel_size=pp_size,
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            max_num_seqs=4,
+            gpu_memory_utilization=0.7,
+            num_gpu_blocks_override=16,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        ) as runner:
+            outputs.append(runner.llm.generate(prompts, params))
+
+    for single, pipeline in zip(*outputs):
+        expected, actual = single.outputs[0], pipeline.outputs[0]
+        assert actual.token_ids == expected.token_ids
+        for token, expected_probs, actual_probs in zip(
+            expected.token_ids, expected.logprobs, actual.logprobs
+        ):
+            assert actual_probs[token].logprob == pytest.approx(
+                expected_probs[token].logprob, abs=1e-3
+            )
+
+
 def test_reasoning_end_handles_markers_split_across_tokens():
     from irwkv.reasoning import ReasoningParserManager
     from tests.parser.engine.conftest import make_mock_tokenizer
@@ -1573,6 +1632,7 @@ def test_reasoning_parser_completes_marker_from_prompt(
 def test_structured_output_keeps_content_merged_with_reasoning_end():
     from irwkv.reasoning import ReasoningParserManager
     from irwkv.v1.structured_output import StructuredOutputManager
+    from irwkv.v1.structured_output.backend_types import StructuredOutputGrammar
     from tests.parser.engine.conftest import make_mock_tokenizer
 
     tokenizer = make_mock_tokenizer(
@@ -1581,7 +1641,7 @@ def test_structured_output_keeps_content_merged_with_reasoning_end():
     )
     tokenizer.encode.side_effect = lambda text, **kwargs: [9] if text == "{" else []
     parser = ReasoningParserManager.get_reasoning_parser("rwkv")(tokenizer)
-    grammar = MagicMock()
+    grammar = MagicMock(spec=StructuredOutputGrammar)
     grammar.accept_tokens.return_value = True
     grammar.validate_tokens.side_effect = lambda tokens: tokens
     grammar.is_terminated.return_value = False
@@ -1611,9 +1671,11 @@ def test_structured_output_keeps_content_merged_with_reasoning_end():
 
 
 def test_guidance_uses_rwkv_byte_vocabulary():
+    from transformers import TokenizersBackend
+
     from irwkv.v1.structured_output.backend_guidance import GuidanceBackend
 
-    tokenizer = MagicMock()
+    tokenizer = MagicMock(spec=TokenizersBackend)
     tokenizer.backend_tokenizer.model = type("RwkvTrie", (), {})()
     tokenizer.get_vocab.return_value = {
         "<eos>": 0,

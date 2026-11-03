@@ -1238,9 +1238,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             return
 
         async def empty_async_generator():
-            # A hack to trick Python to think this is a generator but
-            # in fact it immediately returns.
-            pass
+            if False:
+                yield
 
         final_response = await self.responses_full_generator(
             request,

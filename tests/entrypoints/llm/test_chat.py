@@ -1,11 +1,115 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import weakref
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from irwkv.entrypoints.llm import LLM
 from irwkv.exceptions import IRWKVValidationError
 from irwkv.sampling_params import SamplingParams
+
+
+@pytest.fixture
+def offline_chat():
+    profiles = {
+        name: {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "top_k": -1,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.09,
+            "penalty_decay": 0.994,
+        }
+        for name, temperature in (
+            ("generation_config.json", 0.96),
+            ("fake_think_generation_config.json", 1.0),
+            ("tools_generation_config.json", 0.8),
+        )
+    }
+    llm = LLM.__new__(LLM)
+    llm.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="rwkv"),
+        generation_config="auto",
+        get_diff_sampling_param=MagicMock(
+            side_effect=lambda config_file_name="generation_config.json": profiles[
+                config_file_name
+            ]
+        ),
+    )
+    llm.default_sampling_params = None
+    llm._run_chat = MagicMock()
+    llm._add_chat_requests = MagicMock()
+    return llm
+
+
+@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
+@pytest.mark.parametrize(
+    ("template_kwargs", "tools", "temperature"),
+    [
+        ({}, None, 0.96),
+        ({"fake_cot_mode": True}, None, 1.0),
+        ({"fake_cot_mode": True}, [{"type": "function"}], 0.8),
+    ],
+)
+def test_rwkv_chat_selects_sampling_profile(
+    offline_chat, method, template_kwargs, tools, temperature
+):
+    getattr(offline_chat, method)(
+        [{"role": "user", "content": "Hello"}],
+        tools=tools,
+        chat_template_kwargs=template_kwargs,
+    )
+    run = (
+        offline_chat._run_chat if method == "chat" else offline_chat._add_chat_requests
+    )
+    params = run.call_args.kwargs["params"]
+    assert (params.temperature, params.top_p, params.top_k) == (temperature, 0.9, -1)
+    assert (
+        params.presence_penalty,
+        params.frequency_penalty,
+        params.penalty_decay,
+    ) == (
+        1.0,
+        0.09,
+        0.994,
+    )
+
+
+@pytest.mark.parametrize("method", ["chat", "enqueue_chat"])
+def test_rwkv_chat_preserves_explicit_sampling(offline_chat, method):
+    params = SamplingParams(temperature=0.5)
+    getattr(offline_chat, method)(
+        [{"role": "user", "content": "Hello"}], sampling_params=params
+    )
+    run = (
+        offline_chat._run_chat if method == "chat" else offline_chat._add_chat_requests
+    )
+    assert run.call_args.kwargs["params"] is params
+    offline_chat.model_config.get_diff_sampling_param.assert_not_called()
+
+
+@pytest.mark.parametrize("generation_config", ["irwkv", "auto"])
+def test_chat_preserves_defaults_when_rwkv_profiles_disabled(
+    offline_chat, generation_config
+):
+    offline_chat.model_config.generation_config = generation_config
+    if generation_config == "auto":
+        offline_chat.model_config.hf_config.model_type = "other"
+    offline_chat.chat(
+        [{"role": "user", "content": "Hello"}],
+        chat_template_kwargs={"fake_cot_mode": True},
+    )
+    assert offline_chat._run_chat.call_args.kwargs["params"].temperature == 0.96
+    offline_chat.model_config.get_diff_sampling_param.assert_called_once_with()
+
+
+def test_rwkv_chat_rejects_incomplete_sampling_profiles(offline_chat):
+    offline_chat.model_config.get_diff_sampling_param.side_effect = None
+    offline_chat.model_config.get_diff_sampling_param.return_value = {}
+    with pytest.raises(ValueError, match="generation_config.json.*missing"):
+        offline_chat.chat([{"role": "user", "content": "Hello"}])
 
 
 @pytest.fixture(scope="function")

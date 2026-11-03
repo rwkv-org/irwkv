@@ -13,11 +13,13 @@ from irwkv.tokenizers.hf import (
     maybe_make_thread_pool,
 )
 
+TOKENIZER_SUBFOLDER = "rwkv7-g1l-1.5b-20261031-ctx34304"
+
 
 @pytest.mark.parametrize("model_id", ["rwkv-rs/rwkv7-g1-st"])
 def test_cached_tokenizer(model_id: str):
     reference_tokenizer = AutoTokenizer.from_pretrained(
-        model_id, trust_remote_code=True
+        model_id, trust_remote_code=True, subfolder=TOKENIZER_SUBFOLDER
     )
     reference_tokenizer.add_special_tokens({"cls_token": "<CLS>"})
     reference_tokenizer.add_special_tokens({"additional_special_tokens": ["<SEP>"]})
@@ -52,7 +54,9 @@ def test_thread_pool_tokenizer_pickle(model_id: str):
     """Regression test for issue #45433: the thread-pool tokenizer wrapper
     reconstructs through maybe_make_thread_pool on unpickling, which used to
     fall off the end and return None."""
-    reference_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    reference_tokenizer = AutoTokenizer.from_pretrained(
+        model_id, subfolder=TOKENIZER_SUBFOLDER
+    )
 
     pooled_tokenizer = maybe_make_thread_pool(deepcopy(reference_tokenizer))
     assert pooled_tokenizer is not None
@@ -70,7 +74,9 @@ def test_thread_pool_tokenizer_pickle(model_id: str):
 @pytest.mark.parametrize("model_id", ["rwkv-rs/rwkv7-g1-st"])
 def test_cached_tokenizer_max_token_id_is_a_valid_id(model_id: str):
     """max_token_id is the largest valid id, one less than vocab_size."""
-    reference_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    reference_tokenizer = AutoTokenizer.from_pretrained(
+        model_id, subfolder=TOKENIZER_SUBFOLDER
+    )
     cached_tokenizer = get_cached_tokenizer(deepcopy(reference_tokenizer))
 
     expected = max(
