@@ -23,7 +23,7 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a17`. FlashRWKV2 exposes the public
+commits and `FlashRWKV2==0.1.0a18`. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -97,7 +97,7 @@ Preparation uses the loaded model weights, configured state dtype, and each
 actual graph shape, including the separate head/sampling graphs. Model tuning
 uses fully active metadata and startup state slots, which are reset before
 capture. The report records each selected configuration, fingerprint, device
-class, profile path, and hit/missing/tuned/revalidated status. Same-class GPUs
+class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
 and new worker processes reuse profiles through FlashRWKV2's locking and
 compatibility checks.
 
@@ -115,22 +115,26 @@ After preparation, restart with `IRWKV_RWKV_TUNING_MODE=require` to verify loadi
 and capture in a fresh process. Eager workloads can use FlashRWKV2's public
 `prepare_tuning` with representative forward calls and disposable state.
 
-For a legacy namespace, add
-`IRWKV_RWKV_TUNING_LEGACY_DIR=/path/to/tuning/<legacy-namespace>` to the explicit
-`tune` run. FlashRWKV2 revalidates matching old configurations against the
-current operators before publishing them; it tunes missing shapes normally.
-Preserve the original namespace until the new process passes coverage checks.
+On RTX 4090 and PRO 6000 GPUs, FlashRWKV2 uses deterministic configurations for
+supported BF16 projections and head-size-64 WKV with FP32 state. These dispatches
+report `fixed` and do not search or time configurations. Preparation still compiles
+their reachable kernel variants before capture. FP16 recurrent state and other
+unsupported layouts retain verified profiles and bounded tuning. After upgrading,
+run preparation again; compatible TileLang binaries remain reusable.
 
 ## Decoding defaults
 
 RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
-three standalone generation configs:
+three standalone generation configs. These are the G1l and G1l-preview defaults:
 
 | Request mode | Config file | temperature | top_p | top_k | presence | frequency | decay |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Open Think | `generation_config.json` | 0.96 | 0.76 | 32 | 1.0 | 0.1 | 0.988 |
+| Open Think | `generation_config.json` | 0.96 | 0.90 | -1 | 1.0 | 0.09 | 0.994 |
 | Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 0.996 |
 | Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 0.996 |
+
+Earlier checkpoints may specify different values; irwkv uses the selected
+model artifact’s configuration. `top_k=-1` disables top-k filtering.
 
 These must be standalone `GenerationConfig` documents. Omit
 `_from_model_config` or set it to `false`; otherwise Transformers rebuilds the
@@ -146,11 +150,13 @@ and ends the generation prompt with `<think></think`:
 }
 ```
 
-`fake_cot_mode` defaults to `false`, which selects Open Think. The model's
-`chat_template.jinja` must read `fake_cot_mode` directly. Refresh existing
-model artifacts with the template from `transformers-rwkv/temp/rwkv_chat_template.jinja`.
+`fake_cot_mode` defaults to `false`, which selects Open Think. Model artifacts
+use the [`transformers-rwkv` chat template](https://github.com/rwkv-rs/transformers-rwkv/blob/83447dd9935ccce8cbec2693853e76a1c9c2212f/temp/rwkv_chat_template.jinja).
 Supplying tools always selects the Tools profile, regardless of the
 thinking mode. Explicit request sampling fields override the selected profile.
+The same profile selection applies to `LLM.chat()` and `LLM.enqueue_chat()`
+when `sampling_params` is omitted; explicitly supplied `sampling_params` are
+used as provided.
 
 All six controls are executed by
 `infer_sampling_six_parameter_forward_varlen`; `frequency_penalty` is the

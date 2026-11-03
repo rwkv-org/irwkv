@@ -28,7 +28,6 @@ from irwkv.entrypoints.openai.chat_completion.serving import (
 )
 from irwkv.entrypoints.openai.models.serving import (
     BaseModelPath,
-    OpenAIModelRegistry,
     OpenAIServingModels,
 )
 from irwkv.entrypoints.serve.engine.protocol import ErrorResponse
@@ -108,6 +107,7 @@ def monkeypatch_module():
 
 MODEL_NAME = "rwkv-rs/rwkv7-g1-st"
 MODEL_NAME_SHORT = "rwkv"
+TOKENIZER_SUBFOLDER = "rwkv7-g1l-1.5b-20261031-ctx34304"
 CHAT_TEMPLATE = "Dummy chat template for testing {}"
 BASE_MODEL_PATHS = [
     BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME),
@@ -171,13 +171,11 @@ class MockIrwkvConfig:
 def _build_renderer(model_config: MockModelConfig):
     return HfRenderer(
         MockIrwkvConfig(model_config, parallel_config=MockParallelConfig()),
-        cached_tokenizer_from_config(model_config),
+        cached_tokenizer_from_config(model_config, subfolder=TOKENIZER_SUBFOLDER),
     )
 
 
-def _build_online_renderer(
-    engine, model_registry: OpenAIModelRegistry
-) -> OnlineRenderer:
+def _build_online_renderer(engine) -> OnlineRenderer:
     return OnlineRenderer(
         model_config=engine.model_config,
         renderer=engine.renderer,
@@ -207,7 +205,7 @@ def _build_serving_chat(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = _build_online_renderer(engine, models.registry)
+    online_renderer = _build_online_renderer(engine)
 
     serving_chat = OpenAIServingChat(
         engine,
@@ -929,7 +927,7 @@ async def _async_serving_chat_init():
     engine = MockEngine()
 
     models = OpenAIServingModels(engine, BASE_MODEL_PATHS)
-    online_renderer = _build_online_renderer(engine, models.registry)
+    online_renderer = _build_online_renderer(engine)
 
     serving_completion = OpenAIServingChat(
         engine,
@@ -1527,7 +1525,7 @@ async def test_tool_choice_validation_without_parser():
         engine_client=mock_engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = _build_online_renderer(mock_engine, models.registry)
+    online_renderer = _build_online_renderer(mock_engine)
 
     # Create serving_chat without tool_parser (enable_auto_tools=False)
     serving_chat = OpenAIServingChat(
@@ -1609,7 +1607,7 @@ async def test_streaming_n_gt1_independent_tool_parsers(
         engine_client=mock_engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = _build_online_renderer(mock_engine, models.registry)
+    online_renderer = _build_online_renderer(mock_engine)
 
     serving_chat = OpenAIServingChat(
         mock_engine,
@@ -1623,7 +1621,7 @@ async def test_streaming_n_gt1_independent_tool_parsers(
         tool_parser="rwkv",
     )
 
-    tokenizer = get_tokenizer(MODEL_NAME)
+    tokenizer = get_tokenizer(MODEL_NAME, subfolder=TOKENIZER_SUBFOLDER)
 
     tools = [
         {
