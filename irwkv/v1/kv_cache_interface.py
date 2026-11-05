@@ -984,6 +984,11 @@ class MambaSpec(KVCacheSpec):
     def block_table_token_alignment(self) -> int | None:
         return None
 
+    @property
+    def retains_latest_checkpoint(self) -> bool:
+        """Whether align mode keeps each request's latest committed state."""
+        return False
+
     def max_memory_usage_bytes(self, irwkv_config: IrwkvConfig) -> int:
         if irwkv_config.cache_config.mamba_cache_mode == "align":
             return self.page_size_bytes * (2 + self.num_prefill_checkpoint_blocks)
