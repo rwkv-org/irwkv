@@ -182,6 +182,23 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
         assert scheduler.running[i] == request
 
 
+def test_rwkv_adapter_batches_drain_before_switching_weights():
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=4)
+    for request, version in zip(requests, ["a", "a", "b", None]):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.extra_args = {"rwkv_adapter_version": version}
+        scheduler.add_request(request)
+
+    for expected in (requests[:2], requests[2:3], requests[3:]):
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) == {r.request_id for r in expected}
+        for request in expected:
+            scheduler.finish_requests(
+                request.request_id, RequestStatus.FINISHED_STOPPED
+            )
+
+
 def test_scheduler_stats_route_to_existing_output_client():
     scheduler = create_scheduler()
     request = create_requests(num_requests=1)[0]

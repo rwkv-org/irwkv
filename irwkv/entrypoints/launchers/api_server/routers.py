@@ -19,6 +19,11 @@ def register_api_routers(
 
     register_irwkv_serve_api_routers(app)
 
+    if model_config is not None and model_config.hf_config.model_type == "rwkv":
+        from irwkv.entrypoints.serve.rwkv_adapters import attach_router
+
+        attach_router(app)
+
     from irwkv.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
     )

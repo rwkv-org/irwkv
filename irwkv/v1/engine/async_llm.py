@@ -486,6 +486,21 @@ class AsyncLLM(EngineClient):
         if reasoning_parser_kwargs is not None:
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
+        extra = request.params.extra_args or {}
+        if extra.get("rwkv_adapter_lease"):
+            import hashlib
+            import json
+
+            request.cache_salt = hashlib.sha256(
+                json.dumps(
+                    [
+                        request.cache_salt,
+                        extra.get("rwkv_adapter_version"),
+                        extra.get("rwkv_state_version"),
+                    ]
+                ).encode()
+            ).hexdigest()
+
         self.input_processor.assign_request_id(request)
 
         # We start the output_handler on the first call to add_request() so
@@ -713,7 +728,41 @@ class AsyncLLM(EngineClient):
 
         """
         q: RequestOutputCollector | None = None
+        adapter_lease = None
         try:
+            extra = sampling_params.extra_args or {}
+            for key in ("adapter_id", "state_id", "adapter_version"):
+                if key in extra and (not isinstance(extra[key], str) or not extra[key]):
+                    raise IRWKVValidationError(f"{key} must be a non-empty string")
+            if "adapter_version" in extra and "adapter_id" not in extra:
+                raise IRWKVValidationError("adapter_version requires adapter_id")
+            if any(
+                key.startswith("rwkv_adapter_") or key == "rwkv_state_version"
+                for key in extra
+            ):
+                raise IRWKVValidationError("RWKV lease fields are reserved")
+            if extra.get("adapter_id") or extra.get("state_id"):
+                from uuid import uuid4
+
+                if isinstance(prompt, (EngineCoreRequest, AsyncGenerator)):
+                    raise IRWKVValidationError(
+                        "uploaded adapters require a non-streaming rendered prompt"
+                    )
+                adapter_lease = uuid4().hex
+                resolved = await self.manage_rwkv_adapters(
+                    "acquire",
+                    lease=adapter_lease,
+                    adapter_id=extra.get("adapter_id"),
+                    adapter_version=extra.get("adapter_version"),
+                    state_id=extra.get("state_id"),
+                )
+                sampling_params = sampling_params.clone()
+                sampling_params.extra_args = {
+                    **extra,
+                    "rwkv_adapter_lease": adapter_lease,
+                    "rwkv_adapter_version": resolved["adapter_version"],
+                    "rwkv_state_version": resolved["state_version"],
+                }
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -792,6 +841,19 @@ class AsyncLLM(EngineClient):
         finally:
             if q is not None:
                 q.close()
+            if adapter_lease is not None and not self.errored:
+                await asyncio.shield(
+                    self.manage_rwkv_adapters("release", lease=adapter_lease)
+                )
+
+    async def manage_rwkv_adapters(self, operation: str, **kwargs):
+        results = await self.collective_rpc(
+            "rwkv_adapter_rpc", args=(operation,), kwargs=kwargs
+        )
+        for result in results:
+            if "error" in result:
+                raise IRWKVValidationError(result["error"])
+        return results[0]["result"]
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

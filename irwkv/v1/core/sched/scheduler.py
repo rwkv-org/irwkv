@@ -759,6 +759,20 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                if self.running:
+                    params = request.sampling_params
+                    running_params = self.running[0].sampling_params
+                    extra = (params.extra_args or {}) if params is not None else {}
+                    running_extra = (
+                        (running_params.extra_args or {})
+                        if running_params is not None
+                        else {}
+                    )
+                    adapter = extra.get("rwkv_adapter_version")
+                    running_adapter = running_extra.get("rwkv_adapter_version")
+                    if adapter != running_adapter:
+                        break
+
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
                     skip_request(request_queue)

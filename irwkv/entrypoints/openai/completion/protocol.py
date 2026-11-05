@@ -231,6 +231,10 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    adapter_id: str | None = Field(default=None, min_length=1, max_length=256)
+    adapter_version: str | None = Field(default=None, min_length=1)
+    state_id: str | None = Field(default=None, min_length=1, max_length=256)
+
     irwkv_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
@@ -370,7 +374,13 @@ class CompletionRequest(OpenAIBaseModel):
 
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        extra_args: dict[str, Any] = self.irwkv_xargs if self.irwkv_xargs else {}
+        extra_args: dict[str, Any] = dict(self.irwkv_xargs or {})
+        for key in ("adapter_id", "adapter_version", "state_id"):
+            value = getattr(self, key)
+            if value is not None:
+                if key in extra_args and extra_args[key] != value:
+                    raise ValueError(f"conflicting {key} and irwkv_xargs.{key}")
+                extra_args[key] = value
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

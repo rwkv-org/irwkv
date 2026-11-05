@@ -396,6 +396,8 @@ class RwkvModelState(DefaultModelState):
         self._rwkv_group_id: int | None = None
         self._sampler: RwkvSampler | None = None
         self._model = model
+        self._rwkv_request_adapters: dict[str, Any] = {}
+        self._rwkv_pending_states: dict[str, torch.Tensor] = {}
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -416,8 +418,7 @@ class RwkvModelState(DefaultModelState):
         input_batch: InputBatch,
         grammar_output: Any | None,
     ) -> SamplerOutput | None:
-        del model
-        if self._sampler is None:
+        if self._sampler is None or getattr(model, "_rwkv_eager_adapter", False):
             return None
         return self._sampler.sample_hidden_states(
             hidden_states,
@@ -427,6 +428,16 @@ class RwkvModelState(DefaultModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        params = new_req_data.sampling_params
+        extra = (params.extra_args or {}) if params is not None else {}
+        lease = extra.get("rwkv_adapter_lease")
+        if lease is not None:
+            adapter, state = self._model._rwkv_leases[lease]
+            self._rwkv_request_adapters[new_req_data.req_id] = adapter
+            if state is not None and new_req_data.num_computed_tokens == 0:
+                self._rwkv_pending_states[new_req_data.req_id] = state.tensors["state"][
+                    self._model.model.start_layer : self._model.model.end_layer
+                ]
         if self._sampler is not None:
             self._sampler.stage_request(req_index, new_req_data.req_id)
         self._state_block_columns[req_index] = (
@@ -440,6 +451,8 @@ class RwkvModelState(DefaultModelState):
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
+        self._rwkv_request_adapters.pop(req_id, None)
+        self._rwkv_pending_states.pop(req_id, None)
         if self._sampler is not None:
             self._sampler.remove_request(req_id)
 
@@ -463,6 +476,19 @@ class RwkvModelState(DefaultModelState):
             self._rwkv_group_id = group_ids[0]
         return self._rwkv_group_id
 
+    def requires_eager_execution(self, req_ids: Sequence[str]) -> bool:
+        if not self._rwkv_request_adapters:
+            return False
+        lora = getattr(self._model.config, "rwkv_lora", None)
+        if lora is None:
+            return False
+        base_scale = lora["lora_alpha"] / lora["r"]
+        return any(
+            adapter is not None and adapter.scale != base_scale
+            for req_id in req_ids
+            if (adapter := self._rwkv_request_adapters.get(req_id)) is not None
+        )
+
     def preprocess_state(
         self,
         input_batch: InputBatch,
@@ -470,7 +496,19 @@ class RwkvModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        if not self._align_mode or input_batch.num_reqs == 0:
+        if input_batch.num_reqs == 0:
+            return
+
+        adapters = [
+            self._rwkv_request_adapters.get(req_id) for req_id in input_batch.req_ids
+        ]
+        if len({None if a is None else a.version for a in adapters}) != 1:
+            raise RuntimeError("RWKV batch contains different adapters")
+        self._model.activate_rwkv_adapter(adapters[0])
+        if not self._align_mode:
+            if self._rwkv_pending_states:
+                block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
+                self._initialize_uploaded_states(input_batch, block_table[:, 0])
             return
 
         num_reqs = input_batch.num_reqs
@@ -510,4 +548,20 @@ class RwkvModelState(DefaultModelState):
             self._state_layer.copy_state_slots(source_indices, destination_indices)
         self._state_block_columns[req_indices] = new_columns
         self._state_num_computed_tokens[req_indices] = computed + query_lens
+        if self._rwkv_pending_states:
+            columns = torch.as_tensor(
+                new_columns, dtype=torch.int64, device=self.device
+            )
+            rows = torch.arange(num_reqs, device=self.device)
+            self._initialize_uploaded_states(input_batch, block_table[rows, columns])
         del num_computed_tokens
+
+    def _initialize_uploaded_states(
+        self, input_batch: InputBatch, state_indices: torch.Tensor
+    ) -> None:
+        for row, req_id in enumerate(input_batch.req_ids):
+            state = self._rwkv_pending_states.pop(req_id, None)
+            if state is not None:
+                self._state_layer.initialize_state_slots(
+                    state_indices[row : row + 1], state
+                )

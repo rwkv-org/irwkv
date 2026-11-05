@@ -228,6 +228,136 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+## Uploaded adapters and initial states
+
+The Python API server accepts Lightning NoRA `.pth` exports, LoRA tensor
+checkpoints, and `blocks.N.att.time_state` checkpoints. Uploads are parsed with
+`torch.load(weights_only=True)`, checked against the model dimensions, and kept
+in worker CPU memory. No uploaded file is needed after registration. Each worker
+has separate adapter and initial-state LRU stores, each limited to **16 entries**.
+These stores are process-local and are cleared when the server restarts.
+
+Reserve adapter parameters when starting the server with a base model:
+
+```bash
+irwkv serve <base-model> --dtype bfloat16 --enable-chunked-prefill \
+  --hf-overrides '{"rwkv_dynamic_adapters": true, "rwkv_lora": {"r": 16, "lora_alpha": 16, "use_nora": false, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value"]}}'
+```
+
+`rwkv_dynamic_adapters` permits the reserved adapter parameters to remain
+zero-initialized when the base checkpoint does not contain them. The configured
+rank is the maximum accepted rank; smaller adapters are zero-padded. Enable all
+projections that uploaded adapters will target. Initial-state uploads alone do
+not require `rwkv_lora` or `rwkv_dynamic_adapters`.
+
+Lightning's exported NoRA A matrix is already initialized/trained with its own
+normalization convention. Its inference computes the raw A/B product: enabling
+`use_nora=true` would incorrectly normalize A again. Dynamic uploads therefore
+require `use_nora=false` and nonzero `lora_alpha` in the server configuration.
+LoRA uploads use canonical PEFT names or Lightning `blocks.N.*.weight.A/B`
+names and require metadata with `r`, `lora_alpha`, and optionally
+`use_nora: false`. Supply this as a multipart `adapter_config.json` file or as
+the `metadata` object in a JSON registration request. Lightning NoRA exports
+contain `archive/nora.json` and need no separate metadata.
+
+```bash
+curl -f http://localhost:8000/v1/adapters \
+  -F adapter_id=my-nora -F file=@adapter-final.pth
+
+curl -f http://localhost:8000/v1/state/upload \
+  -F state_id=agentic -F file=@rwkv-state-agentic.pth
+
+curl -f http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<served-model>","messages":[{"role":"user","content":"你好"}],"adapter_id":"my-nora","state_id":"agentic","max_tokens":64}'
+```
+
+`adapter_id`, optional `adapter_version`, and `state_id` are engine extensions
+on Chat Completions and Completions. They can also be supplied through
+`irwkv_xargs`; conflicting values are rejected. Omitting both IDs selects the
+startup model with zero initial state. `adapter_version` pins the content version
+returned by upload, so a stale version cannot silently select a replacement.
+
+Both upload endpoints also accept JSON with a server-local `path` and the
+corresponding ID. If `state_id` is omitted, the state upload returns a
+content-derived ID. The upload limit is 512 MiB per checkpoint. Shape mismatches,
+missing A/B pairs, nonfinite tensors, and unsupported formats are rejected.
+
+| Operation | Endpoint |
+| --- | --- |
+| Register/upload adapter | `POST /v1/adapters` |
+| List adapters and cache counters | `GET /v1/adapters` |
+| Delete adapter | `DELETE /v1/adapters`, JSON `{"adapter_id":"my-nora"}` |
+| Register/upload initial state | `POST /v1/state/upload` |
+| List initial states and cache counters | `GET /v1/state/list` |
+| Delete initial state | `POST /v1/state/delete`, JSON `{"state_id":"agentic"}` |
+
+The list response exposes `capacity`, `eviction_policy`, `ram_hits`, `evictions`,
+and resident tensor sizes. Uploading a seventeenth entry evicts the least
+recently used idle entry. Requests pin their selected versions through
+completion or cancellation. An active entry cannot be replaced or deleted;
+when all sixteen are pinned, a new upload is rejected. An evicted or unknown
+ID returns an error rather than falling back to the base model.
+
+Requests using different adapters execute in separate batches; requests using
+the same adapter can batch together, including requests with different initial
+states. Adapter tensors are copied into fixed GPU buffers, preserving CUDA
+Graph addresses. Initial states are transposed from Lightning checkpoint layout
+into runtime layout and copied into private request slots with zero shift state.
+Prefix-cache identities include adapter and initial-state content versions to
+prevent reuse across different selections.
+
+When an uploaded LoRA's `lora_alpha / r` differs from the startup scale,
+its batches run the same FlashRWKV2 operators eagerly. This preserves raw A/B
+weights and the requested scale without extra BF16 rounding or replaying a
+graph with a stale scalar. Matching-scale adapters, including Lightning NoRA
+with the configuration above, retain CUDA Graph execution.
+
+Use the base checkpoint on which the adapter was trained. Dimension validation
+does not establish base-model identity: a `.pth` fingerprint cannot be compared
+directly with converted/sharded safetensors. These endpoints use the server's
+normal API-key authentication. The alternative Rust frontend does not expose
+these upload routes.
+
+### Adapter validation
+
+Run the CPU/model and scheduling regressions with:
+
+```bash
+.venv/bin/python -m pytest tests/models/rwkv/test_rwkv.py \
+  tests/v1/core/test_scheduler.py tests/v1/core/test_async_scheduler.py -q
+```
+
+The optional HTTP regression starts a real CUDA Graph server, uploads the
+checkpoints, checks cold/hit prefix isolation and concurrent generation, and
+fills the LRU past its sixteen-entry limit:
+
+```bash
+IRWKV_RWKV_TEST_MODEL=/path/to/base-hf \
+IRWKV_RWKV_TEST_NORA=/path/to/adapter-final.pth \
+IRWKV_RWKV_TEST_STATE=/path/to/rwkv-state-agentic.pth \
+  .venv/bin/python -m pytest tests/models/rwkv/test_rwkv.py \
+  -k uploaded_adapters_generate -v
+```
+
+Validation on 2026-11-04 used an RTX PRO 6000 Blackwell, the G1L preview
+`rwkv-g1l-7b-temp-3797` base (SHA-256 `7bbef36528bb15e992bd3eb3786a9ebd7cb3e174ed566360770a37d1a7be3e60`,
+matching the supplied NoRA manifest), rank-16 NoRA, and the 32-layer agentic
+state. The real uploads, cache hits, seventeenth-entry eviction, mixed concurrent
+requests, streaming cancellation, and return to the base model were checked.
+An additional LoRA registration used the same raw A/B tensors at scale 0.5.
+
+Across two prompts and six adapter/state combinations, all 186 returned token
+IDs matched independent `transformers-rwkv` plus PEFT generation. One sequence
+ended at the configured `✿` stop string. The reference used transformers commit
+`83447dd9935ccce8cbec2693853e76a1c9c2212f` with its required FlashRWKV2 a17;
+irwkv used a18. This is a loading/inference regression, not a task-quality eval.
+
+An `irwkv bench serve` smoke run on that base with the NoRA adapter, random
+128-token inputs, up to 32 output tokens, 8 prompts, and concurrency 4 completed
+8/8 requests: 235.68 output tokens/s, mean TTFT 83.22 ms, and mean TPOT 12.68 ms.
+These short-run measurements are not a throughput claim for other batch sizes.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes

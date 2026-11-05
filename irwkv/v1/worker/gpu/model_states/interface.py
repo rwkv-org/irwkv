@@ -165,6 +165,10 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def requires_eager_execution(self, req_ids: Sequence[str]) -> bool:
+        """Whether a batch uses parameters not represented by captured graphs."""
+        return False
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

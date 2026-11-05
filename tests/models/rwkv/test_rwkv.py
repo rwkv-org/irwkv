@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import io
 import json
 import os
 import sys
+import zipfile
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -195,6 +197,37 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_initial_state_is_copied_only_to_selected_slots(monkeypatch, state_dtype):
+    """Starting requests must not alias the uploaded state or reset other requests."""
+    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    config = _state_irwkv_config(state_dtype)
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    layer.bind_kv_cache(torch.zeros((3, spec.page_size_bytes), dtype=torch.int8))
+    initial_state = torch.randn(2, 2, 64, 64, dtype=torch.bfloat16)
+    for local_layer in range(2):
+        tmix, handle, cmix = layer.get_layer_state(local_layer)
+        tmix.fill_(3)
+        cmix.fill_(4)
+        handle.state.fill_(5)
+
+    layer.initialize_state_slots(torch.tensor([0, 2]), initial_state)
+
+    for local_layer in range(2):
+        tmix, handle, cmix = layer.get_layer_state(local_layer)
+        expected = initial_state[local_layer].to(getattr(torch, state_dtype))
+        torch.testing.assert_close(handle.state[0], expected)
+        torch.testing.assert_close(handle.state[2], expected)
+        assert torch.all(handle.state[1] == 5)
+        assert torch.all(tmix[1] == 3) and torch.all(cmix[1] == 4)
+        assert torch.count_nonzero(tmix[[0, 2]]) == 0
+        assert torch.count_nonzero(cmix[[0, 2]]) == 0
+        handle.state[0].zero_()
+        torch.testing.assert_close(handle.state[2], expected)
+        torch.testing.assert_close(initial_state[local_layer].float(), expected.float())
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
@@ -454,6 +487,9 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
     )
     model_state = object.__new__(RwkvModelState)
     model_state._align_mode = True
+    model_state._rwkv_request_adapters = {}
+    model_state._rwkv_pending_states = {}
+    model_state._model = SimpleNamespace(activate_rwkv_adapter=lambda adapter: None)
     model_state._block_size = 16
     model_state._state_block_columns = np.array([0, 0], dtype=np.int32)
     model_state._state_num_computed_tokens = np.array([15, 16], dtype=np.int64)
@@ -463,6 +499,7 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
 
     input_batch = SimpleNamespace(
         num_reqs=2,
+        req_ids=["first", "second"],
         idx_mapping_np=np.array([0, 1]),
         num_computed_tokens_np=np.array([31, 32], dtype=np.int32),
         num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
@@ -494,6 +531,9 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     )
     model_state = object.__new__(RwkvModelState)
     model_state._align_mode = True
+    model_state._rwkv_request_adapters = {}
+    model_state._rwkv_pending_states = {}
+    model_state._model = SimpleNamespace(activate_rwkv_adapter=lambda adapter: None)
     model_state._block_size = 16
     model_state._state_block_columns = np.array([-1], dtype=np.int32)
     model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
@@ -503,6 +543,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
 
     input_batch = SimpleNamespace(
         num_reqs=1,
+        req_ids=["first"],
         idx_mapping_np=np.array([0]),
         num_computed_tokens_np=np.array([0], dtype=np.int32),
         num_scheduled_tokens=np.array([32], dtype=np.int32),
@@ -982,6 +1023,160 @@ def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.usefixtures("_single_rank")
+def test_dynamic_lora_preserves_raw_weights_and_selects_eager_for_changed_scale():
+    from dataclasses import replace
+
+    from irwkv.model_executor.models.rwkv_adapters import RWKVAdapter
+
+    model = RwkvForCausalLM(
+        irwkv_config=_tiny_model_irwkv_config({**_LORA, "use_nora": False})
+    )
+    model.rwkv_adapter_rpc("list")
+    prefix = "model.layers.0.linear_attn.r_proj"
+    a, b = torch.randn(2, 128), torch.randn(128, 2)
+    entry = RWKVAdapter(
+        "lora",
+        "v1",
+        "lora",
+        {
+            f"{prefix}.lora_A.weight": a,
+            f"{prefix}.lora_B.weight": b,
+        },
+        rank=2,
+        scale=1.3,
+    )
+    layer = model.get_submodule(prefix)
+    pointer = layer.lora_B.weight.data_ptr()
+    model.activate_rwkv_adapter(entry)
+    torch.testing.assert_close(layer.lora_B.weight[:, :2], b, rtol=0, atol=0)
+    assert not layer.lora_B.weight[:, 2:].any()
+    assert layer.lora_scale == 1.3 and model._rwkv_eager_adapter
+    state = object.__new__(RwkvModelState)
+    state._model = model
+    state._rwkv_request_adapters = {"request": entry}
+    assert state.requires_eager_execution(["request"])
+    state._rwkv_request_adapters["request"] = replace(entry, scale=2)
+    assert not state.requires_eager_execution(["request"])
+    assert not state.requires_eager_execution(["base"])
+    model.activate_rwkv_adapter(None)
+    assert layer.lora_B.weight.data_ptr() == pointer
+    assert not layer.lora_B.weight.any()
+    assert layer.lora_scale == 2 and not model._rwkv_eager_adapter
+
+
+def test_adapter_lru_evicts_idle_entries_and_keeps_active_requests():
+    from irwkv.model_executor.models.rwkv_adapters import RWKVAdapter, RWKVAdapterStore
+
+    store = RWKVAdapterStore()
+    for i in range(16):
+        store.put(RWKVAdapter(str(i), str(i), "lora", {}))
+    store.acquire("0")
+    store.get("1")
+    store.put(RWKVAdapter("16", "16", "lora", {}))
+    with pytest.raises(ValueError, match="not found"):
+        store.get("2")
+    assert len(store.entries) == 16
+    assert store.get("0").version == "0"
+    with pytest.raises(ValueError, match="active request"):
+        store.put(RWKVAdapter("0", "replacement", "lora", {}))
+    with pytest.raises(ValueError, match="active request"):
+        store.erase("0")
+    for name in list(store.entries):
+        if name != "0":
+            store.acquire(name)
+    with pytest.raises(ValueError, match="all 16"):
+        store.put(RWKVAdapter("17", "17", "lora", {}))
+    store.release("0")
+    store.put(RWKVAdapter("17", "17", "lora", {}))
+    assert "0" not in store.entries
+
+
+@pytest.mark.parametrize("chat", [False, True])
+def test_uploaded_adapter_request_fields_reach_sampling_params(chat):
+    from irwkv.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from irwkv.entrypoints.openai.completion.protocol import CompletionRequest
+
+    cls = ChatCompletionRequest if chat else CompletionRequest
+    prompt = (
+        {"messages": [{"role": "user", "content": "Hello"}]}
+        if chat
+        else {"prompt": "Hello"}
+    )
+    request = cls(
+        model="rwkv",
+        **prompt,
+        adapter_id="adapter",
+        state_id="state",
+        adapter_version="version",
+        irwkv_xargs={"custom": "value"},
+    )
+    params = request.to_sampling_params(max_tokens=1, default_sampling_params={})
+    assert params.extra_args == {
+        "adapter_id": "adapter",
+        "adapter_version": "version",
+        "state_id": "state",
+        "custom": "value",
+    }
+    assert request.irwkv_xargs == {"custom": "value"}
+    request.irwkv_xargs["adapter_id"] = "conflict"
+    with pytest.raises(ValueError, match="conflicting adapter_id"):
+        request.to_sampling_params(max_tokens=1, default_sampling_params={})
+
+
+def test_lightning_nora_loader_preserves_exported_a_without_renormalization():
+    from irwkv.model_executor.models.rwkv_adapters import load_rwkv_adapter
+
+    config = _tiny_model_irwkv_config(None).model_config.hf_config
+    a = torch.full((2, 128), 3.0, dtype=torch.bfloat16)
+    b = torch.ones(128, 2, dtype=torch.bfloat16)
+    checkpoint = io.BytesIO()
+    torch.save(
+        {"blocks.0.att.key.weight.A": a, "blocks.0.att.key.weight.B": b}, checkpoint
+    )
+    with zipfile.ZipFile(checkpoint, "a") as archive:
+        archive.writestr(
+            "archive/nora.json",
+            json.dumps(
+                {
+                    "method": "nora",
+                    "format_version": 1,
+                    "kind": "inference_adapter",
+                    "layout": "low_rank_ba",
+                    "initialization": "nora_init",
+                    "rank": 2,
+                    "alpha": 2,
+                    "scale": 1,
+                }
+            ),
+        )
+    adapter = load_rwkv_adapter("nora", checkpoint.getvalue(), config)
+    assert adapter.kind == "nora" and adapter.scale == 1
+    torch.testing.assert_close(
+        adapter.tensors["model.layers.0.linear_attn.k_proj.lora_A.weight"], a.float()
+    )
+
+
+def test_uploaded_state_loader_transposes_all_layers_and_rejects_missing_layers():
+    from irwkv.model_executor.models.rwkv_adapters import load_rwkv_adapter
+
+    config = _tiny_model_irwkv_config(None).model_config.hf_config
+    weights = {f"blocks.{i}.att.time_state": torch.randn(2, 64, 64) for i in range(2)}
+    checkpoint = io.BytesIO()
+    torch.save(weights, checkpoint)
+    state = load_rwkv_adapter("state", checkpoint.getvalue(), config, kind="state")
+    for i in range(2):
+        torch.testing.assert_close(
+            state.tensors["state"][i],
+            weights[f"blocks.{i}.att.time_state"].transpose(-1, -2),
+        )
+    checkpoint = io.BytesIO()
+    weights.pop("blocks.1.att.time_state")
+    torch.save(weights, checkpoint)
+    with pytest.raises(ValueError, match="state layers"):
+        load_rwkv_adapter("state", checkpoint.getvalue(), config, kind="state")
+
+
+@pytest.mark.usefixtures("_single_rank")
 @pytest.mark.parametrize("rwkv_lora", [None, _LORA])
 def test_lora_passes_raw_adapters_to_flashrwkv2(monkeypatch, rwkv_lora) -> None:
     calls: dict[str, dict[str, Any]] = {}
@@ -1391,6 +1586,152 @@ def test_config_accepts_async_scheduling() -> None:
     irwkv_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(irwkv_config)
     assert irwkv_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not all(
+        os.environ.get(name)
+        for name in (
+            "IRWKV_RWKV_TEST_MODEL",
+            "IRWKV_RWKV_TEST_NORA",
+            "IRWKV_RWKV_TEST_STATE",
+        )
+    ),
+    reason="local model, NoRA and state checkpoints are required",
+)
+def test_uploaded_adapters_generate_with_isolated_prefix_cache_and_lru():
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+
+    import requests
+
+    from tests.utils import RemoteOpenAIServer
+
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    nora_path = os.environ["IRWKV_RWKV_TEST_NORA"]
+    state_path = os.environ["IRWKV_RWKV_TEST_STATE"]
+    lora = {
+        "r": 16,
+        "lora_alpha": 16,
+        "use_nora": False,
+        "target_modules": [
+            "r_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "mlp.key",
+            "mlp.value",
+        ],
+    }
+    args = [
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "256",
+        "--max-num-seqs",
+        "4",
+        "--max-num-batched-tokens",
+        "128",
+        "--gpu-memory-utilization",
+        "0.4",
+        "--enable-prefix-caching",
+        "--block-size",
+        "32",
+        "--mamba-block-size",
+        "32",
+        "--enable-prompt-tokens-details",
+        "--compilation-config",
+        '{"cudagraph_capture_sizes":[1,2,4,8,16,32]}',
+    ]
+    with RemoteOpenAIServer(
+        model_path,
+        args,
+        env_dict={
+            "IRWKV_RWKV_TUNING_MODE": "inspect",
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        },
+        override_hf_configs={"rwkv_dynamic_adapters": True, "rwkv_lora": lora},
+    ) as server:
+
+        def upload(endpoint, key, name, path):
+            with open(path, "rb") as source:
+                response = requests.post(
+                    server.url_for(endpoint),
+                    data={key: name},
+                    files={"file": (Path(path).name, source)},
+                    timeout=120,
+                )
+            response.raise_for_status()
+
+        upload("v1/adapters", "adapter_id", "nora", nora_path)
+        upload("v1/state/upload", "state_id", "state", state_path)
+        checkpoint = io.BytesIO()
+        torch.save(
+            torch.load(nora_path, map_location="cpu", weights_only=True), checkpoint
+        )
+        response = requests.post(
+            server.url_for("v1/adapters"),
+            data={"adapter_id": "lora"},
+            files={
+                "file": ("adapter.pth", checkpoint.getvalue()),
+                "config": (
+                    "adapter_config.json",
+                    json.dumps({"r": 16, "lora_alpha": 8}),
+                ),
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+
+        def generate(selection):
+            response = requests.post(
+                server.url_for("v1/completions"),
+                json={
+                    "model": model_path,
+                    "prompt": list(range(1, 74)),
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "return_token_ids": True,
+                    **selection,
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        selections = [
+            {},
+            {"adapter_id": "nora"},
+            {"state_id": "state"},
+            {"adapter_id": "nora", "state_id": "state"},
+            {"adapter_id": "lora"},
+            {"adapter_id": "lora", "state_id": "state"},
+        ]
+        expected = []
+        for selection in selections:
+            cold, hit = generate(selection), generate(selection)
+            assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+            assert hit["usage"]["prompt_tokens_details"]["cached_tokens"] == 64
+            assert cold["choices"][0]["token_ids"] == hit["choices"][0]["token_ids"]
+            expected.append(cold["choices"][0]["token_ids"])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            mixed = list(pool.map(generate, selections))
+        assert [r["choices"][0]["token_ids"] for r in mixed] == expected
+
+        response = requests.delete(
+            server.url_for("v1/adapters"), json={"adapter_id": "lora"}, timeout=30
+        )
+        response.raise_for_status()
+
+        for i in range(1, 16):
+            upload("v1/adapters", "adapter_id", f"nora{i}", nora_path)
+        generate({"adapter_id": "nora"})
+        upload("v1/adapters", "adapter_id", "nora16", nora_path)
+        response = requests.get(server.url_for("v1/adapters"), timeout=30)
+        response.raise_for_status()
+        ids = {item["adapter_id"] for item in response.json()["data"]}
+        assert len(ids) == 16 and "nora" in ids and "nora1" not in ids
+        assert generate({})["choices"][0]["token_ids"] == expected[0]
 
 
 @pytest.mark.skipif(

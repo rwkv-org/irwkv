@@ -1368,7 +1368,16 @@ class GPUModelRunner:
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=(
+                is_profile
+                or skip_compiled
+                or (
+                    batch_req_state is not None
+                    and self.model_state.requires_eager_execution(
+                        batch_req_state.req_ids
+                    )
+                )
+            ),
             parallel_config=self.parallel_config,
             allow_ubatching=(
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run

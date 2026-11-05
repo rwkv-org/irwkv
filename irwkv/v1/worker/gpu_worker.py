@@ -1018,6 +1018,12 @@ class Worker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
+    def rwkv_adapter_rpc(self, operation: str, **kwargs):
+        try:
+            return {"result": self.get_model().rwkv_adapter_rpc(operation, **kwargs)}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     def get_compilation_match_table(self) -> dict[str, int]:
         from irwkv.compilation.passes.irwkv_inductor_pass import get_match_table
 

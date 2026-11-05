@@ -362,6 +362,35 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         for handle in self._wkv_handles:
             handle.reset_slots_(indices)
 
+    def initialize_state_slots(
+        self,
+        slot_ids: Sequence[int] | torch.Tensor,
+        initial_state: torch.Tensor,
+    ) -> None:
+        """Copy a runtime-layout [layers, heads, key, value] initial state."""
+        if self._wkv_state_pool is None:
+            raise RuntimeError("RWKV state pool has not been bound")
+        expected_shape = (
+            self.num_local_layers,
+            self.num_heads,
+            self.head_size,
+            self.head_size,
+        )
+        if initial_state.shape != expected_shape:
+            raise ValueError(f"RWKV initial state must have shape {expected_shape}")
+        indices = self._slot_tensor(slot_ids)
+        if indices.numel() == 0:
+            return
+        values = initial_state.to(
+            device=self._wkv_state_pool.device, dtype=self.state_dtype
+        )
+        self.reset_state_slots(indices)
+        self._wkv_state_pool.index_copy_(
+            1,
+            indices.long(),
+            values.unsqueeze(1).expand(-1, indices.numel(), -1, -1, -1),
+        )
+
     def copy_state_slots(
         self,
         source_ids: Sequence[int] | torch.Tensor,
@@ -971,6 +1000,113 @@ class RwkvForCausalLM(
     def get_rwkv_state_layer(self) -> RwkvStateLayer:
         return self.model.rwkv_state
 
+    def rwkv_adapter_rpc(self, operation: str, **kwargs: Any) -> dict[str, Any]:
+        from irwkv.model_executor.models.rwkv_adapters import (
+            RWKVAdapterStore,
+            load_rwkv_adapter,
+        )
+
+        if not hasattr(self, "_rwkv_adapters"):
+            self._rwkv_adapters = RWKVAdapterStore()
+            self._rwkv_states = RWKVAdapterStore()
+            self._rwkv_leases: dict[str, tuple[Any, Any]] = {}
+            self._rwkv_active_adapter: str | None = None
+            self._rwkv_base_adapter = {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in self.named_parameters()
+                if ".lora_" in name
+            }
+        store = (
+            self._rwkv_states if kwargs.get("kind") == "state" else self._rwkv_adapters
+        )
+        if operation == "put":
+            entry = load_rwkv_adapter(
+                kwargs["adapter_id"],
+                kwargs["data"],
+                self.config,
+                kind=kwargs.get("kind", "adapter"),
+                metadata=kwargs.get("metadata"),
+            )
+            if entry.kind != "state":
+                lora = getattr(self.config, "rwkv_lora", None)
+                if not lora or lora["use_nora"] or lora["lora_alpha"] == 0:
+                    raise ValueError(
+                        "dynamic adapters require rwkv_lora with use_nora=false "
+                        "and nonzero lora_alpha"
+                    )
+                if entry.rank > lora["r"]:
+                    raise ValueError("adapter rank exceeds configured rwkv_lora.r")
+                targets = lora["target_modules"]
+                for name in entry.tensors:
+                    projection = name.rsplit(".lora_", 1)[0]
+                    if not any(projection.endswith(target) for target in targets):
+                        raise ValueError(
+                            f"adapter projection is not enabled: {projection}"
+                        )
+            return store.put(entry).info()
+        if operation == "list":
+            return store.info()
+        if operation == "delete":
+            return {"deleted": store.erase(kwargs["adapter_id"])}
+        if operation == "acquire":
+            lease = kwargs["lease"]
+            if lease in self._rwkv_leases:
+                raise ValueError("duplicate adapter lease")
+            adapter = state = None
+            try:
+                if kwargs.get("adapter_id"):
+                    adapter = self._rwkv_adapters.acquire(
+                        kwargs["adapter_id"], kwargs.get("adapter_version")
+                    )
+                if kwargs.get("state_id"):
+                    state = self._rwkv_states.acquire(kwargs["state_id"])
+            except Exception:
+                if adapter is not None:
+                    self._rwkv_adapters.release(adapter.adapter_id)
+                raise
+            self._rwkv_leases[lease] = (adapter, state)
+            return {
+                "adapter_version": None if adapter is None else adapter.version,
+                "state_version": None if state is None else state.version,
+            }
+        if operation == "release":
+            adapter, state = self._rwkv_leases.pop(kwargs["lease"], (None, None))
+            if adapter is not None:
+                self._rwkv_adapters.release(adapter.adapter_id)
+            if state is not None:
+                self._rwkv_states.release(state.adapter_id)
+            return {}
+        raise ValueError(f"unknown RWKV adapter operation: {operation}")
+
+    @torch.no_grad()
+    def activate_rwkv_adapter(self, adapter: Any | None) -> None:
+        version = None if adapter is None else adapter.version
+        if (
+            not hasattr(self, "_rwkv_active_adapter")
+            or self._rwkv_active_adapter == version
+        ):
+            return
+        lora = self.config.rwkv_lora
+        base_scale = lora["lora_alpha"] / lora["r"]
+        scale = base_scale if adapter is None else adapter.scale
+        for name, parameter in self.named_parameters():
+            if ".lora_" not in name:
+                continue
+            self.get_submodule(name.rsplit(".lora_", 1)[0]).lora_scale = scale
+            if adapter is None:
+                parameter.copy_(self._rwkv_base_adapter[name])
+                continue
+            parameter.zero_()
+            source = adapter.tensors.get(name)
+            if source is None:
+                continue
+            if ".lora_A." in name:
+                parameter[: adapter.rank].copy_(source)
+            else:
+                parameter[:, : adapter.rank].copy_(source)
+        self._rwkv_active_adapter = version
+        self._rwkv_eager_adapter = scale != base_scale
+
     @staticmethod
     def get_model_state_cls():
         from irwkv.v1.worker.gpu.model_states.rwkv import RwkvModelState
@@ -1086,7 +1222,12 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if getattr(self.config, "rwkv_dynamic_adapters", False):
+            loaded.update(
+                name for name, _ in self.named_parameters() if ".lora_" in name
+            )
+        return loaded
 
     def process_weights_after_loading(self) -> None:
         self.model.process_weights_after_loading()
