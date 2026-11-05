@@ -391,8 +391,13 @@ class Scheduler(SchedulerInterface):
         ckpt_block_size = (
             self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
         )
+        # Before the first token a follow-up may replace: the last prompt token,
+        # or a replaceable tail such as the chat generation prompt.
+        replay_tokens = request.num_tokens
+        if request.num_tokens == request.num_prompt_tokens:
+            replay_tokens -= max(self.mamba_continuation_tail_tokens - 1, 0)
         last_cache_position = get_mamba_prefill_checkpoint_position(
-            request.num_tokens,
+            replay_tokens,
             block_size,
         )
 
@@ -432,7 +437,8 @@ class Scheduler(SchedulerInterface):
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             get_mamba_prefill_checkpoint_position(
-                request.num_prompt_tokens,
+                request.num_prompt_tokens
+                - max(self.mamba_continuation_tail_tokens - 1, 0),
                 self.hash_block_size,
             )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
@@ -450,14 +456,6 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
-        # State before a replaceable prompt tail (the chat generation prompt).
-        continuation_stop = (
-            (request.num_prompt_tokens - self.mamba_continuation_tail_tokens)
-            // ckpt_block_size
-            * ckpt_block_size
-            if self.mamba_continuation_tail_tokens
-            else 0
-        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -473,7 +471,6 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
-            continuation_stop,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

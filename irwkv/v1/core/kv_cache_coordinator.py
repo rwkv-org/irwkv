@@ -293,15 +293,11 @@ class KVCacheCoordinator(ABC):
         A hit is the shortest across all groups, so every group retains state
         at each position. A resend of the identical prompt is capped at
         ``num_tokens - 1`` because its last token is recomputed for logits.
-        A follow-up turn that replaces the prompt's last
-        ``continuation_tail_tokens`` resumes before that tail.
+        With ``continuation_tail_tokens``, the boundary moves before that tail
+        so a follow-up turn replacing it still hits; a resend recomputes the
+        tail.
         """
-        if self.continuation_tail_tokens:
-            return (
-                request.num_prompt_tokens - 1,
-                request.num_prompt_tokens - self.continuation_tail_tokens,
-            )
-        return (request.num_prompt_tokens - 1,)
+        return (request.num_prompt_tokens - max(self.continuation_tail_tokens, 1),)
 
     def get_num_cacheable_tokens(self, num_computed_tokens: int) -> int:
         """Return the prefix eligible for hashing in this group."""

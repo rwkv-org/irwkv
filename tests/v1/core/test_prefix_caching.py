@@ -229,21 +229,28 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
 
 
 @pytest.mark.parametrize(
-    ("spec_cls", "hash_block_size", "num_prompt_tokens", "chunks", "follow_up_hit"),
+    (
+        "spec_cls",
+        "hash_block_size",
+        "num_prompt_tokens",
+        "chunks",
+        "follow_up_hit",
+        "resend_hit",
+    ),
     [
-        (MambaSpec, 32, 65, [64, 1], 0),
-        (RwkvStateSpec, 32, 65, [32, 32, 1], 32),
-        (MambaSpec, 8, 81, [64, 16, 1], 64),
-        (RwkvStateSpec, 8, 81, [64, 8, 8, 1], 72),
+        (MambaSpec, 32, 65, [64, 1], 0, 64),
+        (RwkvStateSpec, 32, 65, [32, 33], 32, 32),
+        (MambaSpec, 8, 81, [64, 16, 1], 64, 80),
+        (RwkvStateSpec, 8, 81, [64, 8, 9], 72, 72),
     ],
 )
 def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
-    spec_cls, hash_block_size, num_prompt_tokens, chunks, follow_up_hit
+    spec_cls, hash_block_size, num_prompt_tokens, chunks, follow_up_hit, resend_hit
 ):
     """A chat follow-up re-renders history without the previous generation
     prompt ("<think"), so it diverges a few tokens before the prompt end. RWKV
-    also stops prefill and keeps the state before that tail, while an identical
-    resend still resumes at the prompt end."""
+    keeps the state before that tail instead of the prompt-end state, in as
+    many prefill steps as other Mamba models."""
     block_size = 32
     manager = make_kv_cache_manager(
         KVCacheConfig(
@@ -298,13 +305,11 @@ def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
     follow_up = make_request(
         "follow_up", [*prompt[:-2], 1000, 1001], hash_block_size, sha256
     )
-    follow_up_blocks, num_computed, _ = manager.get_computed_blocks(follow_up)
+    _, num_computed, _ = manager.get_computed_blocks(follow_up)
     assert num_computed == follow_up_hit
     resend = make_request("resend", prompt, hash_block_size, sha256)
-    resend_blocks, num_computed, _ = manager.get_computed_blocks(resend)
-    assert num_computed == (num_prompt_tokens - 1) // hash_block_size * hash_block_size
-    if follow_up_hit:
-        assert follow_up_blocks.blocks[0][-1] is not resend_blocks.blocks[0][-1]
+    _, num_computed, _ = manager.get_computed_blocks(resend)
+    assert num_computed == resend_hit
 
 
 def make_kv_cache_config_hybrid_model(
