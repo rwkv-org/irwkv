@@ -1864,7 +1864,10 @@ class MambaManager(SingleTypeKVCacheManager):
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(
-                request, num_tokens, retention_interval=retention_interval
+                request,
+                num_tokens,
+                retention_interval=retention_interval,
+                replay_boundaries=replay_boundaries,
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
@@ -1901,6 +1904,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None,
+        replay_boundaries: Sequence[int],
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
         # Re-key the reserved block at its exported checkpoint boundary.
@@ -1952,16 +1956,18 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
-        latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
-            request.num_prompt_tokens,
-            hash_block_size,
-        )
+        # The prompt's hash-aligned replay boundaries: where a resend of this
+        # prompt, or a follow-up replacing its tail, resumes.
+        replay_hash_boundaries = {
+            boundary // hash_block_size * hash_block_size
+            for boundary in replay_boundaries
+        }
         # The junction is the other position a sibling resumes at: where one was
         # observed to stop, and where the scheduler already ends a chunk. Bounded
         # to the prompt chunk being computed -- during decode the target is the
         # running state block, mutated in place, which equals what its key
         # promises only after that step's forward.
-        if num_tokens != latest_prompt_hash_boundary and not (
+        if num_tokens not in replay_hash_boundaries and not (
             self.shared_prefix_checkpoint
             and num_tokens == request.shared_prefix_boundary
             and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
