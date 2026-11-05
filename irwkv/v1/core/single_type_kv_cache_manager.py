@@ -1870,22 +1870,16 @@ class MambaManager(SingleTypeKVCacheManager):
             request,
             num_tokens,
             retention_interval=retention_interval,
-            replay_boundaries=(
-                (*replay_boundaries, num_tokens)
-                if self.retains_latest_checkpoint
-                else replay_boundaries
-            ),
+            replay_boundaries=replay_boundaries,
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+        latest_checkpoint = None
         if (
             self.retains_latest_checkpoint
             and num_cached_blocks_after > num_cached_blocks_before
         ):
-            self._update_latest_checkpoint(
-                request,
-                num_cached_blocks_after - 1,
-                retention_interval,
-                replay_boundaries,
+            latest_checkpoint = self._update_latest_checkpoint(
+                request, num_cached_blocks_after - 1
             )
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(
@@ -1904,7 +1898,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
-                if self.mamba_cache_mode == "align":
+                # A newer boundary soon supersedes the latest checkpoint, so
+                # offloading it would only churn the connector.
+                if self.mamba_cache_mode == "align" and block is not latest_checkpoint:
                     assert block.block_hash_num_tokens is not None
                     # Offer every retained boundary with its exact block.
                     # The connector filters against its save window, which may
@@ -1922,38 +1918,38 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step.clear()
 
     def _update_latest_checkpoint(
-        self,
-        request: Request,
-        block_idx: int,
-        retention_interval: int | None,
-        replay_boundaries: Sequence[int],
-    ) -> None:
-        block = self.req_to_blocks[request.request_id][block_idx]
-        if block.is_null or block.block_hash is None:
-            return
-        reachable_boundaries = [*replay_boundaries]
-        if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
-        retained = self.reachable_block_mask(
-            block_idx,
-            block_idx + 1,
-            self.cache_hit_alignment_tokens,
-            self.kv_cache_spec,
-            retention_interval=retention_interval,
-            reachable_boundaries=reachable_boundaries,
-            dcp_world_size=self.dcp_world_size,
-        )
-        if retained is None:
-            # Dense retention already keeps every boundary.
-            return
+        self, request: Request, block_idx: int
+    ) -> KVCacheBlock | None:
+        """Make ``block_idx`` the request's latest checkpoint.
+
+        Returns:
+            The block if it is cached only as the latest checkpoint, or
+            ``None`` if retention already keeps it.
+
+        """
+        blocks = self.req_to_blocks[request.request_id]
+        block = blocks[block_idx]
+        if block.is_null:
+            return None
         previous = self._latest_checkpoints.pop(request.request_id, None)
         if previous is not None:
             previous_block, previous_hash = previous
             # The block may have been recycled since; only drop our own entry.
             if previous_block.block_hash == previous_hash:
                 self.block_pool._maybe_evict_cached_block(previous_block)
-        if not retained[0]:
-            self._latest_checkpoints[request.request_id] = (block, block.block_hash)
+        if block.block_hash is not None:
+            return None
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=block_idx,
+            num_full_blocks=block_idx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
+        assert block.block_hash is not None
+        self._latest_checkpoints[request.request_id] = (block, block.block_hash)
+        return block
 
     def _cache_partial_tail_block(
         self,

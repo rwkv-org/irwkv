@@ -575,6 +575,13 @@ def test_align_continuation_resumes_from_latest_committed_state(
         turn.num_computed_tokens += 1
         manager.new_step_starts()
     turn.append_output_token_ids(131)
+    # Only the prompt boundary goes to a connector; superseded latest
+    # checkpoints are not offloaded.
+    (state_manager,) = manager.coordinator.single_type_managers
+    assert [
+        boundary
+        for *_, boundary in state_manager.take_pending_boundary_state_offloads()
+    ] == [16]
     manager.free(turn)
 
     pool = manager.block_pool

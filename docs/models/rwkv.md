@@ -62,10 +62,13 @@ With prefix caching, each request also keeps its latest committed block-aligned
 state after it finishes, is aborted, or is preempted. A newer boundary of the same
 request replaces it. A multi-turn client that resends the complete history
 resumes from that state and processes only the remaining tokens. Reuse requires
-an exact token-prefix match. If a re-rendered history differs, for example
-because reasoning was dropped, a tool call was re-serialized, or the chat
-template or `fake_cot_mode` changed, the hit falls back to the last matching
-retained boundary. The final sampled token of a turn is never consumed, so it
+an exact token-prefix match, so it applies to clients that resend the exact
+token history, such as the Completions API. Chat follow-ups re-render the
+history without the previous generation prompt, so they diverge before this
+state. If a re-rendered history differs, for example because reasoning was
+dropped, a tool call was re-serialized, or the chat template or
+`fake_cot_mode` changed, the hit falls back to the last matching retained
+boundary. The final sampled token of a turn is never consumed, so it
 and any unaligned tail are recomputed. Retained states are evictable blocks in
 the same state pool and are recomputed on a miss.
 
