@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
+import copy
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
@@ -141,12 +142,9 @@ class RwkvSampler(Sampler):
             tuple[int, tuple[torch.Tensor, torch.Tensor] | None]
         ] = []
         self._input_batch: InputBatch | None = None
+        self._graph_rows = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
         self._sampling_graphs: dict[int, _RwkvSamplingGraph] = {}
-        self._structured_outputs_worker: StructuredOutputsWorker | None = None
         if capture_graphs:
-            self._structured_outputs_worker = StructuredOutputsWorker(
-                max_num_logits=max_num_reqs, vocab_size=vocab_size, device=device
-            )
             capacities = (1, 2, 4, 8, 16, 32, 64, 128, 256, 320, 512)
             for capacity in capacities:
                 if capacity <= max_num_reqs:
@@ -171,6 +169,7 @@ class RwkvSampler(Sampler):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
+        structured_outputs_worker: StructuredOutputsWorker | None = None,
     ) -> SamplerOutput | None:
         idx_mapping_np = input_batch.idx_mapping_np
         if (
@@ -194,17 +193,17 @@ class RwkvSampler(Sampler):
 
         apply_grammar_bitmask = None
         if grammar_output is not None:
-            # The bitmask rows address batch rows, which match graph rows only
-            # when no request is still mid-prefill.
-            if num_active != num_reqs:
-                return None
-            structured_outputs_worker = self._structured_outputs_worker
             assert structured_outputs_worker is not None
+            # Grammar requests never sample mid-prefill, so each one has a
+            # compacted graph row; address it through ``cu_num_logits``.
+            self._graph_rows.np[active_rows_np] = np.arange(num_active)
+            graph_batch = copy.copy(input_batch)
+            graph_batch.cu_num_logits = self._graph_rows.copy_to_uva(num_reqs)
 
             def apply_grammar_bitmask(logits: torch.Tensor) -> None:
                 structured_outputs_worker.apply_grammar_bitmask(
                     logits,
-                    input_batch,
+                    graph_batch,
                     grammar_output.structured_output_request_ids,
                     grammar_output.grammar_bitmask,
                 )
@@ -455,6 +454,7 @@ class RwkvModelState(DefaultModelState):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
+        structured_outputs_worker: StructuredOutputsWorker | None = None,
     ) -> SamplerOutput | None:
         del model
         if self._sampler is None:
@@ -463,6 +463,7 @@ class RwkvModelState(DefaultModelState):
             hidden_states,
             input_batch,
             grammar_output,
+            structured_outputs_worker,
         )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:

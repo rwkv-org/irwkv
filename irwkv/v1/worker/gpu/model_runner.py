@@ -1223,6 +1223,7 @@ class GPUModelRunner:
                 sample_hidden_states,
                 input_batch,
                 grammar_output,
+                self.structured_outputs_worker,
             )
             if custom_output is not None:
                 return (

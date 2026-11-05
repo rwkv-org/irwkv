@@ -268,6 +268,7 @@ class ModelState(ABC):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
+        structured_outputs_worker: Any | None = None,
     ) -> Any | None:
         """Optionally sample directly from hidden states."""
         return None

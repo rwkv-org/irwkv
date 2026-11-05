@@ -1256,11 +1256,13 @@ def _graph_sampler(monkeypatch, calls: list[str]) -> tuple[RwkvSampler, Any]:
     sampler.get_logprobs_dims = lambda idx_mapping_np: None
     sampler.needs_logits_processing = np.zeros(4, dtype=bool)
     sampler._sampling_graphs = {4: graph}
-    sampler._structured_outputs_worker = SimpleNamespace(
-        apply_grammar_bitmask=lambda *args: calls.append(("grammar", *args))
-    )
     active_rows = np.empty(4, dtype=np.int64)
     active_slots = np.empty(4, dtype=np.int32)
+    graph_rows = np.full(4, -1, dtype=np.int32)
+    sampler._graph_rows = SimpleNamespace(
+        np=graph_rows,
+        copy_to_uva=lambda size: torch.from_numpy(graph_rows[:size]),
+    )
     sampler._active_rows = SimpleNamespace(
         np=active_rows,
         copy_to_uva=lambda size: torch.from_numpy(active_rows[:size]),
@@ -1285,6 +1287,7 @@ def _graph_sampler(monkeypatch, calls: list[str]) -> tuple[RwkvSampler, Any]:
 
 def _graph_input_batch(num_computed_prefill_tokens: list[int]) -> Any:
     return SimpleNamespace(
+        req_ids=["a", "b", "c", "d"],
         num_reqs=4,
         idx_mapping_np=np.array([2, 1, 3, 0]),
         idx_mapping=torch.tensor([2, 1, 3, 0]),
@@ -1314,45 +1317,46 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     assert torch.equal(graph.top_k[:3], torch.tensor([18, 19, 16]))
 
 
+def _grammar_worker(calls: list[Any]) -> Any:
+    def apply_grammar_bitmask(logits, input_batch, req_ids, bitmask) -> None:
+        rows = [
+            int(input_batch.cu_num_logits[input_batch.req_ids.index(req_id)])
+            for req_id in req_ids
+        ]
+        calls.append(("grammar", logits, rows, bitmask))
+
+    return SimpleNamespace(apply_grammar_bitmask=apply_grammar_bitmask)
+
+
+@pytest.mark.parametrize(
+    ("num_computed_prefill_tokens", "graph_rows"),
+    [
+        # Every request samples: graph rows match batch rows.
+        ([1, 6, 3, 0], [2, 3]),
+        # Request "b" is mid-prefill, so "c" and "d" shift up one graph row.
+        ([1, 2, 3, 0], [1, 2]),
+    ],
+)
 def test_rapid_sampler_graph_masks_grammar_between_logits_and_sampling(
-    monkeypatch,
+    monkeypatch, num_computed_prefill_tokens: list[int], graph_rows: list[int]
 ) -> None:
+    """The bitmask lands on each grammar request's compacted graph row between
+    the logits and sampling replays, including in mixed prefill batches."""
     calls: list[Any] = []
     sampler, graph = _graph_sampler(monkeypatch, calls)
-    input_batch = _graph_input_batch([1, 6, 3, 0])
-    bitmask = np.zeros((1, 1), dtype=np.int32)
+    input_batch = _graph_input_batch(num_computed_prefill_tokens)
+    bitmask = np.zeros((2, 1), dtype=np.int32)
     grammar_output = SimpleNamespace(
-        structured_output_request_ids=["request"], grammar_bitmask=bitmask
+        structured_output_request_ids=["c", "d"], grammar_bitmask=bitmask
     )
 
     output = sampler.sample_hidden_states(
-        torch.zeros(4, 3), input_batch, grammar_output
+        torch.zeros(4, 3), input_batch, grammar_output, _grammar_worker(calls)
     )
 
     assert output is not None
-    assert calls == [
-        "logits",
-        ("grammar", graph.logits, input_batch, ["request"], bitmask),
-        "sample",
-    ]
-
-
-def test_rapid_sampler_graph_defers_grammar_during_partial_prefill(
-    monkeypatch,
-) -> None:
-    calls: list[Any] = []
-    sampler, _ = _graph_sampler(monkeypatch, calls)
-    input_batch = _graph_input_batch([1, 2, 3, 0])
-    grammar_output = SimpleNamespace(
-        structured_output_request_ids=["request"],
-        grammar_bitmask=np.zeros((1, 1), dtype=np.int32),
-    )
-
-    assert (
-        sampler.sample_hidden_states(torch.zeros(4, 3), input_batch, grammar_output)
-        is None
-    )
-    assert calls == []
+    assert calls == ["logits", ("grammar", graph.logits, graph_rows, bitmask), "sample"]
+    assert torch.equal(input_batch.cu_num_logits, torch.tensor([0, 1, 2, 3, 4]))
 
 
 @pytest.mark.parametrize("factory", [SamplingParams, SamplingParams.from_optional])
