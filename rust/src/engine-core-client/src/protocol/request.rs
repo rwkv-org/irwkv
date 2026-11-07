@@ -98,9 +98,6 @@ pub struct EngineCoreRequest {
     /// client when scaling out the frontend.
     #[serde(default)]
     pub client_index: u32,
-    /// In DP mode, indicates which wave this request is expected to belong to.
-    #[serde(default)]
-    pub current_wave: u32,
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]
@@ -185,6 +182,11 @@ mod tests {
             }),
             arrival_time: 1234.5,
             client_index: 7,
+            priority: -3,
+            trace_headers: Some(BTreeMap::from([(
+                "traceparent".to_string(),
+                "trace-1".to_string(),
+            )])),
             session_id: Some("session-1".to_string()),
             kv_hints: Some(KvHintsEnvelope {
                 protocol_version: "0.1".to_string(),
@@ -206,13 +208,15 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        assert_eq!(array.len(), 20);
+        assert_eq!(array.len(), 19);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil);
         assert_eq!(array[4], Value::from(1234.5));
         assert_eq!(array[9], Value::from(7));
-        assert_eq!(array[18], Value::from("session-1"));
-        assert!(matches!(&array[19], Value::Map(_)));
+        assert_eq!(array[10], Value::from(-3));
+        assert!(matches!(&array[11], Value::Map(_)));
+        assert_eq!(array[17], Value::from("session-1"));
+        assert!(matches!(&array[18], Value::Map(_)));
     }
 
     #[test]

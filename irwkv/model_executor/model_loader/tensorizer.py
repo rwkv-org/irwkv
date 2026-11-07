@@ -19,7 +19,6 @@ import regex as re
 import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers import PreTrainedConfig
 
 import irwkv.envs as envs
 from irwkv.config import (
@@ -31,6 +30,7 @@ from irwkv.config import (
 from irwkv.logger import init_logger
 from irwkv.platforms import current_platform
 from irwkv.transformers_utils.repo_utils import hf_api
+from irwkv.transformers_utils.rwkv import RwkvConfig as PreTrainedConfig
 from irwkv.utils.argparse_utils import FlexibleArgumentParser
 from irwkv.utils.import_utils import PlaceholderModule
 

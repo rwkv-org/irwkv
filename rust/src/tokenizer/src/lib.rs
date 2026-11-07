@@ -10,6 +10,7 @@ mod byte_level_decode;
 mod error;
 mod hf;
 mod incremental;
+mod rwkv;
 mod tekken;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
@@ -18,6 +19,7 @@ mod tiktoken;
 pub use error::{Result, TokenizerError};
 pub use hf::HuggingFaceTokenizer;
 pub use incremental::{DecodedText, IncrementalDecoder, TokenAnchor, TokenAttribution};
+pub use rwkv::{RWKV_EOS_TOKEN_ID, load_rwkv_tokenizer};
 pub use tekken::TekkenTokenizer;
 pub use tiktoken::TiktokenTokenizer;
 

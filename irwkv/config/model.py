@@ -72,7 +72,7 @@ _REGISTERED_MODEL_CLASS_OVERRIDES: set[tuple[str, str]] = set()
 RunnerOption = Literal["auto", "generate"]
 ConvertType = Literal["none"]
 ConvertOption = Literal["auto", ConvertType]
-TokenizerMode = Literal["auto", "hf"]
+TokenizerMode = Literal["auto", "rwkv", "hf"]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
@@ -435,7 +435,7 @@ class ModelConfig:
         overrides: dict[str, Any],
     ) -> None:
         """Apply dict overrides, handling both nested configs and dict values."""
-        from transformers import PreTrainedConfig
+        from irwkv.transformers_utils.rwkv import RwkvConfig as PreTrainedConfig
 
         for key, value in overrides.items():
             attr = getattr(config, key, None)

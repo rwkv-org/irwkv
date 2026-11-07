@@ -11,25 +11,23 @@ from openai.types.responses.tool import Tool as ResponsesTool
 from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
 from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from pydantic import BaseModel
-from xgrammar import StructuralTag, normalize_tool_choice
-from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
-from xgrammar.openai_tool_call_schema import (
-    BuiltinToolParam,
-    FunctionToolParam,
-)
-from xgrammar.structural_tag import (
-    AnyTextFormat,
-    JSONSchemaFormat,
-    SequenceFormat,
-    TagFormat,
-    TagsWithSeparatorFormat,
-    TokenTriggeredTagsFormat,
-    TriggeredTagsFormat,
-)
 
 from irwkv.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
+)
+from irwkv.tool_parsers.structural_tag import (
+    AnyTextFormat,
+    BuiltinToolParam,
+    FunctionToolParam,
+    JSONSchemaFormat,
+    SequenceFormat,
+    StructuralTag,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TokenTriggeredTagsFormat,
+    TriggeredTagsFormat,
+    normalize_tool_choice,
 )
 from irwkv.tool_parsers.tool_strict_level import ToolStrictLevel
 from irwkv.tool_parsers.utils import get_function_tools, require_function_tools
@@ -228,6 +226,8 @@ def get_model_structural_tag(
             f"Structural tag model {model!r} is an xgrammar builtin with fixed "
             f"tokens and cannot apply token_suffix={token_suffix!r}"
         )
+
+    from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
 
     return get_xgrammar_model_structural_tag(
         model=model,

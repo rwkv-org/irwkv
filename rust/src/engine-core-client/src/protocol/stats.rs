@@ -315,8 +315,10 @@ pub struct SchedulerStats {
     #[serde(default)]
     pub num_skipped_waiting_reqs: u64,
     /// Internal DP load-balancing step counter.
+    #[serde(default)]
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.
+    #[serde(default)]
     pub current_wave: u64,
     /// KV-cache usage. `1.0` means 100% usage.
     pub kv_cache_usage: f64,

@@ -26,6 +26,7 @@ def rwkv_config(thinking: bool = True) -> ParserEngineConfig:
         name="rwkv",
         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
         wait_for_reasoning=thinking,
+        strip_trailing_reasoning_whitespace=False,
         terminals={"THINK_START": "<think>", "THINK_END": "</think>"},
         token_id_terminals={"THINK_START": "<think>", "THINK_END": "</think>"},
         transitions={

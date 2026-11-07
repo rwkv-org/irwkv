@@ -1588,6 +1588,18 @@ def get_kv_cache_config_from_groups(
     allocatable_memory = max(available_memory - fixed_memory_bytes, 0)
     num_blocks = allocatable_memory // pool_bytes_per_block
     num_blocks = may_override_num_blocks(irwkv_config, num_blocks)
+    if (
+        getattr(irwkv_config, "model_config", None) is not None
+        and getattr(irwkv_config.model_config.hf_config, "model_type", None) == "rwkv"
+        and all(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode == "none"
+            for group in kv_cache_groups
+        )
+        and irwkv_config.cache_config.num_gpu_blocks_override is None
+    ):
+        # One mutable state per running request, plus the reserved null slot.
+        num_blocks = min(num_blocks, irwkv_config.scheduler_config.max_num_seqs + 1)
     size = visible_bytes_per_block * num_blocks
 
     # Groups alias from byte 0. Spec regions are laid out differently:

@@ -23,7 +23,6 @@ from typing import Any, NamedTuple
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 import irwkv.version
 from irwkv.config import ModelConfig
@@ -31,6 +30,7 @@ from irwkv.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from irwkv.platforms import current_platform
+from irwkv.transformers_utils.rwkv import SAFE_WEIGHTS_INDEX_NAME
 from irwkv.utils.hashing import safe_hash
 
 SOCKET_NAME_TEMPLATE = "irwkv_weight_cache_{gpu_uuid}{role}.sock"

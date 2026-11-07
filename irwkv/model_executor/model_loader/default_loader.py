@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from irwkv.config import ModelConfig
 from irwkv.config.load import LoadConfig
@@ -35,6 +34,7 @@ from irwkv.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from irwkv.tracing import instrument
+from irwkv.transformers_utils.rwkv import SAFE_WEIGHTS_INDEX_NAME
 
 if TYPE_CHECKING:
     from irwkv.model_executor.models.utils import WeightsMapper

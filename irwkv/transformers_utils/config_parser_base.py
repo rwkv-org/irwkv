@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from transformers import PreTrainedConfig
+from .rwkv import RwkvConfig as PreTrainedConfig
 
 
 class ConfigParserBase(ABC):

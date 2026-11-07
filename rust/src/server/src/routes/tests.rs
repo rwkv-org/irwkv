@@ -5177,6 +5177,69 @@ async fn reset_encoder_cache_route_sends_expected_utility_call() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn rwkv_state_routes_preserve_binary_utility_payloads() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            for operation in ["import", "export"] {
+                let utility = recv_engine_message(dealer).await;
+                let payload = decode_value(&utility[1]).expect("decode state utility");
+                let array = payload.as_array().expect("utility array");
+                let call_id = array[1].as_u64().expect("call id");
+                assert_eq!(array[2], Value::from("rwkv_state"));
+                let args = array[3].as_array().expect("state args");
+                assert_eq!(args[0], Value::from(operation));
+                let result = if operation == "import" {
+                    assert_eq!(args[1], Value::Binary(b"binary-state".to_vec()));
+                    Value::Map(vec![(Value::from("id"), Value::from("state"))])
+                } else {
+                    assert_eq!(args[1], Value::from("state"));
+                    Value::Binary(b"binary-state".to_vec())
+                };
+                send_outputs(
+                    push,
+                    utility_outputs(call_id, UtilityResultEnvelope::without_type_info(result)),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+    let uploaded = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rwkv/states")
+                .body(Body::from("binary-state"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let body = to_bytes(uploaded.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        json!({"id": "state"})
+    );
+    let downloaded = app
+        .clone()
+        .call(Request::builder().uri("/v1/rwkv/states/state").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(
+        downloaded.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        to_bytes(downloaded.into_body(), usize::MAX).await.unwrap().as_ref(),
+        b"binary-state"
+    );
+    engine_task.await.expect("mock state engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() {
     let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
         boxed_test_future(async move {

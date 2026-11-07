@@ -147,6 +147,12 @@ class KVConnectorFactory:
 
 
 KVConnectorFactory.register_connector(
+    "RwkvStateConnector",
+    "irwkv.distributed.kv_transfer.kv_connector.v1.rwkv_connector",
+    "RwkvStateConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "irwkv.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",

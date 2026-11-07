@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run
+#!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # /// script
@@ -16,6 +16,9 @@ from enum import Enum, IntEnum
 import msgpack
 import msgspec
 import numpy as np
+
+from irwkv.v1.engine import EngineCoreOutput, EngineCoreRequest
+from irwkv.v1.metrics.stats import SchedulerStats
 
 
 class RequestOutputKind(Enum):
@@ -65,59 +68,8 @@ class KvHintsEnvelope(msgspec.Struct, frozen=True):
     actions: list[KvHintAction]
 
 
-class EngineCoreRequest(
-    msgspec.Struct,
-    array_like=True,
-    omit_defaults=True,
-):
-    request_id: str
-    prompt_token_ids: list[int] | None
-    mm_features: object | None
-    sampling_params: EngineCoreSamplingParams | None
-    arrival_time: float
-    cache_salt: str | None = None
-    data_parallel_rank: int | None = None
-    prompt_embeds: object | None = None
-    prompt_is_token_ids: list[bool] | None = None
-    client_index: int = 0
-    current_wave: int = 0
-    priority: int = 0
-    trace_headers: dict[str, str] | None = None
-    resumable: bool = False
-    external_req_id: str | None = None
-    reasoning_ended: bool | None = None
-    reasoning_parser_kwargs: dict[str, object] | None = None
-    abort_immediately: bool = False
-    session_id: str | None = None
-    kv_hints: KvHintsEnvelope | None = None
-
-
-class EngineCoreOutput(
-    msgspec.Struct,
-    array_like=True,
-    omit_defaults=True,
-):
-    request_id: str
-    new_token_ids: list[int]
-    new_logprobs: object | None = None
-    new_prompt_logprobs_tensors: object | None = None
-    pooling_output: object | None = None
-    finish_reason: FinishReason | None = None
-    stop_reason: int | str | None = None
-    events: object | None = None
-    kv_transfer_params: object | None = None
-    ec_transfer_params: object | None = None
-    trace_headers: object | None = None
-    prefill_stats: object | None = None
-    num_nans_in_logits: int = 0
-    mm_cache_miss_hashes: list[str] | None = None
-    new_sampling_mask: object | None = None
-    spec_decode_metrics: object | None = None
-    prompt_token_id_logprobs: object | None = None
-
-
 class ExtendedEngineCoreOutput(EngineCoreOutput):
-    # Match Omni's append-only schema without requiring Omni or torch.
+    # Match Omni's append-only schema without requiring Omni.
     multimodal_output: dict[str, object] | None = None
     is_segment_finished: bool = False
     new_prompt_len_snapshot: int | None = None
@@ -162,6 +114,8 @@ request = EngineCoreRequest(
         output_kind=RequestOutputKind.FINAL_ONLY,
     ),
     arrival_time=42.5,
+    cache_salt=None,
+    data_parallel_rank=None,
     client_index=0,
     session_id="session-1",
     kv_hints=KvHintsEnvelope(
@@ -185,6 +139,8 @@ defaults_request = EngineCoreRequest(
     mm_features=None,
     sampling_params=EngineCoreSamplingParams(),
     arrival_time=1.0,
+    cache_salt=None,
+    data_parallel_rank=None,
 )
 
 multimodal_tensor = np.array([[1.0, 2.0], [3.5, 4.25]], dtype=np.float32)
@@ -544,3 +500,8 @@ print(msgspec.msgpack.encode(mooncake_stats).hex())
 print(msgspec.msgpack.encode(multi_connector_stats).hex())
 print(msgspec.msgpack.encode(ready_response).hex())
 print(extended_outputs_bytes.hex())
+print(
+    msgspec.msgpack.encode(
+        SchedulerStats(num_running_reqs=3, num_waiting_reqs=2)
+    ).hex()
+)

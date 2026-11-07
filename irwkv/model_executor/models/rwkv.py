@@ -31,6 +31,7 @@ from irwkv.model_executor.models.interfaces import (
     SupportsPP,
 )
 from irwkv.sequence import IntermediateTensors
+from irwkv.transformers_utils.rwkv import RWKV_MAX_TOKEN_ID
 from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
@@ -402,6 +403,63 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         indices = self._slot_tensor(slot_ids)
         for handle in self._wkv_handles:
             handle.materialize_slots_(indices)
+
+    @property
+    def state_slot_shapes(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        pools = self._state_pools()
+        return {
+            name: ((pool.shape[0], *pool.shape[2:]), pool.dtype)
+            for name, pool in pools.items()
+        }
+
+    @property
+    def state_slot_nbytes(self) -> int:
+        return sum(
+            pool.numel() * pool.element_size() // pool.shape[1]
+            for pool in self._state_pools().values()
+        )
+
+    def _state_pools(self) -> dict[str, torch.Tensor]:
+        if (
+            self._tmix_shift_pool is None
+            or self._cmix_shift_pool is None
+            or self._wkv_state_pool is None
+        ):
+            raise RuntimeError("RWKV state pool has not been bound")
+        return {
+            "tmix": self._tmix_shift_pool,
+            "cmix": self._cmix_shift_pool,
+            "wkv": self._wkv_state_pool,
+        }
+
+    def snapshot_state_slot(self, slot: int) -> dict[str, torch.Tensor]:
+        if not 0 < slot < self.state_pool_size:
+            raise ValueError("Invalid RWKV state snapshot slot")
+        result = {}
+        for name, pool in self._state_pools().items():
+            source = pool[:, slot]
+            target = torch.empty(
+                source.shape,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=source.is_cuda,
+            )
+            target.copy_(source, non_blocking=True)
+            result[name] = target
+        return result
+
+    def restore_state_slot(self, slot: int, tensors: dict[str, torch.Tensor]) -> None:
+        if not 0 < slot < self.state_pool_size:
+            raise ValueError("Invalid RWKV state restore slot")
+        pools = self._state_pools()
+        if tensors.keys() != pools.keys():
+            raise ValueError("RWKV state tensor names do not match")
+        for name, pool in pools.items():
+            target, source = pool[:, slot], tensors[name]
+            if source.shape != target.shape or source.dtype != target.dtype:
+                raise ValueError(f"RWKV state tensor {name} has an incompatible layout")
+        for name, pool in pools.items():
+            pool[:, slot].copy_(tensors[name], non_blocking=True)
 
     def _prepare_live_ticket(self, metadata: RwkvAttentionMetadata) -> object:
         flashrwkv2 = _load_flashrwkv2()
@@ -1089,9 +1147,13 @@ class RwkvForCausalLM(
         logits = _load_flashrwkv2().infer_head_linear_all_forward_varlen(
             hidden_states, self.lm_head.weight, **_lora_kwargs(self.lm_head, "")
         )
-        return self.logits_processor(
+        logits = self.logits_processor(
             self.lm_head, logits[..., : self.config.vocab_size]
         )
+        if logits is not None and self.config.vocab_size > RWKV_MAX_TOKEN_ID:
+            logits[..., 0] = -float("inf")
+            logits[..., RWKV_MAX_TOKEN_ID + 1 :] = -float("inf")
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

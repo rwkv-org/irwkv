@@ -368,7 +368,7 @@ impl GenerateOutputStream {
             kv_transfer_params: raw.kv_transfer_params,
             ec_transfer_params: raw.ec_transfer_params,
             sampling_mask,
-            spec_decode_metrics: raw.spec_decode_metrics,
+            spec_decode_metrics: None,
         };
 
         Ok(output)

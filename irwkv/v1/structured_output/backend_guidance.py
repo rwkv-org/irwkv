@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from transformers import TokenizersBackend
 
 from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import init_logger
 from irwkv.sampling_params import SamplingParams
 from irwkv.tokenizers import TokenizerLike
+from irwkv.tokenizers.rwkv import RwkvTokenizer as TokenizersBackend
 from irwkv.utils.import_utils import LazyLoader
 from irwkv.v1.structured_output.backend_types import (
     StructuredOutputBackend,
@@ -128,7 +128,7 @@ def process_for_additional_properties(
 
 class RwkvGuidanceTokenizer:
     def __init__(self, tokenizer: TokenizerLike, vocab_size: int):
-        from transformers.convert_slow_tokenizer import bytes_to_unicode
+        from irwkv.transformers_utils.rwkv import bytes_to_unicode
 
         self.tokenizer = tokenizer
         self.eos_token_id = tokenizer.eos_token_id
@@ -170,10 +170,8 @@ class GuidanceBackend(StructuredOutputBackend):
 
     @staticmethod
     def _build_ll_tokenizer(tokenizer: TokenizerLike, vocab_size: int) -> Any:
-        if (
-            isinstance(tokenizer, TokenizersBackend)
-            and type(tokenizer.backend_tokenizer.model).__name__ == "RwkvTrie"
-        ):
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if type(getattr(backend, "model", None)).__name__ == "RwkvTrie":
             wrapped = llguidance.TokenizerWrapper(
                 RwkvGuidanceTokenizer(tokenizer, vocab_size)
             )
@@ -356,6 +354,10 @@ def serialize_guidance_grammar(
                 s_tag = json.loads(grammar_spec)
             else:
                 s_tag = grammar_spec
+            if "format" in s_tag:
+                from irwkv.tool_parsers.structural_tag import to_guidance_grammar
+
+                return to_guidance_grammar(s_tag, _process_schema)
             triggers: list[str] = s_tag["triggers"]
             tags: list[llguidance.StructTag] = []
             for s in s_tag["structures"]:

@@ -49,7 +49,7 @@ class RwkvAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_kv_connector(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
@@ -140,6 +140,11 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
         )
         buffers = self._live_buffers.get(descriptor)
         if buffers is None:
+            # Captured graphs own stable addresses; eager shapes need only
+            # the current buffers, not a permanent entry for every chunk size.
+            for previous in self._live_buffers.keys() - self._captured_descriptors:
+                del self._live_buffers[previous]
+                self._live_query_layouts.pop(previous, None)
             buffers = (
                 torch.empty(
                     sequence_capacity + 1,

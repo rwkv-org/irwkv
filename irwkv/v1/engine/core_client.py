@@ -294,6 +294,9 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def rwkv_state_async(self, operation: str, value: str | bytes | None = None):
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """InprocClient: client for in-process EngineCore. Intended
@@ -1238,6 +1241,9 @@ class AsyncMPClient(MPClient):
     async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
         per_engine = await self.call_utility_all_async("compute_weight_checksums")
         return [worker for workers in per_engine for worker in workers]
+
+    async def rwkv_state_async(self, operation: str, value: str | bytes | None = None):
+        return await self.call_utility_async("rwkv_state", operation, value)
 
 
 class DPAsyncMPClient(AsyncMPClient):

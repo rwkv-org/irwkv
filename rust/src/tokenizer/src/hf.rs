@@ -153,6 +153,13 @@ pub struct HuggingFaceTokenizer {
 }
 
 impl HuggingFaceTokenizer {
+    pub fn new_rwkv() -> Result<Self> {
+        info!("loading original RWKV byte vocabulary");
+        let mut tokenizer = Self::from_hf_backend(crate::load_rwkv_tokenizer()?);
+        tokenizer.special_token_ids = vec![crate::RWKV_EOS_TOKEN_ID].into();
+        Ok(tokenizer)
+    }
+
     fn from_hf_backend(tokenizer: HfTokenizer) -> Self {
         let added_vocab = {
             let mut vocab: Vec<_> = tokenizer
@@ -283,15 +290,20 @@ impl Tokenizer for HuggingFaceTokenizer {
     }
 
     fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        let token_ids: Cow<'_, [u32]> = if skip_special_tokens {
+            Cow::Owned(token_ids.iter().copied().filter(|&id| !self.is_special_id(id)).collect())
+        } else {
+            Cow::Borrowed(token_ids)
+        };
         match &self.backend {
             Backend::Hf(t) => t
-                .decode(token_ids, skip_special_tokens)
+                .decode(token_ids.as_ref(), skip_special_tokens)
                 .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report())),
             Backend::Fastokens(t) => t
-                .decode(token_ids, skip_special_tokens)
+                .decode(token_ids.as_ref(), skip_special_tokens)
                 .map_err(|error| tokenizer_error!("decoding failed: {}", error.as_report())),
             Backend::FastokensByteLevel(t) => {
-                decode_fastokens_byte_level(t, token_ids, skip_special_tokens)
+                decode_fastokens_byte_level(t, token_ids.as_ref(), skip_special_tokens)
             }
         }
     }
@@ -340,6 +352,20 @@ mod tests {
 
     const REGULAR_TOKEN: &str = "<|regular|>";
     const SPECIAL_TOKEN: &str = "<|special|>";
+
+    #[test]
+    fn native_rwkv_end_of_turn_is_not_returned_when_skipping_special_tokens() {
+        let tokenizer = HuggingFaceTokenizer::new_rwkv().unwrap();
+        assert!(tokenizer.is_special_id(crate::RWKV_EOS_TOKEN_ID));
+        assert_eq!(
+            tokenizer.decode(&[crate::RWKV_EOS_TOKEN_ID], false).unwrap(),
+            "✿"
+        );
+        assert_eq!(
+            tokenizer.decode(&[crate::RWKV_EOS_TOKEN_ID], true).unwrap(),
+            ""
+        );
+    }
 
     fn tiny_bpe_tokenizer() -> HfTokenizer {
         let vocab = [

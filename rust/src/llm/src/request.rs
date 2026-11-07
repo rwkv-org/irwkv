@@ -108,7 +108,6 @@ impl GenerateRequest {
                 prompt_embeds: None,
                 prompt_is_token_ids: None,
                 client_index: 0,
-                current_wave: 0,
                 priority,
                 trace_headers,
                 resumable: false,

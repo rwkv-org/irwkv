@@ -229,7 +229,9 @@ impl ModelConfig {
     /// Return the effective model-side EOS token ids, following the same
     /// simplified text-config selection as `vocab_size`.
     pub(super) fn eos_token_ids(&self) -> &[u32] {
-        if let Some(eos_token_id) = self.eos_token_id.as_ref() {
+        if self.model_type() == Some("rwkv") {
+            &[irwkv_tokenizer::RWKV_EOS_TOKEN_ID]
+        } else if let Some(eos_token_id) = self.eos_token_id.as_ref() {
             eos_token_id.as_slice()
         } else if let Some(text_config) = self.text_config.as_deref() {
             text_config.eos_token_ids()
@@ -446,6 +448,16 @@ mod tests {
         assert_eq!(single.eos_token_ids(), &[151645]);
         assert_eq!(many.eos_token_ids(), &[128001, 128008, 128009]);
         assert!(null.eos_token_ids().is_empty());
+    }
+
+    #[test]
+    fn rwkv_uses_original_end_of_turn_instead_of_converted_eos_ids() {
+        let config: ModelConfig =
+            serde_json::from_str(r#"{"model_type":"rwkv","eos_token_id":[0,2]}"#).unwrap();
+        assert_eq!(
+            config.eos_token_ids(),
+            &[irwkv_tokenizer::RWKV_EOS_TOKEN_ID]
+        );
     }
 
     #[test]

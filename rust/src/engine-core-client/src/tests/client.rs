@@ -529,7 +529,6 @@ fn multipart_logprob_output_frames(request_id: &str) -> Vec<bytes::Bytes> {
                 Value::Nil,
             ]),
             Value::Nil,
-            Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
         ])]),
         Value::Nil,
@@ -617,7 +616,6 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             assert_eq!(add[0].as_ref(), &[0x00]);
             let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
             assert_eq!(request.request_id, "req-1");
-            assert_eq!(request.current_wave, 0);
 
             assert!(
                 timeout(
@@ -661,7 +659,6 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             assert_eq!(add[0].as_ref(), &[0x00]);
             let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
             assert_eq!(request.request_id, "req-3");
-            assert_eq!(request.current_wave, 1);
 
             send_outputs(
                 &mut data_socket.push,
@@ -698,7 +695,6 @@ async fn coordinator_wave_control_tracks_pause_running_and_rebroadcasts() {
             assert_eq!(add[0].as_ref(), &[0x00]);
             let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
             assert_eq!(request.request_id, "req-2");
-            assert_eq!(request.current_wave, 0);
 
             assert!(
                 timeout(
@@ -2723,7 +2719,8 @@ async fn reset_prefix_cache_returns_false_when_any_engine_fails() {
 fn python_msgpack_fixtures_match_rust_encoding() {
     init_tracing();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tests/python_compat.py");
-    let output = Command::new(&script)
+    let output = Command::new(std::env::var_os("PYTHON").unwrap_or_else(|| "python".into()))
+        .arg(&script)
         .output()
         .unwrap_or_else(|error| panic!("failed to execute {:?}: {error}", script));
     assert!(
@@ -2753,6 +2750,11 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         lines.next().expect("missing MultiConnector stats fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
     let extended_outputs_hex = lines.next().expect("missing extended outputs fixture line");
+    let scheduler_stats_hex = lines.next().expect("missing scheduler stats fixture line");
+    let scheduler_stats: SchedulerStats =
+        rmp_serde::from_slice(&hex::decode(scheduler_stats_hex).unwrap()).unwrap();
+    assert_eq!(scheduler_stats.num_running_reqs, 3);
+    assert_eq!(scheduler_stats.num_waiting_reqs, 2);
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2858,7 +2860,6 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         ],
                         new_logprobs: None,
                         new_prompt_logprobs_tensors: None,
-                        pooling_output: None,
                         finish_reason: Some(
                             Length,
                         ),
@@ -2871,7 +2872,6 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         num_nans_in_logits: 0,
                         mm_cache_miss_hashes: None,
                         new_sampling_mask: None,
-                        spec_decode_metrics: None,
                         prompt_token_id_logprobs: None,
                     },
                 ],
@@ -3285,7 +3285,6 @@ async fn bootstrapped_external_coordinator_updates_wave_ignores_counts_and_sends
     assert_eq!(add[0].as_ref(), &[0x00]);
     let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
     assert_eq!(request.request_id, "req-1");
-    assert_eq!(request.current_wave, 7);
     assert!(client.is_healthy());
 
     send_outputs(
@@ -3361,7 +3360,7 @@ async fn bootstrapped_external_coordinator_running_state_suppresses_wakeup() {
 
     let add = recv_engine_message(&mut dealer).await;
     let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
-    assert_eq!(request.current_wave, 5);
+    assert_eq!(request.request_id, "req-1");
 
     send_outputs(
         &mut push,

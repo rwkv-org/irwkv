@@ -9,14 +9,6 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import huggingface_hub
-from transformers import GenerationConfig, PreTrainedConfig
-from transformers.configuration_utils import ALLOWED_LAYER_TYPES
-from transformers.models.auto.image_processing_auto import get_image_processor_config
-from transformers.models.auto.modeling_auto import (
-    MODEL_MAPPING_NAMES,
-)
-from transformers.models.auto.tokenization_auto import get_tokenizer_config
-from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from irwkv import envs
 from irwkv.logger import init_logger
@@ -34,11 +26,20 @@ from .repo_utils import (
     try_get_local_file,
     with_retry,
 )
+from .rwkv import GenerationConfig, RwkvConfig, load_json
 
-if envs.IRWKV_USE_MODELSCOPE:
-    from modelscope import AutoConfig
-else:
-    from transformers import AutoConfig
+PreTrainedConfig = RwkvConfig
+HF_CONFIG_NAME = "config.json"
+MODEL_MAPPING_NAMES = {"rwkv": "RwkvForCausalLM"}
+ALLOWED_LAYER_TYPES: set[str] = set()
+
+
+def get_tokenizer_config(model, **kwargs) -> dict[str, Any]:
+    return load_json(model, "tokenizer_config.json", **kwargs)
+
+
+def get_image_processor_config(model, **kwargs) -> dict[str, Any]:
+    return get_hf_file_to_dict("preprocessor_config.json", model, **kwargs) or {}
 
 logger = init_logger(__name__)
 
@@ -91,7 +92,7 @@ class HFConfigParser(ConfigParserBase):
         )
         kwargs.pop("hf_overrides", None)
         try:
-            config = AutoConfig.from_pretrained(
+            config = RwkvConfig.from_pretrained(
                 model,
                 trust_remote_code=trust_remote_code,
                 revision=revision,

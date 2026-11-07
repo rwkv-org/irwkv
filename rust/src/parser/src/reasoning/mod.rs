@@ -41,9 +41,6 @@ mod rwkv {
         pub fn new(tokenizer: DynTokenizer) -> Result<Self> {
             Ok(Self {
                 inner: DelimitedReasoningParserBuilder::new(tokenizer, "<think>", "</think>")
-                    .with_after_start("\n")
-                    .with_before_end("\n")
-                    .with_after_end("\n\n")
                     .build()?,
             })
         }
@@ -110,6 +107,15 @@ mod rwkv {
             let delta = push_str(&mut parser, "answer");
             assert_eq!(delta.reasoning, None);
             assert_eq!(content_str(&delta), Some("answer"));
+        }
+
+        #[test]
+        fn rwkv_preserves_whitespace_for_replayed_history() {
+            let tokenizer = Arc::new(fake_tokenizer());
+            let mut parser = RwkvReasoningParser::new(tokenizer).unwrap();
+            let delta = push_str(&mut parser, "<think>\nreason \n</think>\n\nanswer ");
+            assert_eq!(reasoning_str(&delta), Some("\nreason \n"));
+            assert_eq!(content_str(&delta), Some("\n\nanswer "));
         }
 
         #[test]

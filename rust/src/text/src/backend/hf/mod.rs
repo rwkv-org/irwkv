@@ -48,7 +48,7 @@ pub fn load_rwkv_sampling_profile(path: Option<&std::path::Path>) -> Result<Rwkv
         )));
     }
     Ok(RwkvSamplingProfile {
-        stop_strings: config.stop_strings.unwrap_or_default(),
+        stop_strings: vec!["✿".to_string()],
         params: crate::SamplingParams {
             temperature: config.temperature,
             top_p: config.top_p,
@@ -63,6 +63,7 @@ pub fn load_rwkv_sampling_profile(path: Option<&std::path::Path>) -> Result<Rwkv
 
 fn load_tokenizer(tokenizer: &TokenizerSource) -> Result<DynTokenizer> {
     match tokenizer {
+        TokenizerSource::Rwkv(_) => Ok(Arc::new(HuggingFaceTokenizer::new_rwkv()?)),
         TokenizerSource::HuggingFace(path) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
         TokenizerSource::Tiktoken(path) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),
         TokenizerSource::Tekken(path) => Ok(Arc::new(TekkenTokenizer::new(path)?)),
@@ -99,7 +100,11 @@ impl HfTextBackend {
         let tokenizer = load_tokenizer(&files.tokenizer)?;
         let model_config = load_model_config(files.config_path.as_deref())?;
         let model_vocab_size = model_config.vocab_size()? as usize;
-        let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
+        let mut generation_config =
+            load_generation_config(files.generation_config_path.as_deref())?;
+        if model_config.model_type() == Some("rwkv") {
+            generation_config.stop_strings = Some(vec!["✿".to_string()]);
+        }
         let (primary_eos_token_id, extra_eos_token_ids) = resolve_eos_token_ids(
             &tokenizer_config,
             &model_config,
@@ -147,6 +152,9 @@ fn resolve_eos_token_ids(
     generation_config: &GenerationConfig,
     tokenizer: &dyn Tokenizer,
 ) -> (Option<u32>, BTreeSet<u32>) {
+    if model_config.model_type() == Some("rwkv") {
+        return (Some(irwkv_tokenizer::RWKV_EOS_TOKEN_ID), BTreeSet::new());
+    }
     let model_config_eos_token_ids = model_config.eos_token_ids();
     let primary_eos_token_id = tokenizer_config
         .special_tokens

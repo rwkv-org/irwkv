@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use irwkv_text::Prompt;
 use irwkv_text::backend::hf::{
-    HfSpecialTokens, HfTokenizerConfig, ResolvedModelFiles, load_tokenizer_config,
+    HfSpecialTokens, HfTokenizerConfig, NamedSpecialToken, ResolvedModelFiles, TokenizerSource,
+    load_tokenizer_config,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -117,10 +118,17 @@ impl HfChatRenderer {
         multimodal: Option<MultimodalRenderInfo>,
     ) -> Result<Self> {
         let HfTokenizerConfig {
-            special_tokens,
+            mut special_tokens,
             chat_template,
             ..
         } = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
+        let is_rwkv = matches!(&files.tokenizer, TokenizerSource::Rwkv(_));
+        if is_rwkv {
+            special_tokens = HfSpecialTokens {
+                eos_token: Some(NamedSpecialToken::Text("✿".to_string())),
+                ..Default::default()
+            };
+        }
         let mut template = chat_template;
         let special_tokens = (!special_tokens.is_empty()).then_some(special_tokens);
 
@@ -130,6 +138,14 @@ impl HfChatRenderer {
                     .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
             );
             info!("using configured chat template override");
+        } else if is_rwkv {
+            template = Some(
+                include_str!(
+                    "../../../../../../irwkv/transformers_utils/chat_templates/rwkv.jinja"
+                )
+                .to_string(),
+            );
+            info!("using the native RWKV chat template");
         } else if let Some(chat_template_path) = files.chat_template_path.as_deref() {
             // If independent chat template file(s) exist and contain non-empty content,
             // they take priority over template entries in the tokenizer config
@@ -188,6 +204,11 @@ impl HfChatRenderer {
         effective_template: &CompiledChatTemplate,
         request: &ChatRequest,
     ) -> Result<RenderedPrompt> {
+        if request.chat_options.template_kwargs.contains_key("messages") {
+            return Err(Error::ChatTemplateThrown {
+                message: "Template kwargs cannot replace conversation messages".to_string(),
+            });
+        }
         let mut messages = to_template_messages(
             &request.messages,
             effective_template.content_format(),
@@ -374,7 +395,20 @@ fn to_template_message<'a>(
             tool_call_id: None,
         },
         ChatMessage::Assistant { content } => {
-            let text = content.text();
+            let text = if matches!(content_format, ChatTemplateContentFormat::String) {
+                content
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantContentBlock::Text { text } if !text.is_empty() => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                content.text()
+            };
             let reasoning = content.reasoning();
             let tool_calls = to_template_tool_calls(content)?;
             let content =
@@ -497,6 +531,16 @@ fn to_template_string_content(
     match content {
         ChatContent::Text(text) => Ok(text.clone()),
         ChatContent::Parts(parts) => {
+            if parts.iter().all(|part| matches!(part, ChatContentPart::Text { .. })) {
+                return Ok(parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ChatContentPart::Text { text } if !text.is_empty() => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"));
+            }
             let mut out = String::new();
             for part in parts {
                 match part {
@@ -981,7 +1025,76 @@ mod tests {
 
         let rendered = render(Some("{{ messages[0].content }}"), &request).unwrap();
 
-        assert_eq!(rendered, "hello world");
+        assert_eq!(rendered, "hello\n world");
+    }
+
+    #[test]
+    fn assistant_text_parts_use_the_same_separator_as_user_parts() {
+        let request = sample_request(vec![ChatMessage::Assistant {
+            content: vec![
+                AssistantContentBlock::Text {
+                    text: "A1".to_string(),
+                },
+                AssistantContentBlock::Text {
+                    text: "A2".to_string(),
+                },
+            ],
+        }]);
+        assert_eq!(
+            render(Some("{{ messages[0].content }}"), &request).unwrap(),
+            "A1\nA2"
+        );
+    }
+
+    #[test]
+    fn native_rwkv_template_preserves_assistant_prefixes() {
+        let template =
+            include_str!("../../../../../../irwkv/transformers_utils/chat_templates/rwkv.jinja");
+        for style in ["bot", "assistant", "function_calling"] {
+            for mode in ["fake_think", "open_think"] {
+                let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "Q1")]);
+                request
+                    .chat_options
+                    .template_kwargs
+                    .insert("rwkv_prompt_template".to_string(), serde_json::json!(style));
+                request.chat_options.template_kwargs.insert(
+                    "rwkv_generation_prompt".to_string(),
+                    serde_json::json!(mode),
+                );
+                let prefix = render(Some(template), &request).unwrap();
+                let mut content = vec![AssistantContentBlock::Text {
+                    text: "A1\n\n  ".to_string(),
+                }];
+                if mode == "open_think" {
+                    content.insert(
+                        0,
+                        AssistantContentBlock::Reasoning {
+                            text: "R1".to_string(),
+                        },
+                    );
+                }
+                request.messages.push(ChatMessage::Assistant { content });
+                request.messages.push(ChatMessage::text(ChatRole::User, "Q2"));
+                let history = render(Some(template), &request).unwrap();
+                let reasoning = if mode == "open_think" {
+                    "R1</think>"
+                } else {
+                    ""
+                };
+                assert!(history.starts_with(&format!("{prefix}{reasoning}A1\n\n  ✿")));
+            }
+        }
+    }
+
+    #[test]
+    fn template_kwargs_cannot_replace_request_messages() {
+        let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "Q1")]);
+        request
+            .chat_options
+            .template_kwargs
+            .insert("messages".to_string(), serde_json::json!([]));
+        let error = render(Some("{{ messages[0].content }}"), &request).unwrap_err();
+        assert!(error.is_request_validation_error());
     }
 
     #[test]
@@ -1152,7 +1265,7 @@ mod tests {
         .unwrap()
         .prompt;
 
-        assert_eq!(rendered, Prompt::Text("hello world".to_string()));
+        assert_eq!(rendered, Prompt::Text("hello\n world".to_string()));
     }
 
     #[test]

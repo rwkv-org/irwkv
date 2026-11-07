@@ -3,11 +3,16 @@
 
 from collections.abc import Mapping, Set
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal
 
 import pytest
 from packaging.version import Version
-from transformers import __version__ as TRANSFORMERS_VERSION
+
+try:
+    TRANSFORMERS_VERSION = version("transformers")
+except PackageNotFoundError:
+    TRANSFORMERS_VERSION = "0"
 
 from irwkv.config.model import ModelDType, TokenizerMode
 

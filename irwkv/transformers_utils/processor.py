@@ -1,23 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import importlib
 import inspect
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast, get_args, get_type_hints
 
-from transformers import (
-    AutoFeatureExtractor,
-    AutoImageProcessor,
-    AutoProcessor,
-    AutoVideoProcessor,
-    processing_utils,
-)
-from transformers.feature_extraction_utils import FeatureExtractionMixin
-from transformers.image_processing_utils import BaseImageProcessor
-from transformers.models.auto.video_processing_auto import VIDEO_PROCESSOR_MAPPING_NAMES
-from transformers.processing_utils import ProcessorMixin
-from transformers.video_processing_utils import BaseVideoProcessor
 from typing_extensions import TypeVar
 
 from irwkv.logger import init_logger
@@ -29,7 +19,19 @@ from irwkv.utils.func_utils import get_allowed_kwarg_only_overrides
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from transformers import (
+        processing_utils,
+    )
+    from transformers.feature_extraction_utils import FeatureExtractionMixin
+    from transformers.image_processing_utils import BaseImageProcessor
+    from transformers.processing_utils import ProcessorMixin
+    from transformers.video_processing_utils import BaseVideoProcessor
+
     from irwkv.config import ModelConfig
+else:
+    ProcessorMixin = BaseImageProcessor = BaseVideoProcessor = (
+        FeatureExtractionMixin
+    ) = object
 
 
 def _transformers_v4_compatibility_import():
@@ -38,6 +40,8 @@ def _transformers_v4_compatibility_import():
     In Transformers v5 these were merged into `ProcessorChatTemplateKwargs` and
     `ChatTemplateLoadKwargs` was removed. For backward compatibility, we add an alias
     for `ChatTemplateLoadKwargs` if it doesn't exist."""
+    from transformers import processing_utils
+
     old_import = getattr(processing_utils, "ChatTemplateLoadKwargs", None)
     new_import = getattr(processing_utils, "ProcessorChatTemplateKwargs", None)
     if old_import is None and new_import is not None:
@@ -53,6 +57,8 @@ def _transformers_v4_compatibility_init() -> Any:
 
     This can be removed if `Molmo2ForConditionalGeneration` is upstreamed to
     Transformers."""
+    from transformers.processing_utils import ProcessorMixin
+
     if hasattr(ProcessorMixin.__init__, "_irwkv_patched"):
         return
 
@@ -70,9 +76,6 @@ def _transformers_v4_compatibility_init() -> Any:
         __init__._irwkv_patched = True  # type: ignore[attr-defined]
         ProcessorMixin.__init__ = __init__
 
-
-_transformers_v4_compatibility_import()
-_transformers_v4_compatibility_init()
 
 _P = TypeVar("_P", bound=ProcessorMixin, default=ProcessorMixin)
 _I = TypeVar("_I", bound=BaseImageProcessor, default=BaseImageProcessor)
@@ -96,7 +99,10 @@ class HashableList(list):
 
 
 def _get_processor_factory_fn(processor_cls: type | tuple[type, ...]):
-    if isinstance(processor_cls, tuple) or processor_cls == ProcessorMixin:
+    from transformers import AutoProcessor
+    from transformers.processing_utils import ProcessorMixin
+
+    if isinstance(processor_cls, tuple) or processor_cls in (object, ProcessorMixin):
         return AutoProcessor.from_pretrained
     if hasattr(processor_cls, "from_pretrained"):
         return processor_cls.from_pretrained
@@ -105,7 +111,7 @@ def _get_processor_factory_fn(processor_cls: type | tuple[type, ...]):
 
 
 def _merge_mm_kwargs(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
     processor_cls: type | tuple[type, ...],
     /,
     **kwargs,
@@ -180,7 +186,13 @@ def get_video_processor_cls_name_from_config(
     # instead of the generic opencv fallback. The mapping is ``None`` for a
     # given type when torchvision is unavailable; callers then use opencv.
     model_config = get_hf_file_to_dict("config.json", processor_name, revision=revision)
+    if model_config and model_config.get("model_type") == "rwkv":
+        return None
     if model_config and "model_type" in model_config:
+        from transformers.models.auto.video_processing_auto import (
+            VIDEO_PROCESSOR_MAPPING_NAMES,
+        )
+
         video_processor = VIDEO_PROCESSOR_MAPPING_NAMES.get(model_config["model_type"])
         # Transformers >= 5.19 maps to {"torchvision": name}
         if isinstance(video_processor, dict):
@@ -195,7 +207,7 @@ _cached_get_video_processor_cls_name = lru_cache(
 
 
 def get_video_processor_cls_name(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
 ) -> str | None:
     model = model_config.model
     revision = model_config.revision
@@ -211,6 +223,15 @@ def get_processor(
     **kwargs: Any,
 ) -> _P:
     """Load a processor for the given model name via HuggingFace."""
+    from transformers import AutoProcessor
+    from transformers.processing_utils import ProcessorMixin
+
+    _transformers_v4_compatibility_import()
+    _transformers_v4_compatibility_init()
+
+    if processor_cls is object:
+        processor_cls = ProcessorMixin
+
     if revision is None:
         revision = "main"
     try:
@@ -279,6 +300,8 @@ cached_get_processor = lru_cache(get_processor)
 def get_processor_kwargs_type(
     processor: ProcessorMixin,
 ) -> type[processing_utils.ProcessingKwargs]:
+    from transformers import processing_utils
+
     try:
         # get kwargs annotations in processor
         call_params = inspect.signature(type(processor).__call__).parameters
@@ -378,7 +401,7 @@ def cached_get_processor_without_dynamic_kwargs(
 
 
 def cached_processor_from_config(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
     processor_cls: type[_P] | tuple[type[_P], ...] = ProcessorMixin,
     **kwargs: Any,
 ) -> _P:
@@ -400,6 +423,8 @@ def get_feature_extractor(
 ):
     """Load an audio feature extractor for the given model name
     via HuggingFace."""
+    from transformers import AutoFeatureExtractor
+
     try:
         processor_name = convert_model_repo_to_path(processor_name)
         feature_extractor = AutoFeatureExtractor.from_pretrained(
@@ -431,9 +456,11 @@ cached_get_feature_extractor = lru_cache(get_feature_extractor)
 
 
 def cached_feature_extractor_from_config(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
     **kwargs: Any,
 ):
+    from transformers import AutoFeatureExtractor
+
     return cached_get_feature_extractor(
         model_config.model,
         revision=model_config.revision,
@@ -451,6 +478,8 @@ def get_image_processor(
     **kwargs: Any,
 ):
     """Load an image processor for the given model name via HuggingFace."""
+    from transformers import AutoImageProcessor
+
     try:
         processor_name = convert_model_repo_to_path(processor_name)
         processor_cls = processor_cls_overrides or AutoImageProcessor
@@ -484,9 +513,11 @@ cached_get_image_processor = lru_cache(get_image_processor)
 
 
 def cached_image_processor_from_config(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
     **kwargs: Any,
 ):
+    from transformers import AutoImageProcessor
+
     return cached_get_image_processor(
         model_config.model,
         revision=model_config.revision,
@@ -504,6 +535,8 @@ def get_video_processor(
     **kwargs: Any,
 ):
     """Load a video processor for the given model name via HuggingFace."""
+    from transformers import AutoVideoProcessor
+
     try:
         processor_name = convert_model_repo_to_path(processor_name)
         processor_cls = processor_cls_overrides or AutoVideoProcessor
@@ -537,10 +570,12 @@ cached_get_video_processor = lru_cache(get_video_processor)
 
 
 def cached_video_processor_from_config(
-    model_config: "ModelConfig",
+    model_config: ModelConfig,
     processor_cls: type[_V] | None = None,
     **kwargs: Any,
 ):
+    from transformers import AutoVideoProcessor
+
     return cached_get_video_processor(
         model_config.model,
         revision=model_config.revision,

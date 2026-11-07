@@ -5,7 +5,6 @@ from typing import final
 
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
-from transformers import PreTrainedConfig
 
 from irwkv.config.model_arch import (
     ModelArchitectureConfig,
@@ -14,6 +13,7 @@ from irwkv.transformers_utils.config import (
     ConfigFormat,
     get_safetensors_params_metadata,
 )
+from irwkv.transformers_utils.rwkv import RwkvConfig as PreTrainedConfig
 from irwkv.utils.torch_utils import common_broadcastable_dtype
 
 

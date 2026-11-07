@@ -2,7 +2,7 @@
 
 irwkv serves RWKV-7 artifacts with the native `RwkvForCausalLM`
 implementation. The artifact must use the canonical `model_type="rwkv"`
-configuration, safetensors weight names, tokenizer, and chat template from
+configuration and safetensors weight names from
 [`transformers-rwkv`](https://github.com/rwkv-rs/transformers-rwkv).
 
 RWKV execution requires CUDA and the public fused operators and recurrent-state
@@ -22,8 +22,26 @@ uv pip install -r requirements/rwkv.txt --torch-backend=auto
 uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
-The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a17`. FlashRWKV2 exposes the public
+The requirements file fixes the native `tokenizers-rwkv` commit and
+`FlashRWKV2==0.1.0a17`. RWKV configuration, tokenization, chat templates, and
+the default llguidance structured-output backend run without Transformers.
+The converted artifact format remains compatible with `transformers-rwkv`.
+Tokenization uses the bundled original `rwkv_vocab_v20230424.txt` directly in
+both Python and Rust. Its 65,529 byte entries retain IDs 1 through 65,529;
+converted `tokenizer.json` vocabularies and added-token mappings are ignored.
+`✿` (ID 10060) is the end-of-turn token. It belongs to the rendered chat history
+and terminates generation without appearing in the returned body. ID 0 and
+IDs above 65529 have no entries in the original vocabulary and are excluded
+from generation. `<|endoftext|>`, `<think>`, and `</think>` are ordinary text,
+not single tokens. The host-state fingerprint includes the original vocabulary.
+
+Python and Rust use the same bundled RWKV chat template. It preserves message
+whitespace and replays assistant reasoning and complete thinking markers so
+that a following turn extends the earlier token history. Return the assistant's
+`reasoning` field along with `content` when continuing an Open Think conversation.
+Use `--chat-template` for an explicit custom template; converted artifact
+templates no longer replace the native default.
+FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -57,6 +75,72 @@ TorchDynamo does not decompose the external fused operators. Use
 To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
 This uses irwkv's state-aligned cache blocks and copies recurrent state at block
 boundaries.
+
+## Host state cache and binary snapshots
+
+For multi-turn prefix reuse with one mutable GPU state per request, enable
+the optional host cache instead of the token-aligned GPU prefix cache:
+
+```bash
+irwkv serve <model> --no-enable-prefix-caching \
+  --kv-transfer-config '{"kv_connector":"RwkvStateConnector","kv_role":"kv_both","kv_connector_extra_config":{"max_bytes":4294967296}}'
+```
+
+The CPU LRU holds immutable, uncompressed snapshots under its byte budget.
+Automatic snapshots with the same model, `cache_salt`, and complete consumed
+token prefix share one entry and a stable ID. Repeated completions refresh its
+LRU position without another GPU-to-CPU copy, including when the first copy is
+still in progress. Requests creating a new snapshot retain their GPU slot
+until the asynchronous copy completes.
+Snapshots contain the actual consumed prefix; the last sampled token may
+still be absent from that prefix. Cache lookup checks only existing snapshot
+lengths and respects `cache_salt`. A missing or evicted snapshot triggers
+recomputation. This initial implementation requires TP=PP=DP=1.
+
+The snapshot is a prefill checkpoint. Supply the full conversation or prompt
+on the next request; only an exact token prefix is reused. The prompt must
+extend beyond the cached prefix, since generation still computes logits from
+at least one new token. Identical-prompt replay does not use a snapshot at its
+full length. Sampling RNG and penalty history start fresh for the new request.
+
+Both Python and Rust HTTP frontends expose these custom endpoints:
+
+| Method | Endpoint | Result |
+| --- | --- | --- |
+| GET | `/v1/rwkv/states` | Cached snapshot metadata in `data` |
+| GET | `/v1/rwkv/states/{id}` | Compressed binary download |
+| POST | `/v1/rwkv/states` | Upload binary bytes; returns new snapshot metadata |
+| DELETE | `/v1/rwkv/states/{id}` | Remove a snapshot |
+
+Metadata includes `id`, the originating engine `request_id`, `num_tokens`, and
+`context_sha1`. A finished request's snapshot becomes visible after its copy
+completes. Imported snapshots have no originating engine request ID.
+
+```bash
+curl http://localhost:8000/v1/rwkv/states
+curl http://localhost:8000/v1/rwkv/states/STATE_ID -o conversation.state
+curl -X POST http://localhost:8000/v1/rwkv/states \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @conversation.state
+```
+
+Select an uploaded state with the existing request extension
+`"kv_transfer_params":{"rwkv_state_id":"STATE_ID"}`. Uploaded states are
+excluded from automatic shared prefix lookup: validating the file cannot prove
+that its tensors were actually computed from its declared context. The explicit
+ID remains a hint; a context mismatch falls back to normal prefill.
+Uploaded states and their descendants remain separate even with identical
+token contexts, since their tensor values may differ.
+
+Files use a versioned header, lossless zlib compression, and safetensors.
+They include consumed token IDs, their SHA-1 over little-endian uint32 values,
+the cache salt, state tensors, and a model fingerprint over the configuration,
+tokenizer, and actual safetensors weights. A SHA-256 checksum detects corruption.
+Import checks the decompressed size, model identity, token range, tensor names,
+shapes, dtypes, and finite values. Uploads are limited to 512 MiB; the model's
+state size and maximum context length further bound decompression. Downloads
+compress in a background CPU thread. State files contain conversation tokens
+and should be handled as conversation data.
 
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
@@ -117,9 +201,8 @@ three standalone generation configs:
 | Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 0.996 |
 | Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 0.996 |
 
-These must be standalone `GenerationConfig` documents. Omit
-`_from_model_config` or set it to `false`; otherwise Transformers rebuilds the
-configuration from the model config and drops the RWKV-only penalty fields.
+These are standalone JSON sampling profiles. The native loader keeps the six
+sampling controls and uses `✿` as the end-of-turn token in every profile.
 
 The default template mode selects Open Think. Setting
 `chat_template_kwargs.rwkv_generation_prompt` to `fake_think` selects Fake
@@ -150,8 +233,8 @@ stages.
 
 ## Tool calling
 
-The canonical artifact chat template emits `**Tool Call:**` followed by fenced
-JSON. Load that template directly from the artifact and select the RWKV parser:
+The native chat template emits `**Tool Call:**` followed by fenced JSON.
+Select the RWKV parser:
 
 ```bash
 irwkv serve <model> \

@@ -600,7 +600,6 @@ impl EngineCoreClient {
         trace!(
             request_id = %req.request_id,
             client_index = req.client_index,
-            current_wave = req.current_wave,
             request = ?req,
             "sending add request"
         );
@@ -627,7 +626,6 @@ impl EngineCoreClient {
         let result: Result<()> = async {
             if let Some(coordinator) = self.coordinator.as_ref() {
                 let snapshot = coordinator.snapshot();
-                req.current_wave = snapshot.current_wave;
                 if !snapshot.engines_running {
                     coordinator.notify_first_request(engine_id.clone())?;
                 }

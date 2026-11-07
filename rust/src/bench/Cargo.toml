@@ -41,7 +41,11 @@ irwkv-engine-core-client.workspace = true
 irwkv-llm.workspace = true
 irwkv-managed-engine.workspace = true
 irwkv-text.workspace = true
+irwkv-tokenizer.workspace = true
 irwkv-tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

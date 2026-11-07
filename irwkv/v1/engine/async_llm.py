@@ -1076,6 +1076,9 @@ class AsyncLLM(EngineClient):
     async def compute_weight_checksums(self) -> list[dict[str, str]]:
         return await self.engine_core.compute_weight_checksums_async()
 
+    async def rwkv_state(self, operation: str, value: str | bytes | None = None):
+        return await self.engine_core.rwkv_state_async(operation, value)
+
     async def collective_rpc(
         self,
         method: str,

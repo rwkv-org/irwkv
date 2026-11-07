@@ -13,6 +13,7 @@ pub(crate) mod openai;
 mod pause;
 mod profile;
 pub(super) mod render;
+mod rwkv_state;
 mod server_info;
 mod sleep;
 mod tokenize;
@@ -80,6 +81,16 @@ fn build_router_with_options(
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route(
+            "/v1/rwkv/states",
+            get(rwkv_state::list_states)
+                .post(rwkv_state::upload_state)
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/rwkv/states/{id}",
+            get(rwkv_state::download_state).delete(rwkv_state::delete_state),
+        )
         // irwkv specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));

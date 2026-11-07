@@ -1,0 +1,104 @@
+{%- macro assistant_text(message, generation_prompt) -%}
+    {%- set content = message.content or '' -%}
+    {%- if message.reasoning is defined and message.reasoning is not none -%}
+        {{- '<think>' + message.reasoning + '</think>' + content -}}
+    {%- elif generation_prompt == 'open_think' and '</think>' in content -%}
+        {{- ('' if content.startswith('<think>') else '<think>') + content -}}
+    {%- else -%}
+        {{- '<think></think>' + content -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set history = namespace(has_tools=false) -%}
+{%- for message in messages -%}
+    {%- if message.role == 'tool' or message.tool_calls | default([]) -%}
+        {%- set history.has_tools = true -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set prompt_style = rwkv_prompt_template | default('bot') -%}
+{%- set generation_prompt = rwkv_generation_prompt | default('open_think') -%}
+{%- if prompt_style not in ['bot', 'assistant', 'function_calling'] -%}
+    {{- raise_exception('Unsupported RWKV prompt style: ' + prompt_style) -}}
+{%- endif -%}
+{%- if generation_prompt not in ['open_think', 'fake_think'] -%}
+    {{- raise_exception('Unsupported RWKV generation prompt: ' + generation_prompt) -}}
+{%- endif -%}
+{%- set think = '<think></think>' if generation_prompt == 'fake_think' else '<think>' -%}
+{%- set use_tools = tools or history.has_tools or prompt_style == 'function_calling' -%}
+{%- if use_tools -%}
+    {%- set output = namespace(parts=[], system=[]) -%}
+    {%- for message in messages -%}
+        {%- if message.role in ['system', 'developer'] -%}
+            {%- set output.system = output.system + [message.content] -%}
+        {%- else -%}
+            {%- if output.system or (tools and not output.parts) -%}
+                {%- set output.parts = output.parts + ['### System'] + output.system -%}
+                {%- for tool in (tools or []) -%}
+                    {%- set function = tool.function if tool.function is defined else tool -%}
+                    {%- set output.parts = output.parts + ['### `' + function.name + '`'] -%}
+                    {%- if function.description | default('') -%}
+                        {%- set output.parts = output.parts + ['**Description:** ' + function.description] -%}
+                    {%- endif -%}
+                    {%- set output.parts = output.parts + ['**Parameters:**', '```json', function.parameters | tojson(indent=2), '```'] -%}
+                {%- endfor -%}
+                {%- if tools -%}
+                    {%- set output.parts = output.parts + [
+                        'To call one of these tools, write exactly this format:',
+                        '**Tool Call:**',
+                        '```json',
+                        '{"name": "tool_name", "arguments": {"key": "value"}}',
+                        '```',
+                        'Do not invent tool call IDs or write tool outputs yourself.'
+                    ] -%}
+                {%- endif -%}
+                {%- set output.system = [] -%}
+            {%- endif -%}
+            {%- if message.role == 'user' -%}
+                {%- set output.parts = output.parts + ['### User', message.content] -%}
+            {%- elif message.role == 'assistant' -%}
+                {%- set output.parts = output.parts + ['### Assistant', assistant_text(message, generation_prompt)] -%}
+                {%- for tool_call in message.tool_calls | default([]) -%}
+                    {%- set function = tool_call.function if tool_call.function is defined else tool_call -%}
+                    {%- set payload = {'name': function.name, 'arguments': function.arguments} -%}
+                    {%- set output.parts = output.parts + ['**Tool Call:**', '```json', payload | tojson(indent=2), '```'] -%}
+                {%- endfor -%}
+                {%- set output.parts = output.parts[:-1] + [output.parts[-1] + '✿'] -%}
+            {%- elif message.role == 'tool' -%}
+                {%- set output.parts = output.parts + ['### Tool Output', '```json', message.content | tojson(indent=2), '```'] -%}
+            {%- else -%}
+                {{- raise_exception('Unsupported RWKV chat role: ' + message.role) -}}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if output.system -%}
+        {%- set output.parts = output.parts + ['### System'] + output.system -%}
+    {%- endif -%}
+    {%- if add_generation_prompt -%}
+        {%- set output.parts = output.parts + ['### Assistant', think] -%}
+    {%- endif -%}
+    {{- output.parts | join('\n') -}}
+{%- else -%}
+    {%- set output = namespace(parts=[]) -%}
+    {%- for message in messages -%}
+        {%- set content = message.content or '' -%}
+        {%- if message.role == 'assistant' -%}
+            {%- set content = assistant_text(message, generation_prompt) -%}
+        {%- endif -%}
+        {%- if prompt_style == 'bot' -%}
+            {%- set label = {'system': 'System', 'developer': 'System', 'user': 'User', 'assistant': 'Bot'}.get(message.role) -%}
+            {%- if label is none -%}
+                {{- raise_exception('Unsupported RWKV chat role: ' + message.role) -}}
+            {%- endif -%}
+            {%- set output.parts = output.parts + [label + '✿' + content + '✿'] -%}
+        {%- else -%}
+            {%- set label = {'system': 'System', 'developer': 'System', 'user': 'User', 'assistant': 'Assistant'}.get(message.role) -%}
+            {%- if label is none -%}
+                {{- raise_exception('Unsupported RWKV chat role: ' + message.role) -}}
+            {%- endif -%}
+            {%- set output.parts = output.parts + [label + ': ' + content + '✿'] -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if add_generation_prompt -%}
+        {%- set output.parts = output.parts + [('Bot✿' if prompt_style == 'bot' else 'Assistant: ') + think] -%}
+    {%- endif -%}
+    {{- output.parts | join('\n' if prompt_style == 'bot' else '\n\n') -}}
+{%- endif -%}

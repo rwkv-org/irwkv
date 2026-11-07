@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-_IRWKV_RENDERERS = {"hf": ("hf", "HfRenderer")}
+_IRWKV_RENDERERS = {"hf": ("hf", "HfRenderer"), "rwkv": ("hf", "HfRenderer")}
 
 
 @dataclass

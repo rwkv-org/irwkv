@@ -23,7 +23,6 @@ import regex as re
 import torch
 from safetensors.torch import load, load_file, safe_open
 from tqdm.auto import tqdm
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from irwkv import envs
 from irwkv.config.load import (
@@ -35,6 +34,7 @@ from irwkv.logger import init_logger
 from irwkv.platforms import current_platform
 from irwkv.tracing import instrument
 from irwkv.transformers_utils.repo_utils import hf_api, hf_fs
+from irwkv.transformers_utils.rwkv import SAFE_WEIGHTS_INDEX_NAME
 from irwkv.utils.import_utils import PlaceholderModule
 
 try:

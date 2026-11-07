@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-from transformers import AutoTokenizer
 
 from irwkv.tokenizers import TokenizerLike
 
 
 @pytest.fixture(scope="module")
 def default_tokenizer() -> TokenizerLike:
+    from transformers import AutoTokenizer
+
     return AutoTokenizer.from_pretrained("openai-community/gpt2")

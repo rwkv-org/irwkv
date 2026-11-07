@@ -6,7 +6,6 @@ from bisect import bisect_left
 
 import tokenizers.decoders
 from tokenizers import Tokenizer
-from transformers import TokenizersBackend
 
 from irwkv.logger import init_logger
 from irwkv.tokenizers import TokenizerLike
@@ -14,6 +13,7 @@ from irwkv.tokenizers.detokenizer_utils import (
     convert_prompt_ids_to_tokens,
     detokenize_incrementally,
 )
+from irwkv.tokenizers.rwkv import RwkvTokenizer as TokenizersBackend
 from irwkv.utils import length_from_prompt_token_ids_or_embeds
 from irwkv.v1.engine import EngineCoreRequest
 

@@ -28,7 +28,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
-from transformers.models.whisper.tokenization_whisper import LANGUAGES
 from typing_extensions import TypeIs
 
 from irwkv.logger import init_logger
@@ -999,6 +998,8 @@ class SupportsTranscription(Protocol):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        from transformers.models.whisper.tokenization_whisper import LANGUAGES
+
         # language codes in supported_languages
         # that don't exist in the full language map
         invalid = set(cls.supported_languages) - set(LANGUAGES.keys())
@@ -1021,6 +1022,8 @@ class SupportsTranscription(Protocol):
 
     @classmethod
     def get_other_languages(cls) -> Mapping[str, str]:
+        from transformers.models.whisper.tokenization_whisper import LANGUAGES
+
         # other possible language codes from the whisper map
         return {k: v for k, v in LANGUAGES.items() if k not in cls.supported_languages}
 

@@ -9,7 +9,7 @@ use hf_hub::{Cache, Repo, RepoType};
 use thiserror_ext::AsReport as _;
 
 use super::HfOverrides;
-use super::config::{HfTokenizerConfig, load_tokenizer_config};
+use super::config::{HfTokenizerConfig, load_model_config, load_tokenizer_config};
 use crate::error::{Error, Result};
 
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
@@ -17,6 +17,8 @@ const HF_TOKEN_ENV: &str = "HF_TOKEN";
 /// The tokenizer source selected for a model.
 #[derive(Debug, Clone)]
 pub enum TokenizerSource {
+    /// RWKV model config selecting the bundled original byte vocabulary.
+    Rwkv(PathBuf),
     /// Path to `tokenizer.json` in HuggingFace format.
     HuggingFace(PathBuf),
     /// Path to `tiktoken.model` or `*.tiktoken` file for tiktoken-based models.
@@ -33,7 +35,10 @@ pub enum TokenizerSource {
 impl TokenizerSource {
     pub fn path(&self) -> &Path {
         match self {
-            Self::HuggingFace(path) | Self::Tiktoken(path) | Self::Tekken(path) => path,
+            Self::Rwkv(path)
+            | Self::HuggingFace(path)
+            | Self::Tiktoken(path)
+            | Self::Tekken(path) => path,
         }
     }
 }
@@ -275,6 +280,11 @@ async fn resolve_remote_tokenizer_source(
     siblings: &std::collections::BTreeSet<&str>,
     tokenizer_class: Option<&str>,
 ) -> Result<TokenizerSource> {
+    if let Some(config) = download_if_present(repo, model_id, siblings, "config.json").await?
+        && load_model_config(Some(&config))?.model_type() == Some("rwkv")
+    {
+        return Ok(TokenizerSource::Rwkv(config));
+    }
     if let Some(tekken_path) = download_if_present(repo, model_id, siblings, "tekken.json").await? {
         return Ok(TokenizerSource::Tekken(tekken_path));
     }
@@ -301,6 +311,11 @@ fn resolve_cached_tokenizer_source(
     get_file: &impl Fn(&str) -> Option<PathBuf>,
     tokenizer_config: &HfTokenizerConfig,
 ) -> Result<Option<TokenizerSource>> {
+    if let Some(config) = get_file("config.json")
+        && load_model_config(Some(&config))?.model_type() == Some("rwkv")
+    {
+        return Ok(Some(TokenizerSource::Rwkv(config)));
+    }
     let tekken_path = get_file("tekken.json");
 
     if let Some(tekken_path) = tekken_path {
@@ -329,6 +344,11 @@ fn resolve_local_tokenizer_source(
     model_dir: &Path,
     tokenizer_config: &HfTokenizerConfig,
 ) -> Result<TokenizerSource> {
+    if let Some(config) = local_file_if_exists(model_dir, "config.json")
+        && load_model_config(Some(&config))?.model_type() == Some("rwkv")
+    {
+        return Ok(TokenizerSource::Rwkv(config));
+    }
     let tekken_path = local_file_if_exists(model_dir, "tekken.json");
     if let Some(tekken_path) = tekken_path {
         return Ok(TokenizerSource::Tekken(tekken_path));
@@ -511,6 +531,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ResolvedModelFiles, TokenizerSource};
+
+    #[tokio::test]
+    async fn rwkv_uses_original_vocabulary_without_converted_tokenizer() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"rwkv","vocab_size":65536,"eos_token_id":0}"#,
+        )
+        .unwrap();
+        for converted in [None, Some("invalid converted tokenizer")] {
+            if let Some(converted) = converted {
+                fs::write(dir.path().join("tokenizer.json"), converted).unwrap();
+            }
+            let files = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap();
+            assert!(matches!(files.tokenizer, TokenizerSource::Rwkv(_)));
+            let tokenizer = super::super::load_tokenizer(&files.tokenizer).unwrap();
+            assert_eq!(
+                tokenizer.encode("<|endoftext|>", true).unwrap(),
+                vec![61, 125, 25258, 7588, 2318, 125, 63]
+            );
+            assert_eq!(tokenizer.encode("✿", false).unwrap(), vec![10060]);
+        }
+        let get_file = |name: &str| {
+            let path = dir.path().join(name);
+            path.is_file().then_some(path)
+        };
+        let cached = super::resolve_cached_tokenizer_source(&get_file, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(cached, TokenizerSource::Rwkv(_)));
+    }
 
     #[test]
     fn remote_chat_template_selection_stays_with_main_tokenizer() {

@@ -99,8 +99,6 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub new_prompt_logprobs_tensors: Option<MaybeWireLogprobs>,
     #[serde(default)]
-    pub pooling_output: Option<Box<OpaqueValue>>,
-    #[serde(default)]
     pub finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
     pub stop_reason: Option<StopReason>,
@@ -132,10 +130,6 @@ pub struct EngineCoreOutput {
     pub mm_cache_miss_hashes: Option<Vec<String>>,
     #[serde(default)]
     pub new_sampling_mask: Option<MaybeWireSamplingMask>,
-    /// Per-request speculative-decoding acceptance metrics, set on the final
-    /// output when `--per-request-spec-decode-metrics` is enabled.
-    #[serde(default)]
-    pub spec_decode_metrics: Option<Box<RequestSpecDecodeMetrics>>,
     /// Log probabilities of `SamplingParams.prompt_logprob_token_ids`, set on
     /// the first output of a request that asked for them.
     #[serde(default)]
@@ -530,7 +524,6 @@ mod tests {
                             ],
                             new_logprobs: None,
                             new_prompt_logprobs_tensors: None,
-                            pooling_output: None,
                             finish_reason: None,
                             stop_reason: None,
                             events: None,
@@ -541,7 +534,6 @@ mod tests {
                             num_nans_in_logits: 0,
                             mm_cache_miss_hashes: None,
                             new_sampling_mask: None,
-                            spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
                         },
                     ],

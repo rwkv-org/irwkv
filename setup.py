@@ -349,6 +349,7 @@ ext_modules = [
 package_data = {
     "irwkv": [
         "py.typed",
+        "tokenizers/rwkv_vocab_v20230424.txt",
         "libs/*.so*",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",

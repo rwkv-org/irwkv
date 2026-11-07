@@ -33,6 +33,10 @@ def register_irwkv_serve_api_routers(app: FastAPI):
 
     attach_tokenize_router(app)
 
+    from .rwkv_state import router as rwkv_state_router
+
+    app.include_router(rwkv_state_router)
+
 
 def register_irwkv_dev_api_routers(app: FastAPI):
     logger.warning(

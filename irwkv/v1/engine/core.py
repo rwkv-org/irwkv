@@ -686,6 +686,8 @@ class EngineCore:
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
         self.structured_output_manager.clear_backend()
+        if hasattr(self, "_rwkv_state_executor"):
+            self._rwkv_state_executor.shutdown(wait=True)
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
@@ -733,9 +735,19 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return self.scheduler.reset_prefix_cache(
-            reset_running_requests, reset_connector
+        from irwkv.distributed.kv_transfer.kv_connector.v1.rwkv_connector import (
+            RwkvStateConnector,
         )
+
+        reset_rwkv = reset_connector and isinstance(
+            self.scheduler.connector, RwkvStateConnector
+        )
+        success = self.scheduler.reset_prefix_cache(
+            reset_running_requests, reset_connector and not reset_rwkv
+        )
+        if success and reset_rwkv:
+            self.rwkv_state("clear")
+        return success
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -929,7 +941,39 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def rwkv_state(self, operation: str, value: str | bytes | None = None):
+        from irwkv.distributed.kv_transfer.kv_connector.v1.rwkv_connector import (
+            RwkvStateConnector,
+        )
+
+        connector = self.scheduler.connector
+        if not isinstance(connector, RwkvStateConnector):
+            return {"error": "RWKV host state caching is not enabled"}
+        results = self.model_executor.collective_rpc(
+            "rwkv_state", args=(operation, value)
+        )
+        result, index = results[0]
+        connector.update_index(index)
+        if isinstance(result, dict) and "error" in result:
+            return result
+        if operation == "export":
+            from concurrent.futures import ThreadPoolExecutor
+
+            from irwkv.v1.rwkv_state import compress_state
+
+            if not hasattr(self, "_rwkv_state_executor"):
+                self._rwkv_state_executor = ThreadPoolExecutor(max_workers=1)
+            return self._rwkv_state_executor.submit(compress_state, result)
+        return result
+
     def set_weight_version(self, weight_version: str) -> None:
+        if weight_version != getattr(self, "_weight_version", None):
+            from irwkv.distributed.kv_transfer.kv_connector.v1.rwkv_connector import (
+                RwkvStateConnector,
+            )
+
+            if isinstance(self.scheduler.connector, RwkvStateConnector):
+                self.rwkv_state("version", weight_version)
         self._weight_version = weight_version
 
     def get_weight_version(self) -> str:

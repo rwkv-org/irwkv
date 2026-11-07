@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from transformers import PreTrainedConfig
+
+from irwkv.transformers_utils.rwkv import RwkvConfig as PreTrainedConfig
 
 if TYPE_CHECKING:
     from irwkv.model_executor.layers.quantization import QuantizationMethods

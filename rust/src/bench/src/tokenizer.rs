@@ -207,14 +207,20 @@ impl TokenizerKind {
     pub fn get_allowed_tokens(&self) -> Vec<u32> {
         match self {
             TokenizerKind::Local(tok) => {
-                let vs = tok.get_vocab_size(true) as u32;
                 let mut special_ids = HashSet::new();
                 for (id, token) in tok.get_added_tokens_decoder() {
                     if token.special {
                         special_ids.insert(id);
                     }
                 }
-                (0..vs).filter(|id| !special_ids.contains(id)).collect()
+                let mut ids: Vec<_> = tok
+                    .get_vocab(true)
+                    .into_values()
+                    .filter(|id| !special_ids.contains(id))
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
             }
             TokenizerKind::Tiktoken(tok) => tok.get_allowed_tokens(),
             TokenizerKind::Server(srv) => (0..srv.cached_vocab_size).collect(),
@@ -319,6 +325,16 @@ pub async fn load_tokenizer(
 
 /// Try loading tokenizer.json from local path or HuggingFace Hub.
 async fn try_load_local(model_id: &str) -> Result<Tokenizer> {
+    let config = Path::new(model_id).join("config.json");
+    if config.is_file()
+        && irwkv_text::backend::hf::load_model_config(Some(&config))
+            .map_err(|error| BenchError::Tokenizer(error.to_string()))?
+            .model_type()
+            == Some("rwkv")
+    {
+        return irwkv_tokenizer::load_rwkv_tokenizer()
+            .map_err(|error| BenchError::Tokenizer(error.to_string()));
+    }
     // 1. Try local directory with tokenizer.json
     let local_path = Path::new(model_id).join("tokenizer.json");
     if local_path.exists() {
@@ -345,6 +361,15 @@ async fn try_load_local(model_id: &str) -> Result<Tokenizer> {
 
     // 4. Download from HuggingFace Hub (hf-hub handles auth via HF_TOKEN / cached token)
     let repo = crate::hub::HubRepo::model(model_id.to_string()).map_err(BenchError::Tokenizer)?;
+    if let Ok(config) = repo.get("config.json").await
+        && irwkv_text::backend::hf::load_model_config(Some(&config))
+            .map_err(|error| BenchError::Tokenizer(error.to_string()))?
+            .model_type()
+            == Some("rwkv")
+    {
+        return irwkv_tokenizer::load_rwkv_tokenizer()
+            .map_err(|error| BenchError::Tokenizer(error.to_string()));
+    }
     let tokenizer_path = repo
         .get("tokenizer.json")
         .await
@@ -357,6 +382,26 @@ async fn try_load_local(model_id: &str) -> Result<Tokenizer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rwkv_benchmark_uses_only_original_vocabulary_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"rwkv"}"#).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            "invalid converted tokenizer",
+        )
+        .unwrap();
+        let tok = TokenizerKind::Local(Box::new(
+            try_load_local(dir.path().to_str().unwrap()).await.unwrap(),
+        ));
+        assert_eq!(
+            tok.encode("<|endoftext|>", true).unwrap(),
+            vec![61, 125, 25258, 7588, 2318, 125, 63]
+        );
+        assert_eq!(tok.num_special_tokens_to_add(), 0);
+        assert_eq!(tok.get_allowed_tokens(), (1..=65529).collect::<Vec<_>>());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_server_tokenizer_sync_bridge() {

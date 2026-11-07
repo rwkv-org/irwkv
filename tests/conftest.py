@@ -33,14 +33,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from irwkv.transformers_utils.repo_utils import hf_api
 from PIL import Image
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BatchEncoding,
-    BatchFeature,
-)
-from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from irwkv.tokenizers.rwkv import BatchEncoding
+
+BatchFeature = Any
+
 
 from tests.models.utils import (
     TokensTextLogprobs,
@@ -382,7 +378,7 @@ class HfRunner:
         is_sentence_transformer: bool = False,
         is_cross_encoder: bool = False,
         skip_tokenizer_init: bool = False,
-        auto_cls: type[_BaseAutoModelClass] = AutoModelForCausalLM,
+        auto_cls: type = None,
         tokenizer_name: str | None = None,
         processor: Any | None = None,
         # Set this to avoid hanging issue
@@ -420,10 +416,13 @@ class HfRunner:
         is_sentence_transformer: bool = False,
         is_cross_encoder: bool = False,
         skip_tokenizer_init: bool = False,
-        auto_cls: type[_BaseAutoModelClass] = AutoModelForCausalLM,
+        auto_cls: type = None,
         tokenizer_name: str | None = None,
         processor: Any | None = None,
     ) -> None:
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+        auto_cls = auto_cls or AutoModelForCausalLM
         model_name = maybe_model_redirect(model_name)
         self.model_name = model_name
 
@@ -573,6 +572,8 @@ class HfRunner:
         audios: PromptAudioInput | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
     ) -> list[BatchFeature | BatchEncoding | dict[str, torch.Tensor]]:
+        from transformers import BatchFeature
+
         if images is not None:
             assert len(prompts) == len(images)
 

@@ -5,7 +5,6 @@ from collections.abc import Generator
 
 import torch
 from torch import nn
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from irwkv.config import ModelConfig
 from irwkv.config.load import LoadConfig
@@ -17,6 +16,7 @@ from irwkv.model_executor.model_loader.weight_utils import (
 )
 from irwkv.transformers_utils.repo_utils import resolve_revision
 from irwkv.transformers_utils.runai_utils import is_runai_obj_uri, list_safetensors
+from irwkv.transformers_utils.rwkv import SAFE_WEIGHTS_INDEX_NAME
 
 
 class RunaiModelStreamerLoader(BaseModelLoader):

@@ -47,6 +47,11 @@ from irwkv.multimodal.processing.processor import (
     find_mm_placeholders,
 )
 from irwkv.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
+from irwkv.tokenizers.rwkv import (
+    AssistantTracker,
+    RwkvTokenizer,
+    _compile_chat_template,
+)
 from irwkv.transformers_utils.chat_templates import get_chat_template_fallback_path
 from irwkv.transformers_utils.processor import cached_get_processor
 from irwkv.utils.async_utils import make_async
@@ -225,6 +230,8 @@ def _try_get_processor_chat_template(
     code_revision: str | None,
     trust_remote_code: bool,
 ) -> str | None:
+    if isinstance(tokenizer, RwkvTokenizer):
+        return None
     cache_key = (
         tokenizer.name_or_path,
         revision,
@@ -477,10 +484,8 @@ def _iter_nodes_assign_content_item(root: jinja2.nodes.Node):
 
 
 def _try_extract_ast(chat_template: str) -> jinja2.nodes.Template | None:
-    import transformers.utils.chat_template_utils as hf_chat_utils
-
     try:
-        jinja_compiled = hf_chat_utils._compile_jinja_template(chat_template)
+        jinja_compiled = _compile_chat_template(chat_template)
         return jinja_compiled.environment.parse(chat_template)
     except Exception:
         logger.exception("Error when compiling Jinja template")
@@ -661,24 +666,11 @@ def resolve_chat_template_content_format(
     return detected_format if given_format == "auto" else given_format
 
 
-# adapted from https://github.com/huggingface/transformers/blob/v4.56.2/src/transformers/utils/chat_template_utils.py#L398-L412
-# only preserve the parse function used to resolve chat template kwargs
-class AssistantTracker(jinja2.ext.Extension):
-    tags = {"generation"}
-
-    def parse(self, parser: jinja2.parser.Parser) -> jinja2.nodes.Node:
-        lineno = next(parser.stream).lineno
-        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
-        call = self.call_method("_generation_support")
-        call_block = jinja2.nodes.CallBlock(call, [], [], body)
-        return call_block.set_lineno(lineno)
-
-
 def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
     env = jinja2.sandbox.ImmutableSandboxedEnvironment(
         trim_blocks=True,
         lstrip_blocks=True,
-        extensions=[AssistantTracker, jinja2.ext.loopcontrols],
+        extensions=[AssistantTracker, jinja2.ext.loopcontrols, jinja2.ext.do],
     )
     parsed_content = env.parse(chat_template)
     template_vars = jinja2.meta.find_undeclared_variables(parsed_content)
@@ -690,15 +682,7 @@ _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
 
 @lru_cache
 def _get_hf_base_chat_template_params() -> frozenset[str]:
-    from transformers import PythonBackend
-
-    # Get standard parameters from HuggingFace's base tokenizer class.
-    # This dynamically extracts parameters from PythonBackend's
-    # apply_chat_template method, ensuring compatibility with tokenizers
-    # that use **kwargs to receive standard parameters.
-
-    # Read signature from HF's base class - the single source of truth
-    base_sig = inspect.signature(PythonBackend.apply_chat_template)
+    base_sig = inspect.signature(RwkvTokenizer.apply_chat_template)
 
     # Exclude VAR_KEYWORD (**kwargs) and VAR_POSITIONAL (*args) placeholders
     return frozenset(

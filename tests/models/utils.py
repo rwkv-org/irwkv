@@ -8,12 +8,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import PreTrainedConfig
 
 from irwkv.config.model import AttnTypeStr, ModelConfig, ModelDType, RunnerOption
 from irwkv.logprobs import Logprob, PromptLogprobs, SampleLogprobs
 from irwkv.multimodal.processing import InputProcessingContext
 from irwkv.tokenizers import cached_tokenizer_from_config
+from irwkv.transformers_utils.rwkv import RwkvConfig as PreTrainedConfig
 
 from .. import ci_envs
 from .registry import HF_EXAMPLE_MODELS

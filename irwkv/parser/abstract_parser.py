@@ -9,17 +9,6 @@ from dataclasses import dataclass, field, replace
 
 from openai.types.responses import ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
-from xgrammar import Grammar, StructuralTag
-from xgrammar.structural_tag import (
-    ConstStringFormat,
-    Format,
-    GrammarFormat,
-    JSONSchemaFormat,
-    OrFormat,
-    RegexFormat,
-    TagFormat,
-    TriggeredTagsFormat,
-)
 
 from irwkv.entrypoints.chat_utils import (
     get_tool_call_id_type,
@@ -52,6 +41,17 @@ from irwkv.tool_parsers.abstract_tool_parser import Tool, ToolParser
 from irwkv.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
+)
+from irwkv.tool_parsers.structural_tag import (
+    ConstStringFormat,
+    Format,
+    GrammarFormat,
+    JSONSchemaFormat,
+    OrFormat,
+    RegexFormat,
+    StructuralTag,
+    TagFormat,
+    TriggeredTagsFormat,
 )
 from irwkv.tool_parsers.structural_tag_registry import (
     get_structural_tag_tools,
@@ -288,16 +288,8 @@ def structured_outputs_to_format(params: StructuredOutputsParams) -> Format | No
             elements=[ConstStringFormat(value=choice) for choice in params.choice]
         )
     if params.grammar is not None:
-        from irwkv.v1.structured_output.utils import grammar_is_likely_lark
-
         grammar = params.grammar
         # IMPORTANT(arpera):
-        # GrammarFormat only accepts EBNF.
-        if grammar_is_likely_lark(grammar):
-            try:
-                grammar = str(Grammar.from_lark(grammar))
-            except Exception as e:
-                raise IRWKVValidationError("Invalid grammar specification.") from e
         return GrammarFormat(grammar=grammar)
     if params.structural_tag is not None:
         check_json_nesting(params.structural_tag, structural_tag=True)
@@ -320,13 +312,12 @@ def structured_outputs_to_format(params: StructuredOutputsParams) -> Format | No
     return None
 
 
-def _xgrammar_supports(structured_outputs: StructuredOutputsParams) -> bool:
-    """Whether the constraint passes xgrammar validation on its own."""
-    from irwkv.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+def _guidance_supports(structured_outputs: StructuredOutputsParams) -> bool:
+    """Whether the constraint passes guidance validation on its own."""
+    from irwkv.v1.structured_output.backend_guidance import validate_guidance_grammar
 
     try:
-        # validate_xgrammar_grammar rewrites `choice` into `grammar` in place.
-        validate_xgrammar_grammar(
+        validate_guidance_grammar(
             SamplingParams(structured_outputs=replace(structured_outputs))
         )
     except (TypeError, ValueError, IRWKVValidationError):
@@ -538,10 +529,10 @@ class DelegatingParser(Parser):
 
         output_format = None
         if resolved_tools and is_auto and structured_outputs:
-            if not _xgrammar_supports(structured_outputs):
+            if not _guidance_supports(structured_outputs):
                 logger.warning_once(
                     "Tool calls are not constrained for tool_choice=auto with "
-                    "structured outputs because xgrammar does not support the "
+                    "structured outputs because guidance does not support the "
                     "structured output constraint; the structured output "
                     "constraint applies.",
                     scope="local",

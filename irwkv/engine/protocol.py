@@ -248,6 +248,10 @@ class EngineClient(ABC):
         """Return rank-qualified weight digests from every worker of every engine."""
         raise NotImplementedError
 
+    async def rwkv_state(self, operation: str, value: str | bytes | None = None):
+        """List, import, export, or delete a RWKV prefix snapshot."""
+        raise NotImplementedError
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks."""
         raise NotImplementedError

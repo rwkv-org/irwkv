@@ -16,22 +16,17 @@ from cachetools import LRUCache
 
 import irwkv.envs as envs
 from irwkv.logger import init_logger
+from irwkv.transformers_utils.rwkv import bytes_to_unicode
 from irwkv.utils.import_utils import LazyLoader
 
 if TYPE_CHECKING:
     import outlines_core as oc
-    import transformers.convert_slow_tokenizer as convert_slow_tokenizer
-    import transformers.file_utils as file_utils
     import xgrammar as xgr
 
     from irwkv.tokenizers import TokenizerLike
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     oc = LazyLoader("oc", globals(), "outlines_core")
-    file_utils = LazyLoader("file_utils", globals(), "transformers.file_utils")
-    convert_slow_tokenizer = LazyLoader(
-        "convert_slow_tokenizer", globals(), "transformers.convert_slow_tokenizer"
-    )
 
 
 logger = init_logger(__name__)
@@ -217,19 +212,13 @@ def _reduced_vocabulary(tokenizer: TokenizerLike) -> dict[bytes, list[int]]:
     """
     eos_token_id = tokenizer.eos_token_id
 
-    unicode_to_bytes = {
-        v: k for k, v in convert_slow_tokenizer.bytes_to_unicode().items()
-    }
+    unicode_to_bytes = {v: k for k, v in bytes_to_unicode().items()}
 
     def convert_token_to_string(token: str) -> str:
         string = tokenizer.convert_tokens_to_string([token])
 
         # A hack to handle missing spaces to HF's Llama tokenizers
-        if (
-            type(token) is str
-            and token.startswith(file_utils.SPIECE_UNDERLINE)
-            or token == "<0x20>"
-        ):
+        if type(token) is str and token.startswith("▁") or token == "<0x20>":
             return " " + string
 
         return string

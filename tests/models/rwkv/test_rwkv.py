@@ -294,6 +294,45 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
         for_capture=False,
     )
     assert eager.validated_metadata is prepared_ticket
+    for length in range(4, 20):
+        query_start_loc = torch.tensor([0, length], dtype=torch.int32)
+        builder._build_live(
+            SimpleNamespace(
+                num_reqs=1,
+                num_actual_tokens=length,
+                max_query_len=length,
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc,
+            ),
+            torch.tensor([4], dtype=torch.int32),
+            for_capture=False,
+        )
+    assert set(builder._live_buffers) == builder._captured_descriptors | {(1, 19, 19)}
+    assert first.cu_seqlens is builder._live_buffers[(2, 4, 4)][0]
+
+
+@pytest.mark.parametrize(
+    "mode,override,expected", [("none", None, 5), ("align", None, 20), ("none", 12, 12)]
+)
+def test_state_pool_does_not_allocate_unusable_slots(mode, override, expected):
+    from irwkv.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from irwkv.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheLayout
+
+    config = _state_irwkv_config()
+    config.model_config.hf_config.model_type = "rwkv"
+    config.cache_config.mamba_cache_mode = mode
+    config.cache_config.num_gpu_blocks_override = override
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.cache_config.get_resolved_kv_cache_layout = lambda: KVCacheLayout.LBNHC
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    result = get_kv_cache_config_from_groups(
+        config,
+        [KVCacheGroupSpec([layer.prefix], spec)],
+        20 * spec.page_size_bytes,
+    )
+    assert result.num_blocks == expected
+    assert result.kv_cache_tensors[0].size == expected * spec.page_size_bytes
 
 
 def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> None:
@@ -555,6 +594,7 @@ def _config() -> SimpleNamespace:
         ),
         quant_config=None,
         kv_transfer_config=None,
+        structured_outputs_config=SimpleNamespace(backend="auto"),
         mamba_config=SimpleNamespace(enable_stochastic_rounding=False),
         compilation_config=SimpleNamespace(
             mode=None,
@@ -645,6 +685,22 @@ def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> N
     assert result.dtype == torch.float32
     assert torch.equal(result, logits[:, :2])
     assert result[0, 1] > result[0, 0]
+
+
+def test_head_excludes_ids_missing_from_original_vocabulary(monkeypatch) -> None:
+    module: Any = _fake_flashrwkv2()
+    logits = torch.zeros(1, 65536)
+    module.infer_head_linear_all_forward_varlen = lambda *args, **kwargs: logits
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=65536),
+        lm_head=SimpleNamespace(weight=torch.empty(65536, 1)),
+        logits_processor=lambda head, values: values,
+    )
+    result = RwkvForCausalLM.compute_logits(model, torch.zeros(1, 1))
+    assert torch.isneginf(result[0, 0])
+    assert torch.isneginf(result[0, 65530:]).all()
+    assert torch.equal(result[0, 1:65530], torch.zeros(65529))
 
 
 @pytest.mark.parametrize("capturing", [False, True])
@@ -1460,6 +1516,20 @@ def test_reasoning_end_handles_markers_split_across_tokens():
     assert not parser.is_reasoning_end(tokens + [1, 2])
 
 
+def test_reasoning_preserves_whitespace_needed_to_replay_history():
+    from irwkv.reasoning import ReasoningParserManager
+    from tests.parser.engine.conftest import make_mock_tokenizer
+
+    tokenizer = make_mock_tokenizer(
+        {"<": 1, "think": 2, ">": 3, "</": 4}, special_tokens=[]
+    )
+    parser = ReasoningParserManager.get_reasoning_parser("rwkv")(tokenizer)
+    assert parser.extract_reasoning("thought \n\n</think> answer \n", MagicMock()) == (
+        "thought \n\n",
+        " answer \n",
+    )
+
+
 def test_structured_output_waits_for_split_reasoning_end():
     from irwkv.reasoning import ReasoningParserManager
     from irwkv.v1.structured_output import ConstraintBounds, StructuredOutputManager
@@ -1568,7 +1638,9 @@ def test_structured_output_keeps_content_merged_with_reasoning_end():
     )
     tokenizer.encode.side_effect = lambda text, **kwargs: [9] if text == "{" else []
     parser = ReasoningParserManager.get_reasoning_parser("rwkv")(tokenizer)
-    grammar = MagicMock()
+    from irwkv.v1.structured_output.backend_types import StructuredOutputGrammar
+
+    grammar = MagicMock(spec=StructuredOutputGrammar)
     grammar.accept_tokens.return_value = True
     grammar.validate_tokens.side_effect = lambda tokens: tokens
     grammar.is_terminated.return_value = False

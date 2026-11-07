@@ -26,10 +26,10 @@ from functools import lru_cache, partial
 from typing import TYPE_CHECKING
 
 import torch
-from transformers import PreTrainedTokenizerBase
 
 from irwkv.exceptions import IRWKVValidationError
 from irwkv.sampling_params import SamplingParams
+from irwkv.tokenizers.protocol import TokenizerLike as PreTrainedTokenizerBase
 from irwkv.utils.import_utils import LazyLoader
 from irwkv.utils.torch_utils import PIN_MEMORY
 from irwkv.v1.structured_output.backend_types import (

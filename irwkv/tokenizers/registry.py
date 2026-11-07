@@ -23,7 +23,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-_IRWKV_TOKENIZERS = {"hf": ("hf", "CachedHfTokenizer")}
+_IRWKV_TOKENIZERS = {
+    "rwkv": ("rwkv", "RwkvTokenizer"),
+    "hf": ("hf", "CachedHfTokenizer"),
+}
 
 
 @dataclass
@@ -106,9 +109,8 @@ def resolve_tokenizer_args(
         else:
             assert_never(runner_type)
 
-    # Fallback to HF tokenizer
     if tokenizer_mode == "auto":
-        tokenizer_mode = "hf"
+        tokenizer_mode = "rwkv"
 
     return tokenizer_mode, tokenizer_name, args, kwargs
 

@@ -1009,6 +1009,21 @@ class Worker(WorkerBase):
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
 
+    def rwkv_state(self, operation: str, value: str | bytes | None = None):
+        from irwkv.distributed.kv_transfer import get_kv_transfer_group
+        from irwkv.distributed.kv_transfer.kv_connector.v1.rwkv_connector import (
+            RwkvStateConnector,
+        )
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, RwkvStateConnector):
+            raise ValueError("RWKV host state caching is not enabled")
+        try:
+            result = connector.state_operation(operation, value)
+        except (ValueError, KeyError) as error:
+            result = {"error": str(error)}
+        return result, connector.build_connector_worker_meta()
+
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 

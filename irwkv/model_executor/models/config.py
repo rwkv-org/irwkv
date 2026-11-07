@@ -124,6 +124,8 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
         model_config = irwkv_config.model_config
         parallel_config = irwkv_config.parallel_config
         cache_config = irwkv_config.cache_config
+        if irwkv_config.structured_outputs_config.backend == "auto":
+            irwkv_config.structured_outputs_config.backend = "guidance"
 
         if model_config.dtype != torch.bfloat16:
             raise ValueError("RWKV inference requires --dtype bfloat16")
@@ -150,7 +152,22 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             irwkv_config.kv_transfer_config is not None
             and irwkv_config.kv_transfer_config.is_kv_transfer_instance
         ):
-            raise ValueError("RWKV does not support KV cache connectors")
+            transfer = irwkv_config.kv_transfer_config
+            if transfer.kv_connector != "RwkvStateConnector":
+                raise ValueError("RWKV supports only RwkvStateConnector")
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("RWKV host state caching currently requires PP=1")
+            if getattr(parallel_config, "data_parallel_size", 1) != 1:
+                raise ValueError("RWKV host state caching currently requires DP=1")
+            if cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "RwkvStateConnector requires --no-enable-prefix-caching"
+                )
+            if getattr(irwkv_config, "speculative_config", None) is not None:
+                raise ValueError(
+                    "RWKV host state caching does not support speculative decoding"
+                )
+            transfer.kv_load_failure_policy = "recompute"
         if irwkv_config.mamba_config.enable_stochastic_rounding:
             raise ValueError("RWKV does not support stochastic cache rounding")
         if not irwkv_config.scheduler_config.enable_chunked_prefill:
