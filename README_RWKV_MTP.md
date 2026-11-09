@@ -44,7 +44,15 @@ Modified:
 
 ## Requirements
 
-- irwkv at `1f0bd68` plus the patch (or this tree);
+- irwkv with the `mtp` branch (feature commit `a3b3a01`, parent `1f0bd68`) or
+  upstream `1f0bd68` plus `RWKV-PEFT/patches/irwkv_rwkv_mtp.patch`;
+- **FlashRWKV2 (tilerwkv) 0.1.0a18** — irwkv imports `flashrwkv2` for the
+  RWKV-7 kernels:
+  ```bash
+  git clone https://github.com/Joluck/tilerwkv.git
+  cd tilerwkv
+  uv pip install -e .
+  ```
 - pipeline parallel size **1**;
 - chunked prefill enabled (default);
 - an RWKV-7 base with a matching MTP sidecar;
