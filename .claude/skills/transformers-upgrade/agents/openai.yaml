@@ -1,0 +1,4 @@
+interface:
+  display_name: "Transformers Upgrade"
+  short_description: "Update the pinned RWKV Transformers fork."
+  default_prompt: "Use $transformers-upgrade to update and validate the RWKV Transformers revision."
