@@ -25,6 +25,8 @@ from copy import deepcopy
 from typing import Any, NamedTuple, cast
 
 import numpy as np
+import os
+import sys
 import torch
 import torch.nn as nn
 
@@ -359,6 +361,19 @@ class GPUModelRunner:
             if custom:
                 self.irwkv_config._check_supports_watermarking(custom_sampler=True)
                 self.sampler = custom
+            self.rwkv_mtp_spec = None
+            mtp_depth = int(
+                getattr(self.model_config.hf_config, "rwkv_mtp_depth", 0) or 0
+            )
+            if mtp_depth:
+                from irwkv.v1.worker.gpu.rwkv_mtp_spec import RwkvMTPSpeculator
+
+                self.rwkv_mtp_spec = RwkvMTPSpeculator(
+                    self.model, self.irwkv_config, self.device, mtp_depth
+                )
+                logger.info(
+                    "RWKV MTP speculative decoding enabled: depth=%d", mtp_depth
+                )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1065,8 +1080,8 @@ class GPUModelRunner:
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
 
-        # Get prefill tokens if any.
-        if batch_req_state.has_prefill:
+        # Get prefill or speculative-decode tokens, if any.
+        if batch_req_state.has_prefill or np.any(num_scheduled_tokens_np > 1):
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 idx_mapping,
@@ -1200,6 +1215,7 @@ class GPUModelRunner:
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        attn_metadata: Any | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
@@ -1217,6 +1233,13 @@ class GPUModelRunner:
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
+            speculator = getattr(self, "rwkv_mtp_spec", None)
+            if speculator is not None:
+                verify_output = self._mtp_verify(
+                    hidden_states, input_batch, attn_metadata
+                )
+                if verify_output is not None:
+                    return verify_output
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             custom_output = self.model_state.custom_sample(
                 self.model,
@@ -1225,6 +1248,7 @@ class GPUModelRunner:
                 grammar_output,
             )
             if custom_output is not None:
+                self._mtp_stage_drafts(custom_output, sample_hidden_states, input_batch)
                 return (
                     custom_output,
                     custom_output.num_sampled,
@@ -1268,7 +1292,186 @@ class GPUModelRunner:
             )
 
         assert sampler_output is not None
+        self._mtp_stage_drafts(sampler_output, sample_hidden_states, input_batch)
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    @staticmethod
+    def _rwkv_metadata(attn_metadata: Any | None) -> Any | None:
+        metadata = attn_metadata
+        if isinstance(metadata, dict):
+            metadata = next(iter(metadata.values()), None)
+        if metadata is None or not hasattr(metadata, "state_indices"):
+            return None
+        return metadata
+
+    def _mtp_ready(self, input_batch: InputBatch, attn_metadata: Any | None) -> bool:
+        speculator = getattr(self, "rwkv_mtp_spec", None)
+        if speculator is None or input_batch.num_reqs == 0:
+            return False
+        if self.batch_sharder is not None or self.pcp_manager is not None:
+            return False
+        if self._rwkv_metadata(attn_metadata) is None:
+            return False
+        if not hasattr(self, "_spec_pending"):
+            self._spec_pending = None
+        return True
+
+    def _mtp_all_decoding(self, input_batch: InputBatch) -> bool:
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return False
+        computed = input_batch.num_computed_tokens_np[:num_reqs]
+        prefill = input_batch.prefill_len_np[:num_reqs]
+        return bool(np.all(computed >= prefill))
+
+    def _mtp_greedy(self, input_batch: InputBatch) -> bool:
+        idx_mapping_np = input_batch.idx_mapping_np
+        assert self.sampler is not None
+        if self.sampler.get_logprobs_dims(idx_mapping_np) is not None:
+            return False
+        needs_processing = getattr(self.sampler, "needs_logits_processing", None)
+        if needs_processing is not None and np.any(needs_processing[idx_mapping_np]):
+            return False
+        temperature = self.sampler.sampling_states.temperature.np[idx_mapping_np]
+        top_k = self.sampler.sampling_states.top_k.np[idx_mapping_np]
+        return not np.any(temperature > 0.0) and not np.any(
+            (top_k > 1) & (top_k < self.vocab_size)
+        )
+
+    def _mtp_verify(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        attn_metadata: Any | None,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        """Verify a drafted chain inside one scheduled chunk."""
+        if (
+            input_batch.num_reqs != 1
+            or not self._mtp_ready(input_batch, attn_metadata)
+            or not self._mtp_greedy(input_batch)
+            or not self._mtp_all_decoding(input_batch)
+        ):
+            return None
+        speculator = self.rwkv_mtp_spec
+        assert speculator is not None
+        depth = speculator.depth
+        pending = getattr(self, "_spec_pending", None)
+        scheduled = input_batch.num_scheduled_tokens[: input_batch.num_reqs]
+        rows = [
+            row
+            for row in range(input_batch.num_reqs)
+            if int(scheduled[row]) == 1 + depth
+            and pending is not None
+            and input_batch.req_ids[row] in pending
+        ]
+        if not rows or len(rows) != input_batch.num_reqs:
+            return None
+
+        metadata = self._rwkv_metadata(attn_metadata)
+        state_indices = metadata.state_indices[: input_batch.num_reqs]
+        cu = input_batch.query_start_loc_np
+        chunks = []
+        cu_list = []
+        drafts = []
+        accepted: list[int] | None = None
+        lengths = []
+        for row in rows:
+            chunks.append(hidden_states[cu[row] : cu[row + 1]])
+            cu_list.append(0)
+            drafts.append(pending[input_batch.req_ids[row]])
+            lengths.append(int(scheduled[row]))
+        # Pack the chunks into one contiguous block with local cu_seqlens.
+        packed = torch.cat(chunks, dim=0)
+        offset = 0
+        for index, length in enumerate(lengths):
+            cu_list[index] = offset
+            offset += length
+        cu_list.append(offset)
+        accepted, bonus = speculator.verify(packed, cu_list, drafts, state_indices)
+
+
+
+        counts = [accepted[index] + 1 for index in range(len(rows))]
+        num_sampled = torch.tensor(counts, dtype=torch.int32, device=self.device)
+        width = max(max(counts), 1)
+        accepted_ids = torch.zeros(
+            len(rows), width, dtype=torch.int64, device=self.device
+        )
+        for index, row in enumerate(rows):
+            for slot in range(accepted[index]):
+                accepted_ids[index, slot] = drafts[index][slot]
+            accepted_ids[index, accepted[index]] = bonus[index]
+        num_rejected = torch.tensor(
+            [lengths[index] - counts[index] for index in range(len(rows))],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._spec_pending = None
+        sampler_output = SamplerOutput(
+            sampled_token_ids=accepted_ids,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+        return sampler_output, num_sampled, num_rejected
+
+    def _mtp_stage_drafts(
+        self,
+        sampler_output: SamplerOutput,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        """Draft the next chain after a normal one-token step."""
+        speculator = getattr(self, "rwkv_mtp_spec", None)
+        if speculator is None:
+            return
+        self._spec_pending = None
+        sampled = sampler_output.sampled_token_ids
+        if sampled is None or sampled.dim() != 2 or sampled.shape[1] != 1:
+            return
+        if input_batch.num_reqs != 1 or not self._mtp_all_decoding(input_batch):
+            return
+        drafts = speculator.propose(
+            sample_hidden_states, sampled[:, 0], speculator.depth
+        )
+
+        self._spec_pending = {
+            input_batch.req_ids[row]: draft for row, draft in enumerate(drafts)
+        }
+
+    def _pending_spec_map(self) -> dict[str, list[int]] | None:
+        """Draft chains to publish with this step's output."""
+        pending = getattr(self, "_spec_pending", None)
+        if not pending or self.rwkv_mtp_spec is None:
+            return None
+        return {req_id: list(drafts) for req_id, drafts in pending.items()}
+
+    def _mtp_finish_step(
+        self, input_batch: InputBatch, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        """Publish the drafts to the request token buffer and to the scheduler."""
+        pending = getattr(self, "_spec_pending", None)
+
+        if not pending or self.rwkv_mtp_spec is None:
+            return
+        all_ids = self.req_states.all_token_ids.gpu
+        total_len = self.req_states.total_len.gpu
+        spec_map: dict[str, list[int]] = {}
+        for row in range(input_batch.num_reqs):
+            req_id = input_batch.req_ids[row]
+            drafts = pending.get(req_id)
+            if not drafts:
+                continue
+            req_state_idx = int(input_batch.idx_mapping_np[row])
+            start = int(total_len[req_state_idx].item())
+            if start + len(drafts) > all_ids.shape[1]:
+                continue
+            all_ids[req_state_idx, start : start + len(drafts)] = torch.tensor(
+                drafts, dtype=all_ids.dtype, device=all_ids.device
+            )
+            spec_map[req_id] = list(drafts)
+        model_runner_output.spec_token_ids = spec_map
 
     def postprocess_sampled(
         self,
@@ -1543,10 +1746,11 @@ class GPUModelRunner:
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
 
         # Run model.
+        if self.rwkv_mtp_spec is not None:
+            self.rwkv_mtp_spec.prepare_verify_batch(input_batch, attn_metadata)
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
+            # The input tensors are already in the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
@@ -1635,6 +1839,7 @@ class GPUModelRunner:
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        attn_metadata = self.execute_model_state.attn_metadata
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1667,7 +1872,7 @@ class GPUModelRunner:
             )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, attn_metadata=attn_metadata
         )
 
         if self.pp_handler is not None:
@@ -1707,6 +1912,9 @@ class GPUModelRunner:
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             cudagraph_stats=cudagraph_stats,
+            spec_token_ids=self._pending_spec_map(),
+            # @debug
+
         )
 
         # Start the async output copy before updating request states.
@@ -1730,6 +1938,8 @@ class GPUModelRunner:
             num_rejected,
             input_batch.query_start_loc,
         )
+        if self.rwkv_mtp_spec is not None:
+            self._mtp_finish_step(input_batch, model_runner_output)
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

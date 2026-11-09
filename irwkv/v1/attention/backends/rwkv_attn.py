@@ -82,6 +82,16 @@ class RwkvAttentionMetadata:
     num_active_sequences: torch.Tensor | None = None
     validated_metadata: object | None = None
     retain_ticket: bool = False
+    skip_tuning: bool = False
+    # Per-layer recurrent-state checkpoints (MTP speculative decoding).
+    spec_checkpoints: list[torch.Tensor] | None = None
+    # Per-layer chunk inputs, used to restore the token-shift state.
+    spec_layer_inputs: list[torch.Tensor] | None = None
+    # Per-layer feed-forward inputs, used to restore the channel-mix shift.
+    spec_ffn_inputs: list[torch.Tensor] | None = None
+    # Per-layer post-norm chunk inputs for exact token-shift rewind.
+    spec_normalized_tmix: torch.Tensor | None = None
+    spec_normalized_cmix: torch.Tensor | None = None
 
     @property
     def is_live(self) -> bool:

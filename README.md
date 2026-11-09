@@ -24,6 +24,8 @@ the fused operators in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2).
   and Responses, with structured outputs and tool calling.
 - **Deployment options** — single-GPU inference, two-stage pipeline parallelism,
   and an optional Rust frontend.
+- **RWKV-7 MTP speculative decoding** — optional greedy draft+verify head
+  (`IRWKV_RWKV_MTP_DEPTH`); see [README_RWKV_MTP.md](README_RWKV_MTP.md).
 
 ## Quick start
 

@@ -274,13 +274,13 @@ def _prepare_prefill_inputs_kernel(
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
     prefill_len = tl.load(prefill_lens_ptr + req_state_idx)
     num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
-    if num_computed >= prefill_len:
-        # Not prefill.
-        return
 
     query_start = tl.load(query_start_loc_ptr + batch_idx)
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
     query_len = query_end - query_start
+    if num_computed >= prefill_len and query_len == 1:
+        # Plain decode: `prepare_sampled_tokens` fills the single position.
+        return
 
     request_ptr = all_token_ids_ptr + req_state_idx * all_token_ids_stride
     for i in range(0, query_len, BLOCK_SIZE):
@@ -385,7 +385,10 @@ def _prepare_sampled_tokens_kernel(
     tl.store(logits_indices_ptr + batch_idx, query_end - 1)
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     prefill_len = tl.load(prefill_len_ptr + req_state_idx)
-    if seq_len > prefill_len:
+    query_start = tl.load(query_start_loc_ptr + batch_idx)
+    # A multi-token decode chunk takes its tokens from `all_token_ids`; only the
+    # plain one-token decode step needs the last sampled token written here.
+    if seq_len > prefill_len and query_end - query_start == 1:
         last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
         tl.store(input_ids_ptr + query_end - 1, last_token_id)
 

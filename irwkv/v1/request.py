@@ -146,6 +146,11 @@ class Request:
                 for t, is_tok in zip(self.prompt_token_ids, self.prompt_is_token_ids)
             ]
 
+        # Draft tokens proposed for the next speculative verify step.
+        self.spec_token_ids: list[int] = []
+        # This request is scheduled for an MTP verify step.
+        self.spec_verify = False
+
         # Used in async scheduling.
         self.num_output_placeholders = 0
         # Tokens of output in flight when the request was preempted: delivered
@@ -277,7 +282,7 @@ class Request:
 
     @property
     def num_tokens_with_spec(self) -> int:
-        return len(self._all_token_ids)
+        return len(self._all_token_ids) + len(self.spec_token_ids)
 
     @property
     def num_output_tokens(self) -> int:

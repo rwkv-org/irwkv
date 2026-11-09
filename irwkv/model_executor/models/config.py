@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from typing import TYPE_CHECKING
 
 from irwkv.config.model import PROCESSED_LOGPROBS_MODES
@@ -124,6 +125,7 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
         model_config = irwkv_config.model_config
         parallel_config = irwkv_config.parallel_config
         cache_config = irwkv_config.cache_config
+        scheduler_config = irwkv_config.scheduler_config
 
         if model_config.dtype != torch.bfloat16:
             raise ValueError("RWKV inference requires --dtype bfloat16")
@@ -172,6 +174,32 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
             cache_config.mamba_ssm_cache_dtype = "float32"
         elif cache_config.mamba_ssm_cache_dtype not in ("float16", "float32"):
             raise ValueError("RWKV WKV state supports float16 or float32")
+
+        depth = int(os.environ.get("IRWKV_RWKV_MTP_DEPTH", "0") or 0)
+        if depth > 0:
+            from irwkv.model_executor.models.rwkv_mtp import RwkvMTPConfig
+
+            mtp_config = RwkvMTPConfig.from_model_path(model_config.model)
+            if mtp_config is None:
+                raise ValueError(
+                    "IRWKV_RWKV_MTP_DEPTH requires mtp_config.json and "
+                    "mtp.safetensors in the model directory"
+                )
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("RWKV MTP speculative decoding requires PP=1")
+            if not scheduler_config.enable_chunked_prefill:
+                raise ValueError("RWKV MTP requires chunked prefill")
+            if scheduler_config.max_num_seqs != 1:
+                logger.info(
+                    "RWKV MTP decoding applies to single-request steps only; "
+                    "batched steps fall back to plain decoding."
+                )
+            model_config.hf_config.rwkv_mtp_depth = min(depth, mtp_config.mtp_depth)
+            # A speculative step can emit more tokens than one plain decode
+            # step, which the async placeholder accounting cannot express.
+            scheduler_config.async_scheduling = False
+        else:
+            model_config.hf_config.rwkv_mtp_depth = 0
 
         MambaModelConfig.verify_and_update_config(irwkv_config)
 

@@ -193,6 +193,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
 
         config = irwkv_config.model_config.hf_config
         self.prefix = prefix
+        self.config = config
         self.num_local_layers = num_local_layers
         self.hidden_size = config.hidden_size
         self.head_size = config.head_size
@@ -210,6 +211,8 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._wkv_state_pool: torch.Tensor | None = None
         self._wkv_handles: list[_FlashRWKVStateHandle] = []
         self._live_graph_tickets: list[object] = []
+        self._spec_checkpoints: tuple[torch.Tensor, ...] | None = None
+        self._spec_norm_buffers: tuple[torch.Tensor, ...] | None = None
         self.kv_cache = torch.tensor([])
 
         static_context = irwkv_config.compilation_config.static_forward_context
@@ -315,6 +318,44 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
                 )
             self._wkv_handles.append(handle)
         self.kv_cache = kv_cache
+
+    def spec_buffers(
+        self, num_tokens: int, batch: int = 1
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+        """Per-layer rewind buffers for one speculative verify step."""
+        depth = int(getattr(self.config, "rwkv_mtp_depth", 0) or 0)
+        max_reqs = int(getattr(self, "spec_max_reqs", 1) or 1)
+        capacity = max(40, (depth + 2) * max_reqs + max_reqs)
+        if self._spec_checkpoints is None:
+            self._spec_checkpoints = tuple(
+                torch.empty(
+                    (capacity, self.num_heads, self.head_size, self.head_size),
+                    dtype=self.state_dtype,
+                    device=self._wkv_state_pool.device,
+                )
+                for _ in range(self.num_local_layers)
+            )
+            hidden = int(self.hidden_size)
+            device = self._wkv_state_pool.device
+            self._spec_norm_buffers = (
+                torch.empty(
+                    (self.num_local_layers, capacity, hidden),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                torch.empty(
+                    (self.num_local_layers, capacity, hidden),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+            )
+        rows = min(num_tokens + batch, capacity)
+        tmix, cmix = self._spec_norm_buffers
+        return (
+            tuple(buffer[:rows] for buffer in self._spec_checkpoints),
+            tmix[:, :num_tokens],
+            cmix[:, :num_tokens],
+        )
 
     def clear_kv_cache(self) -> None:
         self._wkv_handles.clear()
@@ -564,6 +605,7 @@ class RwkvAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flashrwkv2 = _load_flashrwkv2()
         ticket = metadata.validated_metadata
+        norm_buffers = metadata.spec_normalized_tmix
         residual, xr, xw, xk, xv, xa, xg = (
             flashrwkv2.infer_tmix_postnorm_tokenshift_forward_varlen(
                 hidden_states.contiguous(),
@@ -582,6 +624,9 @@ class RwkvAttention(nn.Module):
                 max_seqlen=metadata.max_seqlen,
                 eps=self.config.layer_norm_epsilon,
                 validated_metadata=ticket,
+                save_normalized=(
+                    None if norm_buffers is None else norm_buffers[self.layer_idx]
+                ),
             )
         )
         if self.layer_idx == 0:
@@ -638,6 +683,16 @@ class RwkvAttention(nn.Module):
             if state_dtype == torch.float16
             else flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
         )
+        checkpoint_kwargs = {}
+        checkpoint_buffers = metadata.spec_checkpoints
+        if checkpoint_buffers is not None:
+            state_shape = int(receptance.shape[0]) + int(metadata.batch_size)
+            checkpoint_kwargs = {
+                "save": True,
+                "boundaries": checkpoint_buffers[self.layer_idx][:state_shape],
+                "checkpoint_interval": 1,
+            }
+
         wkv_output = recurrent(
             receptance.view(-1, self.num_heads, self.head_size),
             decay.view(-1, self.num_heads, self.head_size),
@@ -651,7 +706,10 @@ class RwkvAttention(nn.Module):
             decay_bias=self.w0,
             max_seqlen=metadata.max_seqlen,
             validated_metadata=ticket,
+            **checkpoint_kwargs,
         )
+        if checkpoint_kwargs:
+            wkv_output = wkv_output[0]
         output = flashrwkv2.infer_tmix_readout_forward_varlen(
             wkv_output.view(-1, self.hidden_size),
             receptance,
@@ -704,7 +762,9 @@ class RwkvFeedForward(nn.Module):
         metadata: RwkvAttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flashrwkv2 = _load_flashrwkv2()
-        return flashrwkv2.infer_cmix_forward_varlen(
+
+        ffn_norm = metadata.spec_normalized_cmix
+        output = flashrwkv2.infer_cmix_forward_varlen(
             hidden_states.contiguous(),
             residual.contiguous(),
             layer_norm.weight,
@@ -721,15 +781,21 @@ class RwkvFeedForward(nn.Module):
             deterministic=torch.are_deterministic_algorithms_enabled(),
             **_lora_kwargs(self.key, "key_"),
             **_lora_kwargs(self.value, "value_"),
+            save_normalized=(
+                None if ffn_norm is None else ffn_norm[self.layer_idx]
+            ),
         )
-
+        return output
 
 class RwkvDecoderLayer(nn.Module):
     def __init__(self, config: Any, prefix: str) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
+        self.layer_idx = layer_idx
         self.linear_attn = RwkvAttention(config, layer_idx, f"{prefix}.linear_attn")
         self.mlp = RwkvFeedForward(config, f"{prefix}.mlp")
+        self.mlp.layer_idx = layer_idx
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
@@ -770,6 +836,9 @@ class RwkvDecoderLayer(nn.Module):
             metadata,
             state_dtype,
         )
+        ffn_inputs = metadata.spec_ffn_inputs
+        if ffn_inputs is not None:
+            ffn_inputs[self.layer_idx] = residual
         hidden_states, residual = self.mlp(
             residual,
             attention_output,
@@ -840,6 +909,9 @@ class RwkvModel(nn.Module):
         if get_pp_group().is_first_rank and self._fold_embedding_norm:
             flashrwkv2 = _load_flashrwkv2()
             embedding = self.embed_tokens.weight
+            if getattr(self.config, "rwkv_mtp_depth", 0):
+                # The drafter consumes raw token embeddings, matching training.
+                self._mtp_embedding_weight = embedding.detach().clone()
             folded = torch.empty_like(embedding, dtype=torch.bfloat16)
             for start in range(0, embedding.shape[0], 4096):
                 end = min(start + 4096, embedding.shape[0])
@@ -964,9 +1036,16 @@ class RwkvForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self._prepared_tuning_shapes: set[tuple[int, int, int, int]] = set()
+        self.mtp_head = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def embed_for_mtp(self, input_ids: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.model, "_mtp_embedding_weight", None)
+        if weight is None:
+            return self.model.embed_input_ids(input_ids)
+        return torch.nn.functional.embedding(input_ids, weight)
 
     def get_rwkv_state_layer(self) -> RwkvStateLayer:
         return self.model.rwkv_state
@@ -1004,7 +1083,10 @@ class RwkvForCausalLM(
                 metadata.batch_size,
                 metadata.max_seqlen,
             )
-            if metadata.retain_ticket or shape not in self._prepared_tuning_shapes:
+            if metadata.retain_ticket or (
+                not metadata.skip_tuning
+                and shape not in self._prepared_tuning_shapes
+            ):
                 state = self.get_rwkv_state_layer()
                 batch = metadata.sequence_capacity
                 tokens = metadata.token_capacity
@@ -1086,7 +1168,31 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        self._load_mtp_head()
+        return loaded
+
+    def _load_mtp_head(self) -> None:
+        depth = getattr(self.config, "rwkv_mtp_depth", 0)
+        if not depth:
+            return
+        from irwkv.model_executor.models.rwkv_mtp import RwkvMTPHead
+
+        model_path = self.irwkv_config.model_config.model
+        head = RwkvMTPHead.from_model_path(model_path)
+        if head is None:
+            raise ValueError(
+                f"rwkv_mtp_depth={depth} requires {model_path}/mtp_config.json"
+            )
+        if depth > head.depth:
+            raise ValueError(
+                f"rwkv_mtp_depth={depth} exceeds the MTP head depth {head.depth}"
+            )
+        device = torch.cuda.current_device()
+        head = head.to(device=device, dtype=torch.bfloat16).eval()
+        # Keep the drafter out of the module tree: its weights live in the
+        # sidecar artifact, not in the base checkpoint.
+        object.__setattr__(self, "mtp_head", head)
 
     def process_weights_after_loading(self) -> None:
         self.model.process_weights_after_loading()

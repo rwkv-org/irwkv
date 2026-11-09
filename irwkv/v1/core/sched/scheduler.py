@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -136,6 +138,9 @@ class Scheduler(SchedulerInterface):
             and self.kv_events_config.enable_kv_cache_events
         )
         self.num_sampled_tokens_per_step = 1
+        self.rwkv_mtp_depth = int(
+            getattr(irwkv_config.model_config.hf_config, "rwkv_mtp_depth", 0) or 0
+        )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -581,6 +586,26 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if self.rwkv_mtp_depth and request.spec_token_ids:
+                skip_spec = False
+                if request.max_tokens is not None:
+                    remaining = (
+                        request.num_prompt_tokens
+                        + request.max_tokens
+                        - request.num_tokens
+                    )
+                    # A verify step consumes the sampled token plus every draft
+                    # and still needs room for the commit step's token.
+                    skip_spec = remaining < 1 + len(request.spec_token_ids)
+                if skip_spec:
+                    request.spec_token_ids = []
+                else:
+                    # Verify the drafted chain in one chunk: the sampled token
+                    # plus every draft is a single scheduled step.
+                    request.spec_verify = True
+                    num_new_tokens = 1 + len(request.spec_token_ids)
+
+
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget, input_budget - 0)
@@ -1766,6 +1791,24 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            prev_verify = bool(request.spec_verify)
+            if self.rwkv_mtp_depth and request.spec_verify:
+                # The worker rewound the recurrent state to the accepted prefix
+                # using per-token checkpoints, so only the rejected drafts are
+                # given back; the accepted tokens stay computed.
+                request.num_computed_tokens -= num_tokens_scheduled - len(
+                    generated_token_ids
+                )
+                request.spec_verify = False
+                request.spec_token_ids = []
+            new_spec = (
+                model_runner_output.spec_token_ids.get(req_id)
+                if model_runner_output.spec_token_ids
+                else None
+            )
+
+            if new_spec:
+                request.spec_token_ids = list(new_spec)
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:

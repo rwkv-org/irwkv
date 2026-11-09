@@ -3,6 +3,7 @@
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
 from collections.abc import Sequence
+import os
 from typing import Any, cast
 
 import numpy as np
@@ -387,6 +388,7 @@ class RwkvModelState(DefaultModelState):
     ) -> None:
         super().__init__(irwkv_config, model, encoder_cache, device)
         self._state_layer = model.get_rwkv_state_layer()
+        self._state_layer.spec_max_reqs = self.max_num_reqs
         self._align_mode = irwkv_config.cache_config.mamba_cache_mode == "align"
         block_size = irwkv_config.cache_config.mamba_block_size
         assert block_size is not None
@@ -400,6 +402,55 @@ class RwkvModelState(DefaultModelState):
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
         )
+
+    def prepare_attn(
+        self,
+        input_batch: Any,
+        cudagraph_mode: Any,
+        block_tables: Any,
+        slot_mappings: Any,
+        attn_groups: Any,
+        kv_cache_config: Any,
+        for_capture: bool = False,
+        ubatch_idx: int = 0,
+        model_specific_attn_metadata: Any = None,
+    ) -> dict[str, Any]:
+        metadata = super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+            ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=model_specific_attn_metadata,
+        )
+        if getattr(self._model, "mtp_head", None) is not None:
+            num_tokens = int(input_batch.num_tokens)
+            num_reqs = int(input_batch.num_reqs)
+            depth = int(getattr(self._model.config, "rwkv_mtp_depth", 0) or 0)
+            limit = (depth + 2) * self.max_num_reqs + self.max_num_reqs
+            if for_capture:
+                # Verify chunks are padded to the next CUDA-graph size; the
+                # graph bakes in the save/checkpoint ops, so the rewind
+                # buffers must be attached while those graphs are captured.
+                limit = max(limit, 32)
+            if (
+                os.environ.get("IRWKV_RWKV_MTP_NOSAVE") != "1"
+                and num_reqs == 1
+                and num_tokens <= limit
+            ):
+                checkpoints, tmix_norm, cmix_norm = self._state_layer.spec_buffers(
+                    num_tokens, num_reqs
+                )
+                entries = metadata.values() if isinstance(metadata, dict) else (metadata,)
+                for entry in entries:
+                    if entry is not None and hasattr(entry, "spec_checkpoints"):
+                        entry.spec_checkpoints = list(checkpoints)
+                        entry.spec_normalized_tmix = tmix_norm
+                        entry.spec_normalized_cmix = cmix_norm
+        return metadata
 
     def custom_sampler(self, sampler: Any) -> Any:
         self._sampler = RwkvSampler(

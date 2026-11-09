@@ -298,6 +298,9 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # req_id -> speculative draft tokens proposed by the worker this step.
+    spec_token_ids: dict[str, list[int]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,
