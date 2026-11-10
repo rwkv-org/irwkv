@@ -272,12 +272,12 @@ class OpenAIServingChat(GenerateBaseServing):
         The next turn renders this reply right after the assistant header, such
         as ``Bot✿``, so the state there is what a follow-up can reuse. Rendering
         the conversation with a placeholder reply finds that position without
-        assuming what the generation prompt contains.
+        assuming what the generation prompt contains or how it tokenizes.
 
         Returns:
             The generation prompt after the header, such as ``<think``, and the
-            number of prompt tokens before it; ``None`` if there is no
-            generation prompt or it does not start on a token boundary.
+            number of prompt tokens shared with the placeholder rendering;
+            ``None`` if there is no generation prompt.
 
         """
         if not request.add_generation_prompt or request.continue_final_message:
@@ -314,16 +314,15 @@ class OpenAIServingChat(GenerateBaseServing):
         except Exception:
             logger.debug("Could not render the RWKV reply prefix", exc_info=True)
             return None
-        common_prefix = os.path.commonprefix([prompt_text, cast(str, reply_text)])
-        generation_prompt = prompt_text[len(common_prefix) :]
-        generation_prompt_ids = tokenizer.encode(
-            generation_prompt, add_special_tokens=False
+        reply_text = cast(str, reply_text)
+        generation_prompt = prompt_text[
+            len(os.path.commonprefix([prompt_text, reply_text])) :
+        ]
+        reply_token_ids = tokenizer.encode(reply_text, add_special_tokens=False)
+        num_prefix_tokens = len(
+            os.path.commonprefix([list(prompt_token_ids), reply_token_ids])
         )
-        num_prefix_tokens = len(prompt_token_ids) - len(generation_prompt_ids)
-        if (
-            not generation_prompt_ids
-            or list(prompt_token_ids[num_prefix_tokens:]) != generation_prompt_ids
-        ):
+        if not generation_prompt or num_prefix_tokens >= len(prompt_token_ids):
             return None
         return generation_prompt, num_prefix_tokens
 

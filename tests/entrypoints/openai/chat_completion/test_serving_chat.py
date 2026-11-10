@@ -479,20 +479,21 @@ async def test_chat_full_generator_gives_each_choice_parser_the_prompt():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("fake_cot_mode", "reasoning_parser", "stream", "generation_prompt", "prefix"),
+    ("template_kwargs", "reasoning_parser", "stream", "generation_prompt", "prefix"),
     [
-        (False, "", False, "<think", "<think"),
-        (False, "", True, "<think", "<think"),
-        (True, "", False, "<think></think", "<think></think"),
-        (False, "rwkv", False, "<think", ""),
+        ({"fake_cot_mode": False}, "", False, "<think", "<think"),
+        ({"fake_cot_mode": False}, "", True, "<think", "<think"),
+        ({"fake_cot_mode": True}, "", False, "<think></think", "<think></think"),
+        ({"rwkv_prompt_template": "assistant"}, "", False, "<think", "<think"),
+        ({"fake_cot_mode": False}, "rwkv", False, "<think", ""),
     ],
 )
 async def test_rwkv_chat_caches_state_before_generation_prompt(
-    fake_cot_mode, reasoning_parser, stream, generation_prompt, prefix
+    template_kwargs, reasoning_parser, stream, generation_prompt, prefix
 ):
-    """The next turn renders this reply right after ``Bot✿``, so RWKV chat
-    caches the prompt state there and returns the reply with its generation
-    prompt, which the client can resend unchanged."""
+    """The next turn renders this reply right after the assistant header, so
+    RWKV chat caches the prompt state there and returns the reply with its
+    generation prompt, which the client can resend unchanged."""
     mock_engine = _build_mock_engine()
     mock_engine.model_config.hf_config = MockHFConfig(model_type="rwkv")
     mock_engine.model_config.generation_config = "irwkv"
@@ -501,7 +502,11 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     serving_chat.online_renderer.chat_template = None
     tokenizer = mock_engine.renderer.tokenizer
     reply = "先理解用户的问候。</think>你好！有什么可以帮你？"
-    prompt = "System✿你是一个助手。✿\nUser✿你好✿\nBot✿" + generation_prompt
+    if "rwkv_prompt_template" in template_kwargs:
+        header = "System: 你是一个助手。\n\nUser: 你好\n\nAssistant: "
+    else:
+        header = "System✿你是一个助手。✿\nUser✿你好✿\nBot✿"
+    prompt = header + generation_prompt
     prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
     mock_engine.generate.return_value = _single_request_output(
         RequestOutput(
@@ -530,7 +535,7 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
                 {"role": "system", "content": "你是一个助手。"},
                 {"role": "user", "content": "你好"},
             ],
-            chat_template_kwargs={"fake_cot_mode": fake_cot_mode},
+            chat_template_kwargs=template_kwargs,
             stream=stream,
         )
     )
@@ -538,8 +543,9 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     engine_input, params = mock_engine.generate.call_args.args[:2]
     assert serving_chat._extract_prompt_components(engine_input).text == prompt
     boundary = params.extra_args["prompt_cache_boundary"]
-    assert tokenizer.decode(prompt_token_ids[:boundary]).endswith("\nBot✿")
-    assert tokenizer.decode(prompt_token_ids[boundary:]) == generation_prompt
+    # The space after "Assistant:" tokenizes with the generation prompt.
+    header_ids = tokenizer.encode(header.rstrip(" "), add_special_tokens=False)
+    assert prompt_token_ids[:boundary] == header_ids
     if stream:
         content = ""
         async for chunk in response:
