@@ -1019,17 +1019,21 @@ class RwkvForCausalLM(
                         batch + 1, dtype=torch.int32, device=slots.device
                     )
                     * tokens
-                    // batch,
+                    // batch
+                    if metadata.retain_ticket
+                    else metadata.cu_seqlens,
                     state_indices=slots,
                     num_active_tokens=(
                         torch.full_like(metadata.num_active_tokens, tokens)
-                        if metadata.num_active_tokens is not None
-                        else None
+                        if metadata.retain_ticket
+                        and metadata.num_active_tokens is not None
+                        else metadata.num_active_tokens
                     ),
                     num_active_sequences=(
                         torch.full_like(metadata.num_active_sequences, batch)
-                        if metadata.num_active_sequences is not None
-                        else None
+                        if metadata.retain_ticket
+                        and metadata.num_active_sequences is not None
+                        else metadata.num_active_sequences
                     ),
                     validated_metadata=None,
                     retain_ticket=False,
