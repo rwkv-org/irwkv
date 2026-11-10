@@ -330,12 +330,6 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
         )
-        self.mamba_continuation_tail_tokens = (
-            self.kv_cache_manager.coordinator.continuation_tail_tokens
-            if self.need_mamba_block_aligned_split
-            and self.cache_config.enable_prefix_caching
-            else 0
-        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -391,13 +385,15 @@ class Scheduler(SchedulerInterface):
         ckpt_block_size = (
             self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
         )
-        # Before the first token a follow-up may replace: the last prompt token,
-        # or a replaceable tail such as the chat generation prompt.
-        replay_tokens = request.num_tokens
-        if request.num_tokens == request.num_prompt_tokens:
-            replay_tokens -= max(self.mamba_continuation_tail_tokens - 1, 0)
+        # The prompt is cached at its cache boundary; a resumed request also
+        # replays its output tokens.
+        cache_end = (
+            request.prompt_cache_boundary + 1
+            if request.num_tokens == request.num_prompt_tokens
+            else request.num_tokens
+        )
         last_cache_position = get_mamba_prefill_checkpoint_position(
-            replay_tokens,
+            cache_end,
             block_size,
         )
 
@@ -437,8 +433,7 @@ class Scheduler(SchedulerInterface):
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             get_mamba_prefill_checkpoint_position(
-                request.num_prompt_tokens
-                - max(self.mamba_continuation_tail_tokens - 1, 0),
+                request.prompt_cache_boundary + 1,
                 self.hash_block_size,
             )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
@@ -60,9 +61,11 @@ from irwkv.logprobs import Logprob
 from irwkv.outputs import RequestOutput
 from irwkv.parser import ParserManager
 from irwkv.parser.abstract_parser import Parser
+from irwkv.renderers.hf import safe_apply_chat_template
 from irwkv.renderers.online_renderer import OnlineRenderer
 from irwkv.sampling_params import BeamSearchParams, SamplingParams
 from irwkv.tokenizers import TokenizerLike
+from irwkv.utils.async_utils import make_async
 from irwkv.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
@@ -165,6 +168,12 @@ class OpenAIServingChat(GenerateBaseServing):
             tokenizer=self.renderer.tokenizer,
         )
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
+        self.splits_rwkv_generation_prompt = (
+            self.model_config.hf_config.model_type == "rwkv"
+        )
+        self._apply_chat_template_async: Callable[..., Awaitable[str | list[int]]] = (
+            make_async(safe_apply_chat_template)
+        )
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
@@ -251,6 +260,73 @@ class OpenAIServingChat(GenerateBaseServing):
             "reasoning_parser_kwargs": reasoning_parser_kwargs,
         }
 
+    async def _split_rwkv_generation_prompt(
+        self,
+        request: ChatCompletionRequest,
+        conversation: list[ConversationMessage],
+        chat_template_kwargs: dict[str, Any],
+        engine_input: EngineInput,
+    ) -> tuple[str, int] | None:
+        """Split an RWKV chat prompt where the assistant reply starts.
+
+        The next turn renders this reply right after the assistant header, such
+        as ``Bot✿``, so the state there is what a follow-up can reuse. Rendering
+        the conversation with a placeholder reply finds that position without
+        assuming what the generation prompt contains.
+
+        Returns:
+            The generation prompt after the header, such as ``<think``, and the
+            number of prompt tokens before it; ``None`` if there is no
+            generation prompt or it does not start on a token boundary.
+
+        """
+        if not request.add_generation_prompt or request.continue_final_message:
+            return None
+        components = self._extract_prompt_components(engine_input)
+        prompt_text, prompt_token_ids = components.text, components.token_ids
+        if prompt_text is None or prompt_token_ids is None:
+            return None
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        tools = (
+            None
+            if request.tools is None
+            or (
+                request.tool_choice == "none"
+                and self.exclude_tools_when_tool_choice_none
+            )
+            else [tool.model_dump() for tool in request.tools]
+        )
+        try:
+            reply_text = await self._apply_chat_template_async(
+                self.model_config,
+                cast(Any, tokenizer),
+                [*conversation, {"role": "assistant", "content": "0"}],
+                tokenize=False,
+                **{
+                    **chat_template_kwargs,
+                    "tools": tools,
+                    "chat_template": request.chat_template or self.chat_template,
+                    "add_generation_prompt": False,
+                    "continue_final_message": False,
+                },
+            )
+        except Exception:
+            logger.debug("Could not render the RWKV reply prefix", exc_info=True)
+            return None
+        common_prefix = os.path.commonprefix([prompt_text, cast(str, reply_text)])
+        generation_prompt = prompt_text[len(common_prefix) :]
+        generation_prompt_ids = tokenizer.encode(
+            generation_prompt, add_special_tokens=False
+        )
+        num_prefix_tokens = len(prompt_token_ids) - len(generation_prompt_ids)
+        if (
+            not generation_prompt_ids
+            or list(prompt_token_ids[num_prefix_tokens:]) != generation_prompt_ids
+        ):
+            return None
+        return generation_prompt, num_prefix_tokens
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -327,9 +403,17 @@ class OpenAIServingChat(GenerateBaseServing):
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         mm_token_counts: dict[str, int] | None = None
+        content_prefix = ""
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
             mm_token_counts = _get_mm_token_counts(engine_input)
+            rwkv_generation_prompt = (
+                await self._split_rwkv_generation_prompt(
+                    request, conversation, chat_template_kwargs, engine_input
+                )
+                if self.splits_rwkv_generation_prompt
+                else None
+            )
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
@@ -358,6 +442,18 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     request_sampling_defaults,
                 )
+                if rwkv_generation_prompt is not None:
+                    generation_prompt, num_prefix_tokens = rwkv_generation_prompt
+                    # Cache the state before the generation prompt, which the
+                    # next turn replaces with this reply.
+                    sampling_params.extra_args = {
+                        **(sampling_params.extra_args or {}),
+                        "prompt_cache_boundary": num_prefix_tokens,
+                    }
+                    # Return the reply as the next turn renders it, unless a
+                    # reasoning parser already separates the reasoning.
+                    if parser is None or parser.reasoning_parser is None:
+                        content_prefix = generation_prompt
 
             self._log_inputs(
                 sub_request_id,
@@ -410,6 +506,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_metadata,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
+                content_prefix=content_prefix,
             )
 
         return await self.chat_completion_full_generator(
@@ -422,6 +519,7 @@ class OpenAIServingChat(GenerateBaseServing):
             request_metadata,
             parser=parser,
             mm_token_counts=mm_token_counts,
+            content_prefix=content_prefix,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -468,6 +566,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        content_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -540,7 +639,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             index=i,
                             delta=DeltaMessage(
                                 role=role,
-                                content="",
+                                content=content_prefix,
                             ),
                             logprobs=None,
                             finish_reason=None,
@@ -916,6 +1015,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         parser: Parser | None = None,
         mm_token_counts: dict[str, int] | None = None,
+        content_prefix: str = "",
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1102,6 +1202,11 @@ class OpenAIServingChat(GenerateBaseServing):
             for choice in choices:
                 full_message = last_msg_content + (choice.message.content or "")
                 choice.message.content = full_message
+
+        if content_prefix:
+            for choice in choices:
+                if choice.message.content is not None:
+                    choice.message.content = content_prefix + choice.message.content
 
         assert final_res.prompt_token_ids is not None
         num_prompt_tokens = len(final_res.prompt_token_ids)

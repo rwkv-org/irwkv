@@ -121,15 +121,6 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
-        self.continuation_tail_tokens = max(
-            (
-                group.kv_cache_spec.continuation_tail_tokens
-                for group in kv_cache_config.kv_cache_groups
-                if isinstance(group.kv_cache_spec, MambaSpec)
-                and group.kv_cache_spec.mamba_cache_mode == "align"
-            ),
-            default=0,
-        )
 
     def get_num_blocks_to_allocate(
         self,
@@ -292,12 +283,10 @@ class KVCacheCoordinator(ABC):
 
         A hit is the shortest across all groups, so every group retains state
         at each position. A resend of the identical prompt is capped at
-        ``num_tokens - 1`` because its last token is recomputed for logits.
-        With ``continuation_tail_tokens``, the boundary moves before that tail
-        so a follow-up turn replacing it still hits; a resend recomputes the
-        tail.
+        ``num_tokens - 1`` because its last token is recomputed for logits;
+        a request can move this to an earlier ``prompt_cache_boundary``.
         """
-        return (request.num_prompt_tokens - max(self.continuation_tail_tokens, 1),)
+        return (request.prompt_cache_boundary,)
 
     def get_num_cacheable_tokens(self, num_computed_tokens: int) -> int:
         """Return the prefix eligible for hashing in this group."""

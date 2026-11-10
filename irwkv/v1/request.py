@@ -131,6 +131,14 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        # Prompt position whose state prefix caching keeps: before the last
+        # prompt token, or where a follow-up request is expected to diverge,
+        # such as the chat history before its generation prompt.
+        self.prompt_cache_boundary = self.num_prompt_tokens - 1
+        if sampling_params.extra_args is not None:
+            boundary = sampling_params.extra_args.get("prompt_cache_boundary")
+            if isinstance(boundary, int) and 0 < boundary < self.num_prompt_tokens:
+                self.prompt_cache_boundary = boundary
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens

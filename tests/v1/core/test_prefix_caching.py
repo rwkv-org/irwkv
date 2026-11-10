@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -26,7 +27,6 @@ from irwkv.multimodal.inputs import (
 )
 from irwkv.sampling_params import SamplingParams
 from irwkv.utils.hashing import sha256, sha256_cbor
-from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
 from irwkv.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from irwkv.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
 from irwkv.v1.core.kv_cache_utils import (
@@ -74,6 +74,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     session_id: str | None = None,
+    extra_args: dict[str, Any] | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -87,7 +88,9 @@ def make_request(
             )
             mm_features.append(mm_feature)
 
-    sampling_params = SamplingParams(max_tokens=17, prompt_logprobs=prompt_logprobs)
+    sampling_params = SamplingParams(
+        max_tokens=17, prompt_logprobs=prompt_logprobs, extra_args=extra_args
+    )
     sampling_params.update_from_generation_config({}, eos_token_id=100)
 
     return Request(
@@ -230,27 +233,34 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
 
 @pytest.mark.parametrize(
     (
-        "spec_cls",
         "hash_block_size",
         "num_prompt_tokens",
+        "prompt_cache_boundary",
         "chunks",
         "follow_up_hit",
         "resend_hit",
     ),
     [
-        (MambaSpec, 32, 65, [64, 1], 0, 64),
-        (RwkvStateSpec, 32, 65, [32, 33], 32, 32),
-        (MambaSpec, 8, 81, [64, 16, 1], 64, 80),
-        (RwkvStateSpec, 8, 81, [64, 8, 9], 72, 72),
+        (32, 65, None, [64, 1], 0, 64),
+        (32, 65, 63, [32, 33], 32, 32),
+        (8, 81, None, [64, 16, 1], 64, 80),
+        (8, 81, 79, [64, 8, 9], 72, 72),
+        # The boundary is the prompt-end checkpoint: nothing moves.
+        (32, 34, 32, [32, 2], 32, 32),
     ],
 )
-def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
-    spec_cls, hash_block_size, num_prompt_tokens, chunks, follow_up_hit, resend_hit
+def test_mamba_align_keeps_state_at_prompt_cache_boundary(
+    hash_block_size,
+    num_prompt_tokens,
+    prompt_cache_boundary,
+    chunks,
+    follow_up_hit,
+    resend_hit,
 ):
-    """A chat follow-up re-renders history without the previous generation
-    prompt ("<think"), so it diverges a few tokens before the prompt end. RWKV
-    keeps the state before that tail instead of the prompt-end state, in as
-    many prefill steps as other Mamba models."""
+    """A chat follow-up shares the history up to the previous generation prompt
+    ("<think"), two tokens before the prompt end. A request declaring that
+    boundary keeps its state there instead of the prompt-end state, in as many
+    prefill steps; requests without one are unchanged."""
     block_size = 32
     manager = make_kv_cache_manager(
         KVCacheConfig(
@@ -259,7 +269,7 @@ def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
             kv_cache_groups=[
                 KVCacheGroupSpec(
                     ["mamba"],
-                    spec_cls(
+                    MambaSpec(
                         block_size=block_size,
                         shapes=((1,),),
                         dtypes=(torch.float32,),
@@ -282,10 +292,14 @@ def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
         mamba_partial_cache_hit=hash_block_size < block_size,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
-        mamba_continuation_tail_tokens=manager.coordinator.continuation_tail_tokens,
     )
     prompt = list(range(num_prompt_tokens))
-    turn = make_request("turn", prompt, hash_block_size, sha256)
+    extra_args = (
+        None
+        if prompt_cache_boundary is None
+        else {"prompt_cache_boundary": prompt_cache_boundary}
+    )
+    turn = make_request("turn", prompt, hash_block_size, sha256, extra_args=extra_args)
     scheduled = []
     while turn.num_computed_tokens < num_prompt_tokens:
         chunk = Scheduler._mamba_block_aligned_split(
@@ -303,7 +317,7 @@ def test_mamba_align_keeps_state_before_replaceable_prompt_tail(
     assert scheduled == chunks
 
     follow_up = make_request(
-        "follow_up", [*prompt[:-2], 1000, 1001], hash_block_size, sha256
+        "follow_up", [*prompt[:-2], 1000, 1001, 1002], hash_block_size, sha256
     )
     _, num_computed, _ = manager.get_computed_blocks(follow_up)
     assert num_computed == follow_up_hit
@@ -1088,7 +1102,6 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
-        mamba_continuation_tail_tokens=0,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(

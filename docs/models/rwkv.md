@@ -73,12 +73,13 @@ continuation, so divergent suffixes do not modify each other. Only checkpoints
 actually saved by the scheduler can be reused; the match unit controls hashing
 granularity, not how often states are stored.
 
-A chat follow-up re-renders history without the previous generation prompt
-(`<think` or `<think></think`). RWKV therefore stores the prompt's state at the
-last checkpoint before its final four tokens instead of before its last token,
-so the next turn resumes there instead of a turn earlier. The checkpoint moves
-rather than adding a prefill stop, so on average prefill takes as many steps as
-before; an identical resend resumes up to one match unit earlier.
+For RWKV chat requests, the server finds where the assistant reply starts, after
+`Bot✿` and before the generation prompt (`<think` or `<think></think`). Prefix
+caching keeps the prompt state there instead of before the last prompt token,
+because the next turn renders the reply at that position. Without a reasoning
+parser, the returned content starts with the generation prompt, so a client can
+resend the reply unchanged. Completions and other requests keep the prompt-end
+checkpoint; clients can set it with `"irwkv_xargs": {"prompt_cache_boundary": N}`.
 
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
