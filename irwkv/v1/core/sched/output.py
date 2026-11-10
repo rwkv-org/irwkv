@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from irwkv.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from irwkv.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+    from irwkv.lora.request import LoRARequest
     from irwkv.multimodal.inputs import MultiModalFeatureSpec
     from irwkv.sampling_params import SamplingParams
     from irwkv.v1.core.kv_cache_utils import KVCacheBlockCopy
@@ -44,6 +45,7 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    lora_request: "LoRARequest | None" = None
 
     @classmethod
     def from_request(
@@ -66,6 +68,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            lora_request=request.lora_request,
         )
 
     @property

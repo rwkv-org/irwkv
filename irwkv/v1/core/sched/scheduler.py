@@ -759,6 +759,15 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                if self.running:
+                    active_lora = self.running[0].lora_request
+                    if (active_lora.lora_int_id if active_lora else None) != (
+                        request.lora_request.lora_int_id
+                        if request.lora_request
+                        else None
+                    ):
+                        break
+
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
                     skip_request(request_queue)

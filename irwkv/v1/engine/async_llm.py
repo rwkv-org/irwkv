@@ -33,6 +33,7 @@ from irwkv.exceptions import (
 )
 from irwkv.inputs import EngineInput, PromptType
 from irwkv.logger import configure_logging_if_needed, init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from irwkv.outputs import STREAM_FINISHED, RequestOutput
 from irwkv.profiler.wrapper import TorchProfilerWrapper, create_frontend_profiler
@@ -392,6 +393,7 @@ class AsyncLLM(EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
         if self.errored:
@@ -423,6 +425,7 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank,
                 session_id,
                 kv_hints,
+                lora_request,
             )
 
         # Convert Input --> Request.
@@ -481,6 +484,8 @@ class AsyncLLM(EngineClient):
                 )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
+        if lora_request is not None:
+            request.lora_request = lora_request
         if reasoning_ended is not None:
             request.reasoning_ended = reasoning_ended
         if reasoning_parser_kwargs is not None:
@@ -566,6 +571,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> RequestOutputCollector:
         self._validate_streaming_input_sampling_params(sampling_params)
 
@@ -592,6 +598,7 @@ class AsyncLLM(EngineClient):
             params=sampling_params,
             **inputs,  # type: ignore[arg-type]
         )
+        final_req.lora_request = lora_request
         self.input_processor.assign_request_id(final_req)
         internal_req_id = final_req.request_id
 
@@ -616,6 +623,7 @@ class AsyncLLM(EngineClient):
                         resumable=True,
                         **inputs,  # type: ignore[arg-type]
                     )
+                    req.lora_request = lora_request
                     req.external_req_id = request_id
                     if req.prompt_embeds is not None:
                         raise IRWKVValidationError(
@@ -686,6 +694,7 @@ class AsyncLLM(EngineClient):
         kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Main function called by the API server to kick off a request
             * 1) Making an AsyncStream corresponding to the Request.
@@ -713,7 +722,17 @@ class AsyncLLM(EngineClient):
 
         """
         q: RequestOutputCollector | None = None
+        lora_pinned = False
         try:
+            if lora_request is not None:
+                pinned = await self.collective_rpc(
+                    "pin_lora", args=(lora_request.lora_int_id,)
+                )
+                if not all(pinned):
+                    raise ValueError(
+                        f"LoRA adapter {lora_request.lora_name!r} is unavailable"
+                    )
+                lora_pinned = True
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -727,6 +746,7 @@ class AsyncLLM(EngineClient):
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                lora_request=lora_request,
             )
 
             # The output_handler task pushes items into the queue.
@@ -792,6 +812,10 @@ class AsyncLLM(EngineClient):
         finally:
             if q is not None:
                 q.close()
+            if lora_pinned and lora_request is not None and not self.errored:
+                await self.collective_rpc(
+                    "unpin_lora", args=(lora_request.lora_int_id,)
+                )
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

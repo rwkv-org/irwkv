@@ -1086,7 +1086,15 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        adapters = {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith((".lora_A.weight", ".lora_B.weight"))
+        }
+        if adapters.isdisjoint(loaded):
+            loaded.update(adapters)
+        return loaded
 
     def process_weights_after_loading(self) -> None:
         self.model.process_weights_after_loading()

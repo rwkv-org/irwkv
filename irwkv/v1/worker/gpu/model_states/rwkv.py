@@ -396,6 +396,7 @@ class RwkvModelState(DefaultModelState):
         self._rwkv_group_id: int | None = None
         self._sampler: RwkvSampler | None = None
         self._model = model
+        self._request_loras: dict[str, int | None] = {}
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -427,6 +428,8 @@ class RwkvModelState(DefaultModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        lora = new_req_data.lora_request
+        self._request_loras[new_req_data.req_id] = lora.lora_int_id if lora else None
         if self._sampler is not None:
             self._sampler.stage_request(req_index, new_req_data.req_id)
         self._state_block_columns[req_index] = (
@@ -440,6 +443,7 @@ class RwkvModelState(DefaultModelState):
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
+        self._request_loras.pop(req_id, None)
         if self._sampler is not None:
             self._sampler.remove_request(req_id)
 
@@ -470,6 +474,10 @@ class RwkvModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
+        if input_batch.num_reqs and hasattr(self._model, "_lora_manager"):
+            self._model._lora_manager.set_active_adapter(
+                self._request_loras[input_batch.req_ids[0]]
+            )
         if not self._align_mode or input_batch.num_reqs == 0:
             return
 

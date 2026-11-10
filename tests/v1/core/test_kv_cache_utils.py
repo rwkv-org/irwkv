@@ -996,6 +996,27 @@ def test_hash_request_tokens_no_mm_inputs(hash_fn):
     assert block_hashes[1] == hash_fn((block_hashes[0], (3, 4, 5), None))
 
 
+def test_hash_request_tokens_isolates_lora_versions() -> None:
+    from irwkv.lora.request import LoRARequest
+
+    hashes = []
+    for version in (None, 1, 2):
+        request = Request(
+            request_id=str(version),
+            prompt_token_ids=list(range(6)),
+            sampling_params=SamplingParams(max_tokens=1),
+            block_hasher=get_request_block_hasher(3, sha256),
+            lora_request=(
+                LoRARequest("tenant", version, "/adapter")
+                if version is not None
+                else None
+            ),
+        )
+        hashes.append(request.block_hashes)
+    assert len({blocks[0] for blocks in hashes}) == 3
+    assert len({blocks[1] for blocks in hashes}) == 3
+
+
 def _stats(requests: int, queries: int, hits: int) -> PrefixCacheStats:
     return PrefixCacheStats(requests=requests, queries=queries, hits=hits)
 

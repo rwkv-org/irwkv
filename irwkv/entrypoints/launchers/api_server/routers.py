@@ -25,6 +25,13 @@ def register_api_routers(
 
     register_models_api_router(app)
 
+    if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING:
+        if args.api_server_count is not None and args.api_server_count > 1:
+            raise ValueError("Dynamic LoRA requires a single API server")
+        from irwkv.entrypoints.serve.lora.api_router import attach_router
+
+        attach_router(app)
+
     from irwkv.entrypoints.serve.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )

@@ -228,6 +228,34 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+To serve multiple adapters, enable runtime LoRA updates and reserve the adapter
+parameters with `rwkv_lora`:
+
+```bash
+IRWKV_ALLOW_RUNTIME_LORA_UPDATING=1 irwkv serve <base-model> \
+  --served-model-name base --dtype bfloat16 --enable-chunked-prefill \
+  --api-server-count 1 \
+  --hf-overrides '{"rwkv_lora": {"r": 32, "lora_alpha": 32, "use_nora": false, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"]}}'
+```
+
+Load a PEFT adapter directory containing `adapter_config.json` and
+`adapter_model.safetensors` (or `adapter_model.bin`/`.pt`):
+
+```bash
+curl -X POST localhost:8000/v1/load_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name":"tenant-a","lora_path":"/path/to/adapter"}'
+```
+
+Use `tenant-a` as the request's `model`. To replace it, load the new path with
+`"load_inplace": true`; to remove it, POST `{"lora_name":"tenant-a"}` to
+`/v1/unload_lora_adapter`. Each load gets a distinct cache identity. Requests
+already using an adapter retain their version until they finish. The base model
+and different adapter versions run in separate batches. All adapters must match
+the configured rank, scale, and NoRA setting, and target only configured layers.
+The runtime endpoints accept local paths accessible to the server. Dynamic
+updates require the Python API server with one API-server process.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes

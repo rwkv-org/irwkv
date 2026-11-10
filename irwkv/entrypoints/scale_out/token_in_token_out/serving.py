@@ -184,7 +184,10 @@ class ServingTokens(GenerateBaseServing):
 
         self._preflight()
 
-        model_name = self.models.model_name()
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
+        model_name = self.models.model_name(lora_request)
 
         request_id = (
             f"generate-tokens-{self._base_request_id(raw_request, request.request_id)}"
@@ -355,6 +358,7 @@ class ServingTokens(GenerateBaseServing):
             priority=request.priority,
             data_parallel_rank=data_parallel_rank,
             session_id=session_id,
+            lora_request=lora_request,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=(
                 request.reasoning_parser_kwargs.model_dump()

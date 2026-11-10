@@ -204,6 +204,22 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert len(engine_core_outputs[1].outputs) == 1
 
 
+def test_schedule_separates_lora_versions_and_base() -> None:
+    from irwkv.lora.request import LoRARequest
+
+    scheduler = create_scheduler()
+    first, second, base = create_requests(num_requests=3)
+    first.lora_request = LoRARequest("tenant", 1, "/adapter")
+    second.lora_request = LoRARequest("tenant", 2, "/adapter")
+    for request in (first, second, base):
+        scheduler.add_request(request)
+
+    for request in (first, second, base):
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) == {request.request_id}
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+
 def test_async_scheduling_pp_reschedules_after_pipeline_cadence(monkeypatch):
     """Respect the pipeline broadcast slot cadence for an in-flight request."""
     monkeypatch.setattr(

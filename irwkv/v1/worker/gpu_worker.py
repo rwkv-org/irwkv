@@ -1311,6 +1311,27 @@ class Worker(WorkerBase):
             model_config=self.model_config,
         )
 
+    def add_lora(self, lora_name: str, lora_id: int, lora_path: str) -> bool:
+        from irwkv.lora.request import LoRARequest
+        from irwkv.lora.worker_manager import WorkerLoRAManager
+
+        model = self.model_runner.get_model()
+        if not hasattr(model, "_lora_manager"):
+            model._lora_manager = WorkerLoRAManager(model)
+        return model._lora_manager.add_adapter(
+            LoRARequest(lora_name, lora_id, lora_path)
+        )
+
+    def remove_lora(self, lora_id: int) -> bool:
+        manager = getattr(self.model_runner.get_model(), "_lora_manager", None)
+        return manager.remove_adapter(lora_id) if manager is not None else False
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.get_model()._lora_manager.pin_adapter(lora_id)
+
+    def unpin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.get_model()._lora_manager.unpin_adapter(lora_id)
+
     def _check_weight_transfer_engine(self) -> None:
         if self.weight_transfer_engine is None:
             raise RuntimeError(

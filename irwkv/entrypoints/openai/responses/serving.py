@@ -73,6 +73,7 @@ from irwkv.inputs import EngineInput
 from irwkv.logger import init_logger
 from irwkv.logprobs import Logprob as SampleLogprob
 from irwkv.logprobs import SampleLogprobs
+from irwkv.lora.request import LoRARequest
 from irwkv.outputs import CompletionOutput
 from irwkv.parser import Parser, ParserManager
 from irwkv.renderers.online_renderer import (
@@ -330,7 +331,10 @@ class OpenAIServingResponses(GenerateBaseServing):
         else:
             prev_response = None
 
-        model_name = self.models.model_name()
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
+        model_name = self.models.model_name(lora_request)
 
         render_result = await self._render_resolved_response_inputs(
             request,
@@ -472,6 +476,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                lora_request=lora_request,
             )
             generators.append(generator)
 
@@ -590,6 +595,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        lora_request: "LoRARequest | None" = None,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -613,6 +619,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 priority=priority,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                lora_request=lora_request,
             )
 
             async for res in generator:

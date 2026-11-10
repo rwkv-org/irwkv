@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from starlette.requests import Request
 
@@ -95,3 +98,37 @@ def test_get_session_id_ignores_empty_and_non_string_values():
     session_id = GenerateBaseServing._get_session_id(request, None)
 
     assert session_id is None
+
+
+@pytest.mark.asyncio
+async def test_lora_registry_reload_preserves_unique_versions():
+    from irwkv.entrypoints.openai.models.protocol import BaseModelPath
+    from irwkv.entrypoints.openai.models.serving import OpenAIServingModels
+    from irwkv.entrypoints.serve.lora.protocol import (
+        LoadLoRAAdapterRequest,
+        UnloadLoRAAdapterRequest,
+    )
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=128),
+        renderer=None,
+        input_processor=None,
+        collective_rpc=AsyncMock(return_value=[True]),
+    )
+    models = OpenAIServingModels(engine, [BaseModelPath("base", "/base")])
+    await models.load_lora_adapter(
+        LoadLoRAAdapterRequest(lora_name="tenant", lora_path="/a")
+    )
+    first = models.get_lora("tenant")
+    await models.load_lora_adapter(
+        LoadLoRAAdapterRequest(lora_name="tenant", lora_path="/a", load_inplace=True)
+    )
+    second = models.get_lora("tenant")
+    assert first is not None and second is not None
+    assert first.lora_int_id != second.lora_int_id
+    assert {card.id for card in (await models.show_available_models()).data} == {
+        "base",
+        "tenant",
+    }
+    await models.unload_lora_adapter(UnloadLoRAAdapterRequest(lora_name="tenant"))
+    assert models.get_lora("tenant") is None

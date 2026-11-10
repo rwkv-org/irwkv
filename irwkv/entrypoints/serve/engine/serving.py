@@ -15,6 +15,7 @@ from irwkv.entrypoints.serve.engine.protocol import ErrorResponse
 from irwkv.entrypoints.serve.engine.typing import AnyRequest
 from irwkv.entrypoints.serve.utils.request_logger import RequestLogger
 from irwkv.inputs import EngineInput
+from irwkv.lora.request import LoRARequest
 from irwkv.renderers.inputs.preprocess import (
     extract_prompt_components,
     extract_prompt_len,
@@ -60,7 +61,23 @@ class BaseServing:
             return True
         if envs.IRWKV_SKIP_MODEL_NAME_VALIDATION:
             return True
-        return self.models.is_base_model(model_name)
+        return (
+            self.models.is_base_model(model_name)
+            or self.models.get_lora(model_name) is not None
+        )
+
+    def _maybe_get_adapters(
+        self, model_name: str | None
+    ) -> LoRARequest | ErrorResponse | None:
+        lora = self.models.get_lora(model_name)
+        if lora is None and not self._is_model_supported(model_name):
+            return self.create_error_response(
+                f"The model `{model_name}` does not exist.",
+                err_type="NotFoundError",
+                status_code=HTTPStatus.NOT_FOUND,
+                param="model",
+            )
+        return lora
 
     @staticmethod
     def create_error_response(

@@ -77,6 +77,7 @@ def test_is_model_supported_skip_name_validation_env(
     mock_engine.model_config.max_model_len = 100
     mock_models = MagicMock()
     mock_models.is_base_model.return_value = False
+    mock_models.get_lora.return_value = None
 
     serving = GenerateBaseServing(
         engine_client=mock_engine,
