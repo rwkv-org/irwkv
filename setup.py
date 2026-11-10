@@ -373,6 +373,7 @@ setup(
     install_requires=get_requirements(),
     extras_require={
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
+        "router": ["vllm-router==0.1.17"],
         "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.3.3"],
         "instanttensor": ["instanttensor >= 0.1.9"],

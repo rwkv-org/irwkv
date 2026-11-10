@@ -76,6 +76,45 @@ granularity, not how often states are stored.
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
+## Multi-replica routing
+
+The optional router integration uses the independent
+[vLLM Router](https://github.com/vllm-project/router) package, also used by
+SkyRL. Install it with irwkv's `router` extra:
+
+```bash
+uv pip install -e '.[router]' --no-build-isolation --torch-backend=auto
+```
+
+The extra pins `vllm-router==0.1.17`. The independently distributed router
+uses the Apache-2.0 license and does not require vLLM or FlashAttention. irwkv
+exposes the upstream configuration and launcher without changing their behavior:
+
+```python
+from irwkv import RouterArgs, launch_router
+
+server_urls = ["http://127.0.0.1:8000", "http://127.0.0.1:8001"]
+args = RouterArgs(
+    worker_urls=server_urls,
+    host="127.0.0.1",
+    port=30000,
+    policy="consistent_hash",
+)
+launch_router(args)
+```
+
+`launch_router` blocks. An application can run it in a child process and stop
+that process on shutdown, as SkyRL does. Wait for the router's `/health`
+endpoint before sending requests. Send generation requests to the router,
+including `X-Session-ID` for session affinity. Enable the scale-out API on the
+replicas for `/inference/v1/generate`.
+
+The upstream `sticky_least_loaded` policy also tracks active sessions; send
+`POST /finish_session?session_id=<id>` to the router when a session ends. With
+`consistent_hash`, finishing a session is a no-op. Keep `server_urls` separately
+for control operations such as weight updates that must reach every replica
+directly.
+
 ## Kernel preparation
 
 FlashRWKV2 stores verified tuning profiles and native builds under

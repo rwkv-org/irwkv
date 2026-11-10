@@ -27,9 +27,14 @@ MODULE_ATTRS = {
     "SamplingParams": ".sampling_params:SamplingParams",
     "CompletionOutput": ".outputs:CompletionOutput",
     "RequestOutput": ".outputs:RequestOutput",
+    "RouterArgs": "vllm_router.router_args:RouterArgs",
+    "launch_router": "vllm_router.launch_router:launch_router",
 }
 
 if typing.TYPE_CHECKING:
+    from vllm_router.launch_router import launch_router as launch_router
+    from vllm_router.router_args import RouterArgs as RouterArgs
+
     from irwkv.engine.arg_utils import AsyncEngineArgs, EngineArgs
     from irwkv.engine.async_llm_engine import AsyncLLMEngine
     from irwkv.engine.llm_engine import LLMEngine
