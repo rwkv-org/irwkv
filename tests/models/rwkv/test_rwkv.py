@@ -1258,10 +1258,10 @@ def _graph_sampler(monkeypatch, calls: list[str]) -> tuple[RwkvSampler, Any]:
     sampler._sampling_graphs = {4: graph}
     active_rows = np.empty(4, dtype=np.int64)
     active_slots = np.empty(4, dtype=np.int32)
-    graph_rows = np.full(4, -1, dtype=np.int32)
-    sampler._graph_rows = SimpleNamespace(
-        np=graph_rows,
-        copy_to_uva=lambda size: torch.from_numpy(graph_rows[:size]),
+    graph_cu_num_logits = np.full(5, -1, dtype=np.int32)
+    sampler._graph_cu_num_logits = SimpleNamespace(
+        np=graph_cu_num_logits,
+        copy_to_uva=lambda size: torch.from_numpy(graph_cu_num_logits[:size].copy()),
     )
     sampler._active_rows = SimpleNamespace(
         np=active_rows,
@@ -1319,35 +1319,35 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
 
 def _grammar_worker(calls: list[Any]) -> Any:
     def apply_grammar_bitmask(logits, input_batch, req_ids, bitmask) -> None:
-        rows = [
-            int(input_batch.cu_num_logits[input_batch.req_ids.index(req_id)])
-            for req_id in req_ids
-        ]
-        calls.append(("grammar", logits, rows, bitmask))
+        cu_num_logits = input_batch.cu_num_logits.tolist()
+        assert cu_num_logits == input_batch.cu_num_logits_np.tolist()
+        calls.append(("grammar", logits, cu_num_logits, bitmask))
 
     return SimpleNamespace(apply_grammar_bitmask=apply_grammar_bitmask)
 
 
 @pytest.mark.parametrize(
-    ("num_computed_prefill_tokens", "graph_rows"),
+    ("num_computed_prefill_tokens", "cu_num_logits"),
     [
-        # Every request samples: graph rows match batch rows.
-        ([1, 6, 3, 0], [2, 3]),
-        # Request "b" is mid-prefill, so "c" and "d" shift up one graph row.
-        ([1, 2, 3, 0], [1, 2]),
+        # Every request samples: one graph row per batch row.
+        ([1, 6, 3, 0], [0, 1, 2, 3, 4]),
+        # Request "b" is mid-prefill and has no graph row, so "c" and "d"
+        # shift up one row.
+        ([1, 2, 3, 0], [0, 1, 1, 2, 3]),
     ],
 )
 def test_rapid_sampler_graph_masks_grammar_between_logits_and_sampling(
-    monkeypatch, num_computed_prefill_tokens: list[int], graph_rows: list[int]
+    monkeypatch, num_computed_prefill_tokens: list[int], cu_num_logits: list[int]
 ) -> None:
-    """The bitmask lands on each grammar request's compacted graph row between
-    the logits and sampling replays, including in mixed prefill batches."""
+    """The bitmask is applied between the logits and sampling replays, with
+    ``cu_num_logits`` as full cumulative offsets into the compacted graph rows,
+    including in mixed prefill batches."""
     calls: list[Any] = []
     sampler, graph = _graph_sampler(monkeypatch, calls)
     input_batch = _graph_input_batch(num_computed_prefill_tokens)
-    bitmask = np.zeros((2, 1), dtype=np.int32)
+    bitmask = np.zeros((3, 1), dtype=np.int32)
     grammar_output = SimpleNamespace(
-        structured_output_request_ids=["c", "d"], grammar_bitmask=bitmask
+        structured_output_request_ids=["a", "c", "d"], grammar_bitmask=bitmask
     )
 
     output = sampler.sample_hidden_states(
@@ -1355,7 +1355,11 @@ def test_rapid_sampler_graph_masks_grammar_between_logits_and_sampling(
     )
 
     assert output is not None
-    assert calls == ["logits", ("grammar", graph.logits, graph_rows, bitmask), "sample"]
+    assert calls == [
+        "logits",
+        ("grammar", graph.logits, cu_num_logits, bitmask),
+        "sample",
+    ]
     assert torch.equal(input_batch.cu_num_logits, torch.tensor([0, 1, 2, 3, 4]))
 
 

@@ -23,6 +23,7 @@ from irwkv.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from irwkv.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from irwkv.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from irwkv.v1.worker.gpu.states import RequestState
+from irwkv.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from irwkv.v1.worker.utils import AttentionGroup
 
 
@@ -268,10 +269,13 @@ class ModelState(ABC):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
-        structured_outputs_worker: Any | None = None,
     ) -> Any | None:
         """Optionally sample directly from hidden states."""
         return None
+
+    structured_outputs_worker: StructuredOutputsWorker | None = None
+    """The runner's grammar bitmask worker, bound once samplers are set up, for
+    ``custom_sample`` implementations that apply grammar masks themselves."""
 
     num_new_sampled_tokens_per_step: int = 1
     """New tokens sampled on each decode step 

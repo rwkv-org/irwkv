@@ -142,7 +142,7 @@ class RwkvSampler(Sampler):
             tuple[int, tuple[torch.Tensor, torch.Tensor] | None]
         ] = []
         self._input_batch: InputBatch | None = None
-        self._graph_rows = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+        self._graph_cu_num_logits = UvaBackedTensor(max_num_reqs + 1, dtype=torch.int32)
         self._sampling_graphs: dict[int, _RwkvSamplingGraph] = {}
         if capture_graphs:
             capacities = (1, 2, 4, 8, 16, 32, 64, 128, 256, 320, 512)
@@ -194,11 +194,17 @@ class RwkvSampler(Sampler):
         apply_grammar_bitmask = None
         if grammar_output is not None:
             assert structured_outputs_worker is not None
-            # Grammar requests never sample mid-prefill, so each one has a
-            # compacted graph row; address it through ``cu_num_logits``.
-            self._graph_rows.np[active_rows_np] = np.arange(num_active)
+            # Offsets into the compacted graph logits: one row per sampling
+            # request, none for requests still mid-prefill. The scheduler never
+            # asks the latter for a grammar mask.
+            cu_num_logits_np = self._graph_cu_num_logits.np[: num_reqs + 1]
+            cu_num_logits_np[0] = 0
+            np.cumsum(finishes_prefill, out=cu_num_logits_np[1:])
             graph_batch = copy.copy(input_batch)
-            graph_batch.cu_num_logits = self._graph_rows.copy_to_uva(num_reqs)
+            graph_batch.cu_num_logits_np = cu_num_logits_np
+            graph_batch.cu_num_logits = self._graph_cu_num_logits.copy_to_uva(
+                num_reqs + 1
+            )
 
             def apply_grammar_bitmask(logits: torch.Tensor) -> None:
                 structured_outputs_worker.apply_grammar_bitmask(
@@ -454,7 +460,6 @@ class RwkvModelState(DefaultModelState):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
-        structured_outputs_worker: StructuredOutputsWorker | None = None,
     ) -> SamplerOutput | None:
         del model
         if self._sampler is None:
@@ -463,7 +468,7 @@ class RwkvModelState(DefaultModelState):
             hidden_states,
             input_batch,
             grammar_output,
-            structured_outputs_worker,
+            self.structured_outputs_worker,
         )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
