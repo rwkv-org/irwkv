@@ -182,8 +182,10 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
     loader = Mock()
     loader.get_all_weights.return_value = iter(())
     monkeypatch.setattr(gpu_model_runner_module, "get_model_loader", lambda _: loader)
-    monkeypatch.setattr(gpu_model_runner_module, "initialize_layerwise_reload", Mock())
-    monkeypatch.setattr(gpu_model_runner_module, "finalize_layerwise_reload", Mock())
+    initialize = Mock()
+    finalize = Mock()
+    monkeypatch.setattr(gpu_model_runner_module, "initialize_weight_reload", initialize)
+    monkeypatch.setattr(gpu_model_runner_module, "finalize_weight_reload", finalize)
 
     runner = Mock()
     runner.model_config = SimpleNamespace(
@@ -197,6 +199,8 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
 
     GPUModelRunner.reload_weights(runner, weights_path="org/new-model")
 
+    initialize.assert_called_once_with(runner.get_model.return_value)
+    finalize.assert_called_once_with(runner.get_model.return_value, runner.model_config)
     loader.get_all_weights.assert_called_once_with(
         runner.model_config, runner.get_model.return_value
     )

@@ -34,6 +34,8 @@ logger = init_logger(__name__)
 __all__ = [
     "get_layerwise_info",
     "record_metadata_for_reloading",
+    "initialize_weight_reload",
+    "finalize_weight_reload",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
@@ -51,6 +53,24 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+
+
+def initialize_weight_reload(model: torch.nn.Module) -> None:
+    """Prepare checkpoint reloading, using a model-specific implementation if set."""
+    initialize = getattr(model, "initialize_weight_reload", None)
+    if initialize is not None:
+        initialize()
+    else:
+        initialize_layerwise_reload(model)
+
+
+def finalize_weight_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:
+    """Finalize the checkpoint reload prepared by `initialize_weight_reload`."""
+    finalize = getattr(model, "finalize_weight_reload", None)
+    if finalize is not None:
+        finalize()
+    else:
+        finalize_layerwise_reload(model, model_config)
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:

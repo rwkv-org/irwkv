@@ -117,7 +117,7 @@ class NCCLWeightTransferEngine(
     This implementation uses NCCL broadcast operations to transfer dense
     checkpoint-format weights from the trainer (rank 0) to all inference workers
     in a process group. Received weights are loaded via the model's
-    `load_weights` using the layerwise reload lifecycle.
+    `load_weights` using the checkpoint reload lifecycle.
     """
 
     # Define backend-specific dataclass types
@@ -157,20 +157,20 @@ class NCCLWeightTransferEngine(
         )
 
     def start_weight_update(self) -> None:
-        """Initialize layerwise reloading for the incoming checkpoint weights."""
+        """Prepare the model for incoming checkpoint weights."""
         from irwkv.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
+            initialize_weight_reload,
         )
 
-        initialize_layerwise_reload(self.model)
+        initialize_weight_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
+        """Finalize the checkpoint reload after all weights have been received."""
         from irwkv.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
+            finalize_weight_reload,
         )
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        finalize_weight_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.

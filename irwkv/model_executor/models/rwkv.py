@@ -836,11 +836,16 @@ class RwkvModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _process_embedding_norm(self) -> None:
+    @torch.no_grad()
+    def _process_embedding_norm(self, *, in_place: bool = False) -> None:
         if get_pp_group().is_first_rank and self._fold_embedding_norm:
             flashrwkv2 = _load_flashrwkv2()
             embedding = self.embed_tokens.weight
-            folded = torch.empty_like(embedding, dtype=torch.bfloat16)
+            folded = (
+                embedding
+                if in_place
+                else torch.empty_like(embedding, dtype=torch.bfloat16)
+            )
             for start in range(0, embedding.shape[0], 4096):
                 end = min(start + 4096, embedding.shape[0])
                 folded[start:end].copy_(
@@ -851,7 +856,8 @@ class RwkvModel(nn.Module):
                         eps=self.config.layer_norm_epsilon,
                     )
                 )
-            self.embed_tokens.weight.data = folded
+            if not in_place:
+                self.embed_tokens.weight.data = folded
             self._embedding_norm_folded = True
             self._embedding_norm_folded_buffer.fill_(True)
 
@@ -964,6 +970,7 @@ class RwkvForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self._prepared_tuning_shapes: set[tuple[int, int, int, int]] = set()
+        self._weight_reload_names: set[str] | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1086,7 +1093,49 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        if self._weight_reload_names is not None:
+            weights = (
+                (name, weight.T if name.endswith(".mlp.value.weight") else weight)
+                for name, weight in weights
+            )
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if self._weight_reload_names is not None:
+            self._weight_reload_names.update(loaded)
+        return loaded
+
+    def initialize_weight_reload(self) -> None:
+        self._weight_reload_names = set()
+
+    @torch.no_grad()
+    def finalize_weight_reload(self) -> None:
+        assert self._weight_reload_names is not None
+        loaded = self._weight_reload_names
+        if get_pp_group().is_first_rank and self.model._fold_embedding_norm:
+            embedding_name = "model.embed_tokens.weight"
+            norm_changed = any(
+                name.startswith("model.embedding_norm.") for name in loaded
+            )
+            if norm_changed and embedding_name not in loaded:
+                raise ValueError(
+                    "Reloading RWKV embedding normalization requires the "
+                    "unfolded embedding weight in the same update."
+                )
+            if embedding_name in loaded:
+                self.model._process_embedding_norm(in_place=True)
+
+        for layer in islice(
+            self.model.layers, self.model.start_layer, self.model.end_layer
+        ):
+            assert isinstance(layer, RwkvDecoderLayer)
+            attention = layer.linear_attn
+            names: tuple[str, ...] = ("w1", "a1", "g1", "w2", "a2", "g2")
+            if attention.layer_idx != 0:
+                names += ("v1", "v2")
+            for name in names:
+                getattr(attention, f"{name}_canonical").copy_(
+                    getattr(attention, name).T
+                )
+        self._weight_reload_names = None
 
     def process_weights_after_loading(self) -> None:
         self.model.process_weights_after_loading()

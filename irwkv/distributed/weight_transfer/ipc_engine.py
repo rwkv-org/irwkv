@@ -158,26 +158,30 @@ class IPCWeightTransferEngine(
         self.packed = init_info.packed
 
     def start_weight_update(self) -> None:
-        """Initialize layerwise reloading for the incoming checkpoint weights."""
+        """Prepare the model for incoming checkpoint weights."""
         from irwkv.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
+            initialize_weight_reload,
         )
 
-        initialize_layerwise_reload(self.model)
+        initialize_weight_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
+        """Finalize the checkpoint reload after all weights have been received."""
         from irwkv.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
+            finalize_weight_reload,
         )
 
-        finalize_layerwise_reload(self.model, self.model_config)
-        # Every reduce_tensor call is a fresh export with its own refcount
-        # slot, so releasing once per update always balances this update's
-        # export and lets the trainer reclaim its staging buffer. Callers
-        # that skip finish are still covered by the replace-on-next-export
-        # path inside the importer.
-        self._packed_importer.close()
+        try:
+            finalize_weight_reload(self.model, self.model_config)
+        finally:
+            self._packed_importer.close()
+
+    def update_weights(self, update_info: dict[str, Any]) -> None:
+        try:
+            super().update_weights(update_info)
+        except BaseException:
+            self._packed_importer.close()
+            raise
 
     def receive_weights(self, update_info: IPCWeightTransferUpdateInfo) -> None:
         """Receive weights from the trainer via CUDA IPC handles and load them.

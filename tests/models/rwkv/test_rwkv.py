@@ -17,6 +17,10 @@ from irwkv.config.compilation import CompilationMode, CUDAGraphMode
 from irwkv.config.model import ModelConfig
 from irwkv.engine.arg_utils import EngineArgs
 from irwkv.exceptions import IRWKVValidationError
+from irwkv.model_executor.model_loader.reload import (
+    finalize_weight_reload,
+    initialize_weight_reload,
+)
 from irwkv.model_executor.models.config import RwkvForCausalLMConfig
 from irwkv.model_executor.models.rwkv import (
     RwkvFeedForward,
@@ -973,6 +977,89 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
         assert torch.equal(param, weights[name])
 
 
+@pytest.mark.usefixtures("_single_rank")
+@torch.no_grad()
+def test_checkpoint_reload_updates_runtime_weights_in_place(monkeypatch) -> None:
+    module: Any = _fake_flashrwkv2()
+    module.infer_embedding_ln0_forward_varlen = lambda x, weight, bias, eps: (
+        torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+    )
+    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(None))
+    torch.manual_seed(123)
+
+    def checkpoint():
+        return {
+            name: torch.randn_like(param) for name, param in model.named_parameters()
+        }
+
+    weights = checkpoint()
+    model.load_weights(weights.items())
+    model.process_weights_after_loading()
+    pointers = {name: param.data_ptr() for name, param in model.named_parameters()}
+    buffer_pointers = {
+        name: buf.data_ptr()
+        for name, buf in model.named_buffers()
+        if "canonical" in name or "layer_zero" in name
+    }
+
+    for _ in range(2):
+        weights = checkpoint()
+        for name in weights:
+            if name.endswith(".mlp.value.weight"):
+                weights[name] = weights[name].T.contiguous()
+        items = list(weights.items())
+        initialize_weight_reload(model)
+        split = len(items) // 2
+        assert model.load_weights(items[:split]) | model.load_weights(
+            items[split:]
+        ) == (set(weights))
+        finalize_weight_reload(model, None)
+
+        assert {name: param.data_ptr() for name, param in model.named_parameters()} == (
+            pointers
+        )
+        assert {
+            name: buf.data_ptr()
+            for name, buf in model.named_buffers()
+            if "canonical" in name or "layer_zero" in name
+        } == buffer_pointers
+        expected_embedding = torch.nn.functional.layer_norm(
+            weights["model.embed_tokens.weight"],
+            (model.config.hidden_size,),
+            weights["model.embedding_norm.weight"],
+            weights["model.embedding_norm.bias"],
+            model.config.layer_norm_epsilon,
+        )
+        torch.testing.assert_close(model.model.embed_tokens.weight, expected_embedding)
+        for index, layer in enumerate(model.model.layers):
+            value = weights[f"model.layers.{index}.mlp.value.weight"]
+            torch.testing.assert_close(layer.mlp.value.weight, value.T)
+            names = ("w1", "a1", "g1", "w2", "a2", "g2")
+            if index:
+                names += ("v1", "v2")
+            for name in names:
+                torch.testing.assert_close(
+                    getattr(layer.linear_attn, f"{name}_canonical"),
+                    weights[f"model.layers.{index}.linear_attn.{name}"].T,
+                )
+
+    embedding = model.model.embed_tokens.weight.clone()
+    initialize_weight_reload(model)
+    model.load_weights(
+        [("model.layers.0.linear_attn.w1", weights["model.layers.0.linear_attn.w1"])]
+    )
+    finalize_weight_reload(model, None)
+    torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+
+    initialize_weight_reload(model)
+    model.load_weights(
+        [("model.embedding_norm.weight", weights["model.embedding_norm.weight"])]
+    )
+    with pytest.raises(ValueError, match="unfolded embedding weight"):
+        finalize_weight_reload(model, None)
+
+
 def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {
         key: id(value) if isinstance(value, torch.Tensor) else value
@@ -1458,6 +1545,217 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             assert single.token_ids == reference.token_ids
             assert single.logprobs == reference.logprobs
         reference = single
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize("backend", ["nccl", "ipc"])
+def test_real_model_native_weight_reload(irwkv_runner, monkeypatch, backend) -> None:
+    """Repeated checkpoint transfers update captured graphs and invalidate cache."""
+    from safetensors import safe_open
+
+    from irwkv.distributed.weight_transfer import (
+        ParamMeta,
+        WeightSource,
+        WeightTransferTrainerFactory,
+    )
+    from irwkv.distributed.weight_transfer.clients import _json_safe_update_payload
+    from irwkv.distributed.weight_transfer.ipc_engine import IPCTrainerInitInfo
+    from irwkv.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo
+    from irwkv.utils.network_utils import get_open_port
+
+    if backend == "nccl" and torch.accelerator.device_count() < 2:
+        pytest.skip("NCCL weight transfer requires two GPUs")
+    monkeypatch.setenv("IRWKV_ALLOW_INSECURE_SERIALIZATION", "1")
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    files = sorted(
+        os.path.join(model_path, name)
+        for name in os.listdir(model_path)
+        if name.endswith(".safetensors")
+    )
+
+    class CheckpointSource(WeightSource):
+        modified = False
+
+        def metadata(self):
+            result = []
+            for path in files:
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        tensor = f.get_tensor(name)
+                        result.append(
+                            ParamMeta(name, tensor.dtype, tuple(tensor.shape))
+                        )
+            return result
+
+        def __iter__(self):
+            for path in files:
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        tensor = f.get_tensor(name).to("cuda")
+                        if self.modified:
+                            if name == "lm_head.weight":
+                                tensor = -tensor
+                            elif name in {
+                                "model.embedding_norm.weight",
+                                "model.layers.1.linear_attn.w1",
+                                "model.layers.1.mlp.value.weight",
+                            }:
+                                tensor = tensor * 0.5
+                        yield name, tensor
+
+    class Client:
+        def __init__(self, llm):
+            self.llm = llm
+
+        def init_weight_transfer_engine(self, init_info):
+            self.llm.collective_rpc(
+                "init_weight_transfer_engine",
+                timeout=600,
+                kwargs={"init_info": init_info},
+            )
+
+        def start_weight_update(self):
+            self.llm.collective_rpc("start_weight_update", timeout=600)
+
+        def update_weights(self, update_info):
+            self.llm.collective_rpc(
+                "update_weights",
+                timeout=600,
+                kwargs={"update_info": _json_safe_update_payload(update_info)},
+            )
+
+        def finish_weight_update(self, weight_version=None):
+            self.llm.collective_rpc("finish_weight_update", timeout=600)
+
+    def snapshot(worker):
+        model = worker.model_runner.get_model()
+        layer = model.model.layers[1]
+        manager = worker.model_runner.cudagraph_manager
+        sampler = worker.model_runner.model_state._sampler
+        importer = getattr(worker.weight_transfer_engine, "_packed_importer", None)
+        return {
+            "pointers": (
+                model.model.embed_tokens.weight.data_ptr(),
+                model.lm_head.weight.data_ptr(),
+                layer.mlp.value.weight.data_ptr(),
+                layer.linear_attn.w1_canonical.data_ptr(),
+            ),
+            "graph_ids": tuple(id(graph) for graph in manager.graphs.values()),
+            "sampler_graph_ids": tuple(
+                id(graph) for graph in sampler._sampling_graphs.values()
+            ),
+            "canonical_equal": torch.equal(
+                layer.linear_attn.w1_canonical, layer.linear_attn.w1.T
+            ),
+            "w1_sum": layer.linear_attn.w1.float().abs().sum().item(),
+            "value_sum": layer.mlp.value.weight.float().abs().sum().item(),
+            "embedding": model.model.embed_tokens.weight[1, :16].float().tolist(),
+            "ipc_released": importer is None or importer._entry is None,
+        }
+
+    def set_graph_enabled(worker, enabled):
+        worker.model_runner.cudagraph_manager._graphs_captured = enabled
+
+    params = SamplingParams(
+        temperature=0,
+        top_k=1,
+        max_tokens=4,
+        ignore_eos=True,
+        logprobs=1,
+        presence_penalty=0,
+        frequency_penalty=0,
+        penalty_decay=1,
+        detokenize=False,
+    )
+    fast_params = params.clone()
+    fast_params.logprobs = None
+    prompt = {"prompt_token_ids": list(range(1, 74))}
+    with irwkv_runner(
+        model_path,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.25,
+        num_gpu_blocks_override=64,
+        block_size=32,
+        mamba_ssm_cache_dtype="float32",
+        enable_prefix_caching=True,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+        weight_transfer_config={"backend": backend},
+    ) as runner:
+        llm = runner.llm
+        baseline = llm.generate([prompt], params, use_tqdm=False)[0]
+        assert llm.generate([prompt], params, use_tqdm=False)[0].num_cached_tokens > 0
+        before = llm.collective_rpc(snapshot)[0]
+        assert before["graph_ids"] and before["sampler_graph_ids"]
+        torch.accelerator.set_device_index(1 if backend == "nccl" else 0)
+        source = CheckpointSource()
+        if backend == "nccl":
+            info = NCCLTrainerInitInfo(
+                rank=0,
+                master_address="127.0.0.1",
+                master_port=get_open_port(),
+                world_size=2,
+                packed_buffer_size_bytes=512 * 1024**2,
+            )
+        else:
+            info = IPCTrainerInitInfo(
+                rank=0, packed=True, packed_buffer_size_bytes=512 * 1024**2
+            )
+        trainer = WeightTransferTrainerFactory.trainer_init(
+            info, client=Client(llm), source=source
+        )
+        try:
+            for modified in (False, True):
+                source.modified = modified
+                trainer.send_weights()
+                after = llm.collective_rpc(snapshot)[0]
+                assert after["pointers"] == before["pointers"]
+                assert after["graph_ids"] == before["graph_ids"]
+                assert after["sampler_graph_ids"] == before["sampler_graph_ids"]
+                assert after["canonical_equal"] and after["ipc_released"]
+                if modified:
+                    assert after["w1_sum"] == pytest.approx(before["w1_sum"] / 2)
+                    assert after["value_sum"] == pytest.approx(before["value_sum"] / 2)
+                    assert after["embedding"] != before["embedding"]
+
+                assert llm.reset_prefix_cache()
+                graph = llm.generate([prompt], params, use_tqdm=False)[0]
+                assert graph.num_cached_tokens == 0
+                assert llm.reset_prefix_cache()
+                fast = llm.generate([prompt], fast_params, use_tqdm=False)[0]
+                assert fast.outputs[0].token_ids == graph.outputs[0].token_ids
+                assert llm.reset_prefix_cache()
+                llm.collective_rpc(set_graph_enabled, args=(False,))
+                eager = llm.generate([prompt], params, use_tqdm=False)[0]
+                llm.collective_rpc(set_graph_enabled, args=(True,))
+                assert eager.outputs[0].token_ids == graph.outputs[0].token_ids
+                for token, graph_probs, eager_probs in zip(
+                    graph.outputs[0].token_ids,
+                    graph.outputs[0].logprobs,
+                    eager.outputs[0].logprobs,
+                ):
+                    assert graph_probs[token].logprob == pytest.approx(
+                        eager_probs[token].logprob, abs=1e-3
+                    )
+                if not modified:
+                    assert graph.outputs[0].token_ids == baseline.outputs[0].token_ids
+                    for token, before_probs, after_probs in zip(
+                        baseline.outputs[0].token_ids,
+                        baseline.outputs[0].logprobs,
+                        graph.outputs[0].logprobs,
+                    ):
+                        assert after_probs[token].logprob == pytest.approx(
+                            before_probs[token].logprob, abs=1e-3
+                        )
+                else:
+                    assert graph.outputs[0].token_ids != baseline.outputs[0].token_ids
+        finally:
+            trainer.shutdown()
 
 
 @pytest.mark.skipif(

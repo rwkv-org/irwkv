@@ -1151,6 +1151,40 @@ def test_ipc_weight_transfer_between_processes(mode: str):
     )
 
 
+def test_ipc_releases_imported_buffer_when_reload_finalization_fails():
+    class FailingModel(torch.nn.Module):
+        def finalize_weight_reload(self):
+            raise ValueError("invalid checkpoint update")
+
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"),
+        create_mock_irwkv_config(),
+        torch.device("cpu"),
+        FailingModel(),
+    )
+    engine._packed_importer._entry = ((), torch.ones(1))
+
+    with pytest.raises(ValueError, match="invalid checkpoint update"):
+        engine.finish_weight_update()
+
+    assert engine._packed_importer._entry is None
+
+
+def test_ipc_releases_imported_buffer_when_update_fails():
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"),
+        create_mock_irwkv_config(),
+        torch.device("cpu"),
+        torch.nn.Module(),
+    )
+    engine._packed_importer._entry = ((), torch.ones(1))
+
+    with pytest.raises(ValueError, match="Invalid update_info"):
+        engine.update_weights({})
+
+    assert engine._packed_importer._entry is None
+
+
 def test_ipc_receive_weights_missing_gpu_uuid_raises():
     """Test that receive_weights raises if GPU UUID not found in IPC handles."""
     if torch.accelerator.device_count() < 1:

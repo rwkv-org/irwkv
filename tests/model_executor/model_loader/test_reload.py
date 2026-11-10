@@ -14,7 +14,9 @@ from irwkv.model_executor.layers.attention_layer_base import AttentionLayerBase
 from irwkv.model_executor.layers.linear import QKVParallelLinear
 from irwkv.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
+    finalize_weight_reload,
     initialize_layerwise_reload,
+    initialize_weight_reload,
     record_metadata_for_reloading,
 )
 from irwkv.model_executor.model_loader.reload.meta import (
@@ -316,14 +318,14 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     }
 
     record_metadata_for_reloading(model)
-    initialize_layerwise_reload(model)
+    initialize_weight_reload(model)
     # Mimic real load_weights: resolve params once, then load in checkpoint
     # order with D last (the param that was dropped).
     params = dict(layer.named_parameters())
     for name in ("A", "dt_bias", "D"):
         param = params[name]
         param.weight_loader(param, loaded[name])
-    finalize_layerwise_reload(model, model_config=None)
+    finalize_weight_reload(model, model_config=None)
 
     assert torch.equal(layer.A, -torch.exp(loaded["A"]))
     assert torch.equal(layer.dt_bias, loaded["dt_bias"])

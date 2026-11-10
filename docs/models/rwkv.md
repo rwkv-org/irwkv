@@ -228,6 +228,21 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+## Online weight updates
+
+RWKV-7 supports checkpoint-format updates through the native `nccl` and `ipc`
+weight-transfer backends. Configure the backend with `--weight-transfer-config`
+and use the existing `init_weight_transfer_engine`, `start_weight_update`,
+`update_weights`, and `finish_weight_update` lifecycle. Pause generation while
+weights are being updated; use the existing prefix-cache reset when old cached
+states should not be reused.
+
+Send weights in checkpoint layout, including the original channel-mix value
+projection. The receiver updates the runtime projection, folded embedding and
+canonical low-rank buffers in place, preserving the addresses used by captured
+CUDA graphs. When embedding normalization is folded, an update that changes its
+weight or bias must include `model.embed_tokens.weight` in the same update.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes
