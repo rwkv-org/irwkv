@@ -29,10 +29,6 @@ class RwkvStateSpec(MambaSpec):
     def requires_block_zeroing(self) -> bool:
         return True
 
-    @property
-    def retains_latest_checkpoint(self) -> bool:
-        return True
-
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
