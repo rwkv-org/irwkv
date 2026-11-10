@@ -1997,6 +1997,78 @@ class MambaManager(SingleTypeKVCacheManager):
         return partial_hash
 
 
+class RwkvStateManager(MambaManager):
+    """Mamba manager that also keeps each RWKV request's latest committed state.
+
+    Sparse retention drops decode boundaries that are neither replay nor
+    periodic checkpoints, so a client resending the full history would recompute
+    the previous reply. In align mode this manager also caches the newest
+    committed boundary as an evictable block; a newer boundary of the same
+    request replaces it. These blocks are not offered to KV connectors, since
+    the next boundary supersedes them.
+    """
+
+    def __init__(
+        self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+    ) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self._latest_checkpoints: dict[
+            str, tuple[KVCacheBlock, BlockHashWithGroupId]
+        ] = {}
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        # The checkpoint stays in the evictable pool after the request ends.
+        self._latest_checkpoints.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
+        num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
+        num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+        if (
+            self.mamba_cache_mode == "align"
+            and num_cached_blocks_after > num_cached_blocks_before
+        ):
+            self._update_latest_checkpoint(request, num_cached_blocks_after - 1)
+
+    def _update_latest_checkpoint(self, request: Request, block_idx: int) -> None:
+        blocks = self.req_to_blocks[request.request_id]
+        block = blocks[block_idx]
+        if block.is_null:
+            return
+        previous = self._latest_checkpoints.pop(request.request_id, None)
+        if previous is not None:
+            previous_block, previous_hash = previous
+            # The block may have been recycled since; only drop our own entry.
+            if previous_block.block_hash == previous_hash:
+                self.block_pool._maybe_evict_cached_block(previous_block)
+        if block.block_hash is not None:
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=block_idx,
+            num_full_blocks=block_idx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
+        assert block.block_hash is not None
+        self.cached_blocks_this_step.add(block.block_hash)
+        self._latest_checkpoints[request.request_id] = (block, block.block_hash)
+
+
 class CrossAttentionManager(SingleTypeKVCacheManager):
     """Manager for cross-attention KV cache in encoder-decoder models."""
 
@@ -2160,6 +2232,11 @@ def register_all_kvcache_specs(irwkv_config):
 
     KVCacheSpecRegistry.register(
         MambaSpec, MambaManager, uniform_type_base_spec=MambaSpec
+    )
+    from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
+
+    KVCacheSpecRegistry.register(
+        RwkvStateSpec, RwkvStateManager, uniform_type_base_spec=MambaSpec
     )
     KVCacheSpecRegistry.register(
         ChunkedLocalAttentionSpec,
