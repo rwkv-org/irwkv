@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     IRWKV_DEBUG_MFU_METRICS: bool = False
     IRWKV_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     IRWKV_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
+    IRWKV_RELOAD_MODE: Literal["layerwise", "direct"] = "layerwise"
     IRWKV_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
     IRWKV_WSL2_ENABLE_PIN_MEMORY: bool = False
     IRWKV_ENABLE_CUDA_COMPATIBILITY: bool = False
@@ -1793,6 +1794,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "IRWKV_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("IRWKV_USE_V2_MODEL_RUNNER", None)
     ),
+    "IRWKV_RELOAD_MODE": env_with_choices(
+        "IRWKV_RELOAD_MODE", "layerwise", ["layerwise", "direct"]
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2027,6 +2031,7 @@ def compile_factors() -> dict[str, object]:
         "IRWKV_CPU_KVCACHE_SPACE",
         "IRWKV_ZENTORCH_WEIGHT_PREPACK",
         "IRWKV_TEST_FORCE_LOAD_FORMAT",
+        "IRWKV_RELOAD_MODE",
         "IRWKV_ENABLE_CUDA_COMPATIBILITY",
         "IRWKV_CUDA_COMPATIBILITY_PATH",
         "IRWKV_SKIP_MODEL_NAME_VALIDATION",

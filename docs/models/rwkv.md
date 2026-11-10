@@ -228,6 +228,18 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+## Online weight updates
+
+RWKV-7 accepts checkpoint-format updates through the native `nccl` and `ipc`
+weight-transfer backends. Pause generation during the update and reset the
+prefix cache before reusing cached states. The `IRWKV_RELOAD_MODE` environment
+variable selects upstream-style `layerwise` (the default) or `direct` reload.
+
+When embedding normalization is folded, an update that changes its weight or
+bias must include the original `model.embed_tokens.weight` in the same update.
+If an update fails after changing weights, send a complete checkpoint update
+before resuming generation.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes
