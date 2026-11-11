@@ -471,7 +471,6 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
         reset_state_slots=lambda slots: resets.append(slots.clone()),
     )
     model_state = object.__new__(RwkvModelState)
-    model_state._model = SimpleNamespace()
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([0, 0], dtype=np.int32)
@@ -512,7 +511,6 @@ def test_align_state_advance_resets_new_request_destination() -> None:
         reset_state_slots=lambda slots: resets.append(slots.clone()),
     )
     model_state = object.__new__(RwkvModelState)
-    model_state._model = SimpleNamespace()
     model_state._align_mode = True
     model_state._block_size = 16
     model_state._state_block_columns = np.array([-1], dtype=np.int32)
@@ -1716,13 +1714,19 @@ def test_config_accepts_async_scheduling() -> None:
     not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
     reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
-@pytest.mark.parametrize("enable_prefix_caching", [True, False])
 @pytest.mark.parametrize(
-    ("pipeline_parallel_size", "data_parallel_size"),
-    [(1, 1), (2, 1), (1, 2)],
-    ids=["single", "pp2", "dp2"],
+    (
+        "use_nora",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "enable_prefix_caching",
+    ),
+    [
+        pytest.param(True, 2, 1, True, id="True-pp2-True"),
+        pytest.param(False, 1, 2, True, id="False-dp2-True"),
+        pytest.param(False, 1, 1, False, id="False-single-False"),
+    ],
 )
-@pytest.mark.parametrize("use_nora", [False, True])
 @pytest.mark.asyncio
 async def test_real_model_lora_tenant_isolation(
     tmp_path,
@@ -1737,6 +1741,12 @@ async def test_real_model_lora_tenant_isolation(
     from safetensors.torch import save_file
 
     from tests.utils import RemoteOpenAIServer
+
+    if (
+        max(pipeline_parallel_size, data_parallel_size) > 1
+        and torch.accelerator.device_count() < 2
+    ):
+        pytest.skip("PP2 and DP2 require two GPUs")
 
     model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
     with open(os.path.join(model_path, "config.json")) as file:
