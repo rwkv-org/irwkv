@@ -25,6 +25,12 @@ def register_api_routers(
 
     register_models_api_router(app)
 
+    from irwkv.entrypoints.serve.lora.api_router import (
+        attach_router as register_lora_api_router,
+    )
+
+    register_lora_api_router(app)
+
     from irwkv.entrypoints.serve.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )

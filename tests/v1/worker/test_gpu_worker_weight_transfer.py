@@ -48,9 +48,16 @@ class _RecordingEngine:
 class _RecordingModelRunner:
     def __init__(self) -> None:
         self.seen_config: IrwkvConfig | None = None
+        self.lora_hooks: list[str] = []
 
     def reload_weights(self) -> None:
         self.seen_config = get_current_irwkv_config()
+
+    def deactivate_loras(self) -> None:
+        self.lora_hooks.append("deactivate")
+
+    def reset_lora_state(self) -> None:
+        self.lora_hooks.append("refresh")
 
 
 def _make_worker(engine: _RecordingEngine | None) -> Worker:
@@ -72,11 +79,13 @@ def test_reload_weights_sets_current_config():
     assert model_runner.seen_config is worker.irwkv_config
 
 
-def test_start_update_finish_delegates_to_engine():
+def test_start_update_finish_delegates_to_engine(monkeypatch):
+    monkeypatch.setenv("IRWKV_ALLOW_RUNTIME_LORA_UPDATING", "0")
     engine = _RecordingEngine()
     worker = _make_worker(engine)
 
     Worker.start_weight_update(worker)
+    assert worker.model_runner.lora_hooks == ["deactivate"]
     assert engine.started is True
     assert worker._weight_update_active is True
 
@@ -85,6 +94,7 @@ def test_start_update_finish_delegates_to_engine():
     assert worker._weight_update_active is True
 
     Worker.finish_weight_update(worker)
+    assert worker.model_runner.lora_hooks == ["deactivate", "refresh"]
     assert engine.finished is True
     assert engine.reset_count == 1
     assert worker._weight_update_active is False

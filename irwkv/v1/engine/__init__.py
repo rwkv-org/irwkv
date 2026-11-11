@@ -11,6 +11,7 @@ import msgspec
 import torch
 
 from irwkv.config.kv_events import KVEventsConfig
+from irwkv.lora.request import LoRARequest
 from irwkv.multimodal.inputs import MultiModalFeatureSpec
 from irwkv.sampling_params import SamplingParams
 from irwkv.v1.kv_hints import KvHintsEnvelope
@@ -137,6 +138,7 @@ class EngineCoreRequest(
 
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
+    lora_request: LoRARequest | None = None
 
     @property
     def params(self) -> SamplingParams:

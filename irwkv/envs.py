@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     IRWKV_USE_RUST_BENCH: bool = False
     IRWKV_RUST_FRONTEND_PATH: str | None = "auto"
     IRWKV_SERVER_DEV_MODE: bool = False
+    IRWKV_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     IRWKV_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     IRWKV_RAY_PER_WORKER_GPUS: float = 1.0
     IRWKV_RAY_BUNDLE_INDICES: str = ""
@@ -1273,6 +1274,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "IRWKV_SERVER_DEV_MODE": lambda: bool(int(os.getenv("IRWKV_SERVER_DEV_MODE", "0"))),
+    "IRWKV_ALLOW_RUNTIME_LORA_UPDATING": lambda: bool(
+        int(os.getenv("IRWKV_ALLOW_RUNTIME_LORA_UPDATING", "0"))
+    ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high

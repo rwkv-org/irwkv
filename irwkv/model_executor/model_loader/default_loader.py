@@ -17,6 +17,7 @@ from irwkv.config import ModelConfig
 from irwkv.config.load import LoadConfig
 from irwkv.logger import init_logger
 from irwkv.model_executor.model_loader.base_loader import BaseModelLoader
+from irwkv.model_executor.model_loader.utils import get_missing_weights
 from irwkv.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -414,9 +415,8 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
         loaded_weights: set[str] | None,
     ) -> None:
-        weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
+            weights_not_loaded = get_missing_weights(model, loaded_weights)
             if weights_not_loaded:
                 raise ValueError(
                     "Following weights were not initialized from "

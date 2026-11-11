@@ -47,6 +47,7 @@ from irwkv.config import (
     KVTransferConfig,
     LoadConfig,
     LoggingConfig,
+    LoRAConfig,
     MambaConfig,
     ModelConfig,
     MultiModalConfig,
@@ -560,6 +561,7 @@ class EngineArgs:
     code_revision: str | None = ModelConfig.code_revision
     hf_token: bool | str | None = ModelConfig.hf_token
     hf_overrides: HfOverrides = get_field(ModelConfig, "hf_overrides")
+    max_cpu_loras: int = get_field(LoRAConfig, "max_cpu_loras")
     model_class_overrides: dict[str, str] = get_field(
         ModelConfig, "model_class_overrides"
     )
@@ -872,6 +874,12 @@ class EngineArgs:
         model_group.add_argument("--config-format", **model_kwargs["config_format"])
         model_group.add_argument("--hf-token", **model_kwargs["hf_token"])
         model_group.add_argument("--hf-overrides", **model_kwargs["hf_overrides"])
+        lora_group = parser.add_argument_group(
+            title="LoRAConfig", description=LoRAConfig.__doc__
+        )
+        lora_group.add_argument(
+            "--max-cpu-loras", **get_kwargs(LoRAConfig)["max_cpu_loras"]
+        )
         model_group.add_argument(
             "--model-class-overrides", **model_kwargs["model_class_overrides"]
         )
@@ -2391,6 +2399,11 @@ class EngineArgs:
 
         config = IrwkvConfig(
             model_config=model_config,
+            lora_config=(
+                LoRAConfig(max_cpu_loras=self.max_cpu_loras)
+                if getattr(model_config.hf_config, "rwkv_lora", None) is not None
+                else None
+            ),
             cache_config=cache_config,
             parallel_config=parallel_config,
             scheduler_config=scheduler_config,

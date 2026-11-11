@@ -31,6 +31,13 @@ from irwkv.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
+def get_missing_weights(model: nn.Module, loaded_weights: set[str]) -> set[str]:
+    missing = {name for name, _ in model.named_parameters()} - loaded_weights
+    if missing and hasattr(model, "get_checkpoint_optional_weights"):
+        missing.difference_update(model.get_checkpoint_optional_weights(loaded_weights))
+    return missing
+
+
 @instrument(span_name="Initialize model")
 def initialize_model(
     irwkv_config: IrwkvConfig,

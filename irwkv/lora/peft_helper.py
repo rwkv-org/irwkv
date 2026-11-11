@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Adapted from: https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/config.py
+
+import math
+from dataclasses import MISSING, dataclass, field, fields
+from typing import Any, Literal
+
+from irwkv.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class PEFTHelper:
+    """A helper class for PEFT configurations, specifically designed for LoRA.
+    This class handles configuration validation, compatibility checks for
+    various LoRA implementations.
+    """
+
+    # Required fields
+    r: int
+    lora_alpha: int
+    target_modules: list[str] | str
+
+    bias: Literal["none"] = field(default="none")
+    modules_to_save: list[str] | None = field(default=None)
+    # True to use Rank-Stabilized LoRA (rsLoRA, see: https://arxiv.org/abs/2312.03732)
+    use_rslora: bool = field(default=False)
+    # True to use Weight-Decomposed Low-Rank Adaptation (DoRA, see: https://arxiv.org/abs/2402.09353)
+    use_dora: bool = field(default=False)
+    # PEFT features that change the adapter's semantics and that vLLM does not
+    # implement. They are read only to reject such adapters.
+    lora_bias: bool = field(default=False)
+    init_lora_weights: bool | str = field(default=True)
+    alora_invocation_tokens: list[int] | None = field(default=None)
+    layer_replication: list[list[int]] | None = field(default=None)
+    use_bdlora: dict | None = field(default=None)
+    use_qalora: bool = field(default=False)
+    # Extra vllm field, start with 'vllm_' to avoid conflict
+    vllm_lora_scaling_factor: float = field(default=1.0)
+
+    def _validate_features(self) -> list[str]:
+        """Check if there are any unsupported LoRA features."""
+        error_msg = []
+        if self.modules_to_save:
+            unsupported_modules = [
+                m for m in self.modules_to_save if m not in ["classifier", "score"]
+            ]
+            if unsupported_modules:
+                error_msg.append(
+                    "vLLM only supports modules_to_save being either None "
+                    'or ["classifier", "score"] for classification models. '
+                    f"Unsupported modules_to_save: {unsupported_modules}"
+                )
+        if self.use_dora:
+            error_msg.append("vLLM does not yet support DoRA.")
+        if self.lora_bias:
+            error_msg.append("vLLM does not support LoRA bias (lora_bias).")
+        if not self._init_is_supported():
+            error_msg.append(
+                f"vLLM does not support init_lora_weights={self.init_lora_weights!r}."
+                " Inits such as PiSSA, OLoRA, CorDA and LoftQ modify the base model"
+                " weights when PEFT loads the adapter. Convert it to a regular LoRA"
+                " adapter with PEFT's path_initial_model_for_weight_conversion, or"
+                " set init_lora_weights to true if the served base model already"
+                " contains the modified weights."
+            )
+        if self.alora_invocation_tokens:
+            error_msg.append("vLLM does not support Activated LoRA (aLoRA).")
+        if self.layer_replication:
+            error_msg.append("vLLM does not support layer_replication.")
+        if self.use_bdlora:
+            error_msg.append("vLLM does not support block-diagonal LoRA (BD-LoRA).")
+        if self.use_qalora:
+            error_msg.append("vLLM does not support QALoRA.")
+        return error_msg
+
+    def _init_is_supported(self) -> bool:
+        # These inits only set the initial adapter weights, so a saved adapter
+        # loads in PEFT as a plain LoRA. lora_ga modifies the base weights only
+        # during training, when its gradients are attached.
+        init = self.init_lora_weights
+        return not isinstance(init, str) or init.lower() in (
+            "gaussian",
+            "eva",
+            "orthogonal",
+            "mica",
+            "lora_ga",
+        )
+
+    def __post_init__(self):
+        if self.r <= 0:
+            raise ValueError(f"LoRA rank `r` must be a positive integer, got {self.r}.")
+        if self.use_rslora:
+            logger.info_once("Loading LoRA weights trained with rsLoRA.")
+            self.vllm_lora_scaling_factor = self.lora_alpha / math.sqrt(self.r)
+        else:
+            self.vllm_lora_scaling_factor = self.lora_alpha / self.r
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> "PEFTHelper":
+        # Get all field information from the class
+        class_fields = {f.name: f for f in fields(cls)}
+        # Check for required fields
+        required_fields = {
+            name
+            for name, f in class_fields.items()
+            if f.default is MISSING and f.default_factory is MISSING
+        }
+
+        # Identify any missing required fields
+        missing_fields = required_fields - set(config_dict.keys())
+        if missing_fields:
+            raise ValueError(f"Missing required configuration fields: {missing_fields}")
+
+        # Filter out fields that aren't defined in the class
+        filtered_dict = {k: v for k, v in config_dict.items() if k in class_fields}
+        return cls(**filtered_dict)
+
+    def validate_legal(self, lora_config: Any) -> None:
+        """Validates the LoRA configuration settings against application
+        constraints and requirements.
+        """
+        error_msg = self._validate_features()
+        if self.r > lora_config.max_lora_rank:
+            error_msg.append(
+                f"LoRA rank {self.r} is greater than max_lora_rank"
+                f" {lora_config.max_lora_rank}."
+            )
+        if self.bias != "none":
+            error_msg.append("Adapter bias is not supported.")
+        if error_msg:
+            raise ValueError(f"{' '.join(error_msg)}")

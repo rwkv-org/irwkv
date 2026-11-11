@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import json
 import os
 import sys
@@ -1064,13 +1065,72 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
     assert model.lm_head.lora_scale == 2.0
     assert model.lm_head.use_nora
 
+    loaded = model.load_weights(
+        (name, param.T if name.endswith(".mlp.value.weight") else param)
+        for name, param in base.named_parameters()
+    )
+    assert loaded == {name for name, _ in base.named_parameters()}
+    assert all(not param.any() for param in adapters.values())
+
     weights = {name: torch.randn(shape) for name, shape in expected.items()}
+    first_name = next(iter(weights))
+    assert model.load_weights([(first_name, weights[first_name])]) == {first_name}
     storage = {name: param.data_ptr() for name, param in adapters.items()}
     assert model.load_weights(weights.items()) == set(expected)
     for name, param in adapters.items():
         assert param.data_ptr() == storage[name]
         assert param.dtype == torch.float32
         assert torch.equal(param, weights[name])
+
+
+@pytest.mark.usefixtures("_single_rank")
+def test_lora_snapshots_switch_without_replacing_buffers(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    from irwkv.lora.request import LoRARequest
+    from irwkv.lora.worker_manager import WorkerLoRAManager
+
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(_LORA))
+    manager = WorkerLoRAManager(model, max_cpu_loras=1)
+    pointers = (
+        model.lm_head.lora_A.weight.data_ptr(),
+        model.lm_head.lora_B.weight.data_ptr(),
+    )
+    for index in (1, 2):
+        path = tmp_path / str(index)
+        path.mkdir()
+        (path / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "r": 4,
+                    "lora_alpha": 8,
+                    "target_modules": ["lm_head"],
+                    "use_nora": True,
+                }
+            )
+        )
+        save_file(
+            {
+                "base_model.model.lm_head.lora_A.weight": torch.full((4, 128), index),
+                "base_model.model.lm_head.lora_B.weight": torch.full((256, 4), index),
+            },
+            str(path / "adapter_model.safetensors"),
+        )
+        assert manager.add_adapter(
+            LoRARequest("tenant", index, str(path), load_inplace=index == 2)
+        )
+
+    manager.set_active_adapter(1)
+    assert torch.all(model.lm_head.lora_B.weight == 1)
+    manager.set_active_adapter(2)
+    assert torch.all(model.lm_head.lora_B.weight == 2)
+    assert manager.remove_adapter(1)
+    manager.set_active_adapter(None)
+    assert not model.lm_head.lora_B.weight.any()
+    assert pointers == (
+        model.lm_head.lora_A.weight.data_ptr(),
+        model.lm_head.lora_B.weight.data_ptr(),
+    )
 
 
 @pytest.mark.usefixtures("_single_rank")
@@ -1396,6 +1456,7 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
         sampling_params=None,
         num_computed_tokens=0,
         block_ids=[],
+        lora_request=None,
     )
     GPUModelRunner.add_requests(runner, SimpleNamespace(scheduled_new_reqs=[request]))
     runner._remove_request.assert_not_called()
@@ -1647,6 +1708,237 @@ def test_config_accepts_async_scheduling() -> None:
     irwkv_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(irwkv_config)
     assert irwkv_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize(
+    (
+        "use_nora",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "enable_prefix_caching",
+    ),
+    [
+        pytest.param(True, 2, 1, True, id="True-pp2-True"),
+        pytest.param(False, 1, 2, True, id="False-dp2-True"),
+        pytest.param(False, 1, 1, False, id="False-single-False"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_real_model_lora_tenant_isolation(
+    tmp_path,
+    enable_prefix_caching: bool,
+    pipeline_parallel_size: int,
+    data_parallel_size: int,
+    use_nora: bool,
+) -> None:
+    from shutil import copyfile
+
+    import httpx
+    from safetensors.torch import save_file
+
+    from tests.utils import RemoteOpenAIServer
+
+    if (
+        max(pipeline_parallel_size, data_parallel_size) > 1
+        and torch.accelerator.device_count() < 2
+    ):
+        pytest.skip("PP2 and DP2 require two GPUs")
+
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    with open(os.path.join(model_path, "config.json")) as file:
+        config = json.load(file)
+    hidden_size, vocab_size = config["hidden_size"], config["vocab_size"]
+    generator = torch.Generator().manual_seed(123)
+    a_head = torch.randn((4, hidden_size), generator=generator)
+    a_receptance = torch.randn((4, hidden_size), generator=generator)
+    paths = []
+    for direction in (1, -1):
+        path = tmp_path / str(direction)
+        path.mkdir()
+        (path / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "r": 4,
+                    "lora_alpha": 4,
+                    "target_modules": ["r_proj", "lm_head"],
+                    "use_nora": use_nora,
+                }
+            )
+        )
+        b_head = torch.zeros((vocab_size, 4))
+        b_head[42, 0], b_head[43, 0] = 10000 * direction, -10000 * direction
+        receptance = "base_model.model.model.layers.0.linear_attn.r_proj"
+        save_file(
+            {
+                "base_model.model.lm_head.lora_A.weight": a_head,
+                "base_model.model.lm_head.lora_B.weight": b_head,
+                f"{receptance}.lora_A.weight": a_receptance,
+                f"{receptance}.lora_B.weight": torch.full(
+                    (hidden_size, 4), 0.001 * direction
+                ),
+            },
+            str(path / "adapter_model.safetensors"),
+        )
+        paths.append(path)
+
+    args = [
+        "--served-model-name",
+        "base",
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "512",
+        "--max-num-batched-tokens",
+        "128",
+        "--max-num-seqs",
+        "4",
+        "--pipeline-parallel-size",
+        str(pipeline_parallel_size),
+        "--data-parallel-size",
+        str(data_parallel_size),
+        "--api-server-count",
+        "1",
+        "--max-cpu-loras",
+        "2",
+        "--gpu-memory-utilization",
+        "0.25",
+        "--num-gpu-blocks-override",
+        "64",
+        "--block-size",
+        "32",
+        "--mamba-ssm-cache-dtype",
+        "float32",
+        "--enable-prefix-caching"
+        if enable_prefix_caching
+        else "--no-enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--compilation-config",
+        '{"cudagraph_capture_sizes":[1,2,4]}',
+    ]
+    overrides = {
+        "rwkv_lora": {
+            "r": 4,
+            "lora_alpha": 4,
+            "use_nora": use_nora,
+            "target_modules": ["r_proj", "lm_head"],
+        }
+    }
+    with RemoteOpenAIServer(
+        model_path,
+        args,
+        env_dict={
+            "IRWKV_ALLOW_RUNTIME_LORA_UPDATING": "1",
+            "IRWKV_RWKV_TUNING_MODE": "inspect",
+        },
+        override_hf_configs=overrides,
+        max_wait_seconds=300,
+    ) as server:
+        async with httpx.AsyncClient(base_url=server.url_root, timeout=120) as client:
+
+            async def load(name: str, path, inplace: bool = False):
+                response = await client.post(
+                    "/v1/load_lora_adapter",
+                    json={
+                        "lora_name": name,
+                        "lora_path": str(path),
+                        "load_inplace": inplace,
+                    },
+                )
+                assert response.status_code == 200, response.text
+
+            async def generate(name: str, max_tokens: int = 4):
+                response = await client.post(
+                    "/v1/completions",
+                    json={
+                        "model": name,
+                        "prompt": list(range(1, 74)),
+                        "max_tokens": max_tokens,
+                        "temperature": 0,
+                        "logprobs": 1,
+                        "return_token_ids": True,
+                        "ignore_eos": True,
+                        "session_id": name,
+                    },
+                )
+                assert response.status_code == 200, response.text
+                return response.json()["choices"][0]["token_ids"]
+
+            if pipeline_parallel_size == 2:
+                response = await client.post(
+                    "/v1/load_lora_adapter",
+                    json={
+                        "lora_name": "tenant-a",
+                        "lora_path": str(tmp_path / "absent"),
+                    },
+                )
+                assert response.status_code == 404, response.text
+
+            await load("tenant-a", paths[0])
+            await load("tenant-b", paths[1])
+            baseline = await generate("base")
+            first = await generate("tenant-a")
+            second = await generate("tenant-b")
+            assert first != second
+            mixed = await asyncio.gather(
+                *(
+                    generate(name)
+                    for name in ("tenant-a", "tenant-b", "base", "tenant-a", "tenant-b")
+                )
+            )
+            assert mixed == [first, second, baseline, first, second]
+            expected_stream = await generate("tenant-a", max_tokens=256)
+            async with client.stream(
+                "POST",
+                "/v1/completions",
+                json={
+                    "model": "tenant-a",
+                    "prompt": list(range(1, 74)),
+                    "max_tokens": 256,
+                    "temperature": 0,
+                    "return_token_ids": True,
+                    "ignore_eos": True,
+                    "stream": True,
+                    "session_id": "tenant-a",
+                },
+            ) as response:
+                assert response.status_code == 200
+                stream_tokens: list[int] = []
+                reloaded = False
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    choice = json.loads(line[6:])["choices"][0]
+                    stream_tokens.extend(choice["token_ids"] or [])
+                    if stream_tokens and not reloaded:
+                        assert choice["finish_reason"] is None
+                        copyfile(
+                            paths[1] / "adapter_model.safetensors",
+                            paths[0] / "adapter_model.safetensors",
+                        )
+                        await load("tenant-a", paths[0], inplace=True)
+                        reloaded = True
+                assert reloaded
+                assert stream_tokens == expected_stream
+            assert await generate("tenant-a") == second
+            response = await client.post(
+                "/v1/unload_lora_adapter", json={"lora_name": "tenant-a"}
+            )
+            assert response.status_code == 200
+            response = await client.post(
+                "/v1/completions",
+                json={
+                    "model": "tenant-a",
+                    "prompt": [1, 2],
+                    "max_tokens": 1,
+                },
+            )
+            assert response.status_code == 404
+            assert await generate("tenant-b") == second
+            assert await generate("base") == baseline
 
 
 @pytest.mark.skipif(

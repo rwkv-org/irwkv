@@ -10,6 +10,7 @@ import numpy as np
 from irwkv import CompletionOutput, RequestOutput
 from irwkv.engine.protocol import EngineClient
 from irwkv.inputs import EngineInput
+from irwkv.lora.request import LoRARequest
 from irwkv.renderers import BaseRenderer
 from irwkv.sampling_params import BeamSearchParams, SamplingParams
 from irwkv.utils import random_uuid
@@ -31,6 +32,7 @@ class BeamSearchOnlineMixin(ABC):
         params: BeamSearchParams,
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
@@ -89,12 +91,19 @@ class BeamSearchOnlineMixin(ABC):
                             request_id_item,
                             trace_headers=trace_headers,
                             session_id=session_id,
+                            lora_request=lora_request,
                         )
                     )
                 )
                 tasks.append(task)
 
-            output = [x[0] for x in await asyncio.gather(*tasks)]
+            try:
+                output = [x[0] for x in await asyncio.gather(*tasks)]
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
             for result in output:
                 # check for error finish reason and abort beam search

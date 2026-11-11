@@ -15,6 +15,7 @@ from irwkv.inputs import (
     split_enc_dec_input,
 )
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from irwkv.multimodal.inputs import MultiModalFeatureSpec
 from irwkv.multimodal.utils import argsort_mm_positions
@@ -267,7 +268,10 @@ class InputProcessor:
         resumable: bool = False,
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> EngineCoreRequest:
+        if lora_request is not None and self.irwkv_config.lora_config is None:
+            raise IRWKVValidationError("LoRA is not enabled")
         watermarking = self._validate_params(params, supported_tasks)
         parallel_config = self.irwkv_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -412,6 +416,7 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
             kv_hints=kv_hints,
+            lora_request=lora_request,
         )
 
     def _validate_prompt_len(

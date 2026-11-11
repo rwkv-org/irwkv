@@ -318,7 +318,10 @@ class OpenAIServingChat(GenerateBaseServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        model_name = self.models.model_name()
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
+        model_name = self.models.model_name(lora_request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -379,6 +382,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     params=sampling_params,
                     trace_headers=trace_headers,
                     session_id=session_id,
+                    lora_request=lora_request,
                 )
             else:
                 generator = self.engine_client.generate(
@@ -389,6 +393,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    lora_request=lora_request,
                     **self._engine_reasoning_kwargs(
                         request, parser, chat_template_kwargs, prompt_token_ids
                     ),
@@ -398,6 +403,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+        result_generator = await self._with_lora(lora_request, result_generator)
 
         if request.stream:
             return self.chat_completion_stream_generator(

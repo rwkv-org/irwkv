@@ -129,6 +129,14 @@ class ServeSubcommand(CLISubcommand):
             )
             args.api_server_count = 1
 
+        if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING and (
+            is_multi_port
+            or rust_frontend_path
+            or args.api_server_count != 1
+            or ((is_external_lb or is_hybrid_lb) and args.data_parallel_size > 1)
+        ):
+            raise ValueError("Dynamic LoRA requires a single Python API server")
+
         if is_multi_port:
             run_dp_supervisor(args)
         elif args.api_server_count < 1:

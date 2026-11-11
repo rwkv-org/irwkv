@@ -1126,6 +1126,15 @@ class RwkvForCausalLM(
             self._reload_names.update(loaded)
         return loaded
 
+    def get_checkpoint_optional_weights(self, loaded_weights: set[str]) -> set[str]:
+        adapter_weights = {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith((".lora_A.weight", ".lora_B.weight"))
+        }
+        # A base checkpoint can omit the zero-initialized adapter as a whole.
+        return adapter_weights if adapter_weights.isdisjoint(loaded_weights) else set()
+
     def process_weights_after_loading(self) -> None:
         embedding_name = "model.embed_tokens.weight"
         loaded = self._reload_names if self._weights_processed else None
