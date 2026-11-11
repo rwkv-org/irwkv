@@ -405,8 +405,11 @@ class GPUModelRunner:
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         if self.lora_manager is None:
+            lora_config = self.irwkv_config.lora_config
+            if lora_config is None:
+                raise ValueError("LoRA is not enabled")
             self.lora_manager = WorkerLoRAManager(
-                self.get_model(), self.model_config.max_cpu_loras
+                self.get_model(), lora_config.max_cpu_loras
             )
         return self.lora_manager.add_adapter(lora_request)
 

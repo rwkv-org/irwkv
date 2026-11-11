@@ -270,6 +270,8 @@ class InputProcessor:
         kv_hints: KvHintsEnvelope | None = None,
         lora_request: LoRARequest | None = None,
     ) -> EngineCoreRequest:
+        if lora_request is not None and self.irwkv_config.lora_config is None:
+            raise IRWKVValidationError("LoRA is not enabled")
         watermarking = self._validate_params(params, supported_tasks)
         parallel_config = self.irwkv_config.parallel_config
         dp_size = parallel_config.data_parallel_size

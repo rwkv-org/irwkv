@@ -1350,8 +1350,7 @@ class Worker(WorkerBase):
                     "active. Call finish_weight_update first."
                 )
             try:
-                if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING:
-                    self.model_runner.deactivate_loras()
+                self.model_runner.deactivate_loras()
                 self.weight_transfer_engine.start_weight_update()
             except BaseException:
                 self.weight_transfer_engine.reset_weight_update_target()
@@ -1419,8 +1418,7 @@ class Worker(WorkerBase):
                 self.weight_transfer_engine.reset_weight_update_target()
                 self._weight_update_active = False
 
-        if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING:
-            self.model_runner.reset_lora_state()
+        self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
         gc.unfreeze()

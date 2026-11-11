@@ -210,7 +210,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             generators.append(generator)
 
-        result_generator = self._with_lora(
+        result_generator = await self._with_lora(
             lora_request, merge_async_iterators(*generators)
         )
 

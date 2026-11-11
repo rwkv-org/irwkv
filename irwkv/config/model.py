@@ -309,8 +309,6 @@ class ModelConfig:
     hf_overrides: HfOverrides = field(default_factory=dict)
     """If a dictionary, contains arguments to be forwarded to the Hugging Face
     config. If a callable, it is called to update the HuggingFace config."""
-    max_cpu_loras: int = Field(default=1, ge=1)
-    """Maximum number of resident runtime LoRA versions per worker."""
     model_class_overrides: dict[str, str] = field(default_factory=dict)
     """Override the model class used for an architecture."""
     generation_config: str = "auto"

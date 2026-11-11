@@ -403,7 +403,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
-        result_generator = self._with_lora(lora_request, result_generator)
+        result_generator = await self._with_lora(lora_request, result_generator)
 
         if request.stream:
             return self.chat_completion_stream_generator(

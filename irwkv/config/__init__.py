@@ -50,6 +50,7 @@ from irwkv.config.utils import (
 )
 from irwkv.config.irwkv import (
     IrwkvConfig,
+    LoRAConfig,
     get_cached_compilation_config,
     get_current_irwkv_config,
     get_current_irwkv_config_or_none,
@@ -127,6 +128,7 @@ __all__ = [
     "update_config",
     # From irwkv.config.irwkv
     "IrwkvConfig",
+    "LoRAConfig",
     "get_cached_compilation_config",
     "get_current_irwkv_config",
     "get_current_irwkv_config_or_none",

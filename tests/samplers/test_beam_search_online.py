@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -17,6 +18,7 @@ from irwkv.entrypoints.generate.beam_search.utils import (
     BeamSearchInstance,
     BeamSearchSequence,
 )
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.inputs import EngineInput, TokensInput
 from irwkv.logprobs import Logprob, SampleLogprobs
 from irwkv.sampling_params import BeamSearchParams
@@ -235,6 +237,36 @@ async def test_beam_search_abort_returns_partial_outputs(
         assert output.logprobs is not None
         assert len(output.logprobs) == abort_after
     assert outputs[0].outputs[0].cumulative_logprob == pytest.approx(-0.1 * abort_after)
+
+
+@pytest.mark.asyncio
+async def test_beam_search_joins_siblings_before_propagating_error(monkeypatch):
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def generate(prompt, params, request_id, **kwargs):
+        if len(prompt["prompt_token_ids"]) == 1:
+            yield await anext(_EngineClient().generate(prompt, params, **kwargs))
+        elif request_id.endswith("-beam-0"):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+        else:
+            await started.wait()
+            raise IRWKVValidationError("beam rejected")
+
+    serving = _AsyncServing()
+    monkeypatch.setattr(serving.engine_client, "generate", generate)
+    prompt: TokensInput = {"type": "token", "prompt_token_ids": [1]}
+    with pytest.raises(IRWKVValidationError, match="beam rejected"):
+        await anext(
+            serving.beam_search(
+                prompt, "request", BeamSearchParams(beam_width=2, max_tokens=2)
+            )
+        )
+    assert stopped.is_set()
 
 
 @pytest.mark.asyncio

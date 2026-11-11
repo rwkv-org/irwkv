@@ -132,6 +132,14 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
+class LoRAConfig:
+    """Configuration for runtime LoRA adapters."""
+
+    max_cpu_loras: int = Field(default=1, ge=1)
+    """Number of resident adapter versions per worker before replacement."""
+
+
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class IrwkvConfig:
     """Dataclass which contains all irwkv-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -141,6 +149,8 @@ class IrwkvConfig:
     # try to download a model
     model_config: ModelConfig = None  # type: ignore[assignment]
     """Model configuration."""
+    lora_config: LoRAConfig | None = None
+    """Runtime LoRA configuration."""
     cache_config: CacheConfig = Field(default_factory=CacheConfig)
     """Cache configuration."""
     parallel_config: ParallelConfig = Field(default_factory=ParallelConfig)

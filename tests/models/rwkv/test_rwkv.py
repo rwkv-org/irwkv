@@ -1093,7 +1093,7 @@ def test_lora_snapshots_switch_without_replacing_buffers(tmp_path) -> None:
     from irwkv.lora.worker_manager import WorkerLoRAManager
 
     model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(_LORA))
-    manager = WorkerLoRAManager(model, max_cpu_loras=2)
+    manager = WorkerLoRAManager(model, max_cpu_loras=1)
     pointers = (
         model.lm_head.lora_A.weight.data_ptr(),
         model.lm_head.lora_B.weight.data_ptr(),
@@ -1118,7 +1118,9 @@ def test_lora_snapshots_switch_without_replacing_buffers(tmp_path) -> None:
             },
             str(path / "adapter_model.safetensors"),
         )
-        assert manager.add_adapter(LoRARequest("tenant", index, str(path)))
+        assert manager.add_adapter(
+            LoRARequest("tenant", index, str(path), load_inplace=index == 2)
+        )
 
     manager.set_active_adapter(1)
     assert torch.all(model.lm_head.lora_B.weight == 1)
@@ -1790,6 +1792,8 @@ async def test_real_model_lora_tenant_isolation(
         str(data_parallel_size),
         "--api-server-count",
         "1",
+        "--max-cpu-loras",
+        "2",
         "--gpu-memory-utilization",
         "0.25",
         "--num-gpu-blocks-override",
@@ -1805,7 +1809,6 @@ async def test_real_model_lora_tenant_isolation(
         "--compilation-config",
         '{"cudagraph_capture_sizes":[1,2,4]}',
     ]
-    args += ["--max-cpu-loras", "3"]
     overrides = {
         "rwkv_lora": {
             "r": 4,

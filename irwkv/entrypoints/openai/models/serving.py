@@ -162,7 +162,9 @@ class OpenAIServingModels(OpenAIModelRegistry):
             previous = self.lora_requests.get(name)
             if previous is not None and not request.load_inplace:
                 return create_error_response(f"LoRA adapter {name!r} is already loaded")
-            lora = LoRARequest(name, next(self._lora_id), path)
+            lora = LoRARequest(
+                name, next(self._lora_id), path, load_inplace=previous is not None
+            )
             try:
                 if not await self.engine_client.add_lora(lora):
                     raise RuntimeError(f"Could not load LoRA adapter {name!r}")
@@ -175,6 +177,7 @@ class OpenAIServingModels(OpenAIModelRegistry):
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+            lora.load_inplace = False
             self.lora_requests[name] = lora
             if previous is not None:
                 await self._retire_lora(previous.lora_int_id)

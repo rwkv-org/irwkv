@@ -130,6 +130,8 @@ class AsyncLLM(EngineClient):
         maybe_register_config_serialize_by_value()
 
         self.irwkv_config = irwkv_config
+        self._lora_requests: dict[int, LoRARequest] = {}
+        self._lora_lock = asyncio.Lock()
         self.model_config = irwkv_config.model_config
         self.scheduler_config = irwkv_config.scheduler_config
         self.observability_config = irwkv_config.observability_config
@@ -412,6 +414,7 @@ class AsyncLLM(EngineClient):
         if isinstance(prompt, AsyncGenerator):
             if reasoning_ended is not None or reasoning_parser_kwargs is not None:
                 raise NotImplementedError
+            self._validate_lora(lora_request)
 
             # Streaming input case.
             return await self._add_streaming_input_request(
@@ -516,6 +519,7 @@ class AsyncLLM(EngineClient):
 
         parent_params = params
         assert isinstance(parent_params, SamplingParams)
+        self._validate_lora(request.lora_request)
 
         # Fan out child requests (for n>1).
         parent_request = ParentRequest(request)
@@ -551,6 +555,7 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        self._validate_lora(request.lora_request)
         if parent_req is None and not self.output_processor.has_request(
             request.request_id
         ):
@@ -1092,10 +1097,45 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.compute_weight_checksums_async()
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
-        return await self.engine_core.add_lora_async(lora_request)
+        return await asyncio.shield(self._add_lora(lora_request))
+
+    def _is_lora_registered(self, request: LoRARequest) -> bool:
+        registered = self._lora_requests.get(request.lora_int_id)
+        return (
+            registered is not None
+            and registered.lora_name == request.lora_name
+            and registered.lora_path == request.lora_path
+        )
+
+    def _validate_lora(self, request: LoRARequest | None) -> None:
+        if request is not None and not self._is_lora_registered(request):
+            raise IRWKVValidationError(
+                f"LoRA adapter {request.lora_name!r} version "
+                f"{request.lora_int_id} is not loaded"
+            )
+
+    async def _add_lora(self, lora_request: LoRARequest) -> bool:
+        async with self._lora_lock:
+            lora_id = lora_request.lora_int_id
+            if lora_id in self._lora_requests:
+                return self._is_lora_registered(lora_request)
+            if not await self.engine_core.add_lora_async(lora_request):
+                return False
+            self._lora_requests[lora_id] = copy(lora_request)
+            return True
 
     async def remove_lora(self, lora_id: int) -> bool:
-        return await self.engine_core.remove_lora_async(lora_id)
+        return await asyncio.shield(self._remove_lora(lora_id))
+
+    async def _remove_lora(self, lora_id: int) -> bool:
+        async with self._lora_lock:
+            if lora_id not in self._lora_requests or any(
+                state.lora_int_id == lora_id
+                for state in self.output_processor.request_states.values()
+            ):
+                return False
+            del self._lora_requests[lora_id]
+            return await self.engine_core.remove_lora_async(lora_id)
 
     async def collective_rpc(
         self,

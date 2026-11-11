@@ -118,8 +118,9 @@ class WorkerLoRAManager:
 
     def add_adapter(self, request: LoRARequest) -> bool:
         if request.lora_int_id in self.adapters:
-            return False
-        if len(self.adapters) >= self.max_cpu_loras:
+            return True
+        # Stage one replacement before dropping the old version.
+        if len(self.adapters) >= self.max_cpu_loras + int(request.load_inplace):
             raise ValueError(
                 f"LoRA capacity reached (--max-cpu-loras={self.max_cpu_loras})"
             )

@@ -104,9 +104,13 @@ def test_get_session_id_ignores_empty_and_non_string_values():
 async def test_lora_reload_keeps_version_until_generation_is_cancelled():
     import asyncio
 
+    from irwkv import SamplingParams
+    from irwkv.entrypoints.generate.base.protocol import RequestResponseMetadata
     from irwkv.entrypoints.openai.models.protocol import BaseModelPath
     from irwkv.entrypoints.openai.models.serving import OpenAIServingModels
-    from irwkv.entrypoints.serve.engine.serving import BaseServing
+    from irwkv.entrypoints.openai.responses.context import SimpleContext
+    from irwkv.entrypoints.openai.responses.protocol import ResponsesRequest
+    from irwkv.entrypoints.openai.responses.serving import OpenAIServingResponses
     from irwkv.entrypoints.serve.lora.protocol import (
         LoadLoRAAdapterRequest,
         UnloadLoRAAdapterRequest,
@@ -125,18 +129,28 @@ async def test_lora_reload_keeps_version_until_generation_is_cancelled():
     )
     first = models.get_lora("tenant")
     assert first is not None
-    serving = BaseServing(models, engine.model_config)
+    serving = object.__new__(OpenAIServingResponses)
+    serving.models = models
     generating = asyncio.Event()
+    context = SimpleContext()
 
     async def generate():
-        yield first.lora_int_id
         generating.set()
         await asyncio.Future()
+        yield context
 
-    result = serving._with_lora(first, generate())
-    assert await anext(result) == first.lora_int_id
-    task = asyncio.create_task(anext(result))
-    await generating.wait()
+    stream = serving.responses_stream_generator(
+        ResponsesRequest(model="tenant", input="hello", stream=True),
+        SamplingParams(max_tokens=8),
+        generate(),
+        context,
+        "tenant",
+        None,
+        RequestResponseMetadata(request_id="resp_lora"),
+    )
+    result = await serving._with_lora(first, stream)
+    assert (await anext(result)).type == "response.created"
+    assert (await anext(result)).type == "response.in_progress"
     await models.load_lora_adapter(
         LoadLoRAAdapterRequest(lora_name="tenant", lora_path="/a", load_inplace=True)
     )
@@ -144,6 +158,8 @@ async def test_lora_reload_keeps_version_until_generation_is_cancelled():
     assert second is not None
     assert first.lora_int_id != second.lora_int_id
     engine.remove_lora.assert_not_awaited()
+    task = asyncio.create_task(anext(result))
+    await generating.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

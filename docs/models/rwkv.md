@@ -270,9 +270,10 @@ already using an adapter retain their version until they finish. The base model
 and different adapter versions run in separate batches. All adapters must match
 the configured rank, scale, and NoRA setting, and target only configured layers.
 The runtime endpoints accept local paths accessible to the server. Dynamic
-updates require a single Python API server. `--max-cpu-loras` bounds the
-number of resident adapter versions per worker, including a new version being
-loaded and retired versions still used by requests.
+updates require a single Python API server. `--max-cpu-loras` sets the
+per-worker adapter capacity. A replacement can use one extra slot while the
+old version is being retired. The old version stays resident until requests
+using it finish.
 
 ## Online weight updates
 

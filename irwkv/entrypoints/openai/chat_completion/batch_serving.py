@@ -228,7 +228,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         created_time = int(time.time())
         final_results: dict[int, RequestOutput] = {}
         try:
-            async for prompt_idx, res in self._with_lora(
+            async for prompt_idx, res in await self._with_lora(
                 lora_request, merge_async_iterators(*generators)
             ):
                 final_results[prompt_idx] = res

@@ -3,7 +3,7 @@
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from http import HTTPStatus
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from fastapi import Request
 
@@ -84,19 +84,24 @@ class BaseServing:
             )
         return lora
 
-    def _with_lora(
+    async def _with_lora(
         self, lora: LoRARequest | None, generator: AsyncGenerator[_T, None]
     ) -> AsyncGenerator[_T, None]:
         if lora is None:
             return generator
 
-        async def generate() -> AsyncGenerator[_T, None]:
+        async def generate() -> AsyncGenerator[_T | None, None]:
             assert isinstance(self.models, OpenAIServingModels)
             async with self.models.use_lora(lora), aclosing(generator):
+                yield None
                 async for output in generator:
                     yield output
 
-        return generate()
+        result = generate()
+        # Start the lifetime before handing off the stream or background task.
+        # The first yield acquires the version without starting generation.
+        await anext(result)
+        return cast(AsyncGenerator[_T, None], result)
 
     @staticmethod
     def create_error_response(
