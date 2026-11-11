@@ -5,6 +5,7 @@ import inspect
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary, ref
 
+import pytest
 import torch
 from torch.nn.parameter import UninitializedParameter
 
@@ -12,6 +13,7 @@ import irwkv.model_executor.model_loader.reload.layerwise as reload_layerwise
 import irwkv.model_executor.model_loader.reload.meta as reload_meta
 from irwkv.model_executor.layers.attention_layer_base import AttentionLayerBase
 from irwkv.model_executor.layers.linear import QKVParallelLinear
+from irwkv.model_executor.model_loader.reload import finish_reload, start_reload
 from irwkv.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -140,6 +142,40 @@ def test_reload_lifecycle():
         assert tensor.shape == materialized_tensor.shape
         assert tensor.__class__ == materialized_tensor.__class__
         assert tensor.__dict__ == materialized_tensor.__dict__
+
+
+def test_layerwise_finish_failure_allows_full_checkpoint_retry(monkeypatch):
+    monkeypatch.setenv("IRWKV_RELOAD_MODE", "layerwise")
+    model = torch.nn.Linear(2, 2)
+    original_params = dict(model.named_parameters())
+    rejected_weight = torch.zeros_like(model.weight)
+    checkpoint = {
+        "weight": torch.full_like(model.weight, 2),
+        "bias": torch.full_like(model.bias, 3),
+    }
+
+    def load_weight(param, loaded_weight):
+        if loaded_weight is rejected_weight and not param.is_meta:
+            raise ValueError("failed to load materialized weight")
+        default_weight_loader(param, loaded_weight)
+
+    model.weight.weight_loader = load_weight
+    record_metadata_for_reloading(model)
+
+    start_reload(model)
+    model.weight.weight_loader(model.weight, rejected_weight)
+    with pytest.raises(ValueError, match="failed to load materialized weight"):
+        finish_reload(model, model_config=None, device=torch.device("cpu"))
+
+    start_reload(model)
+    params = dict(model.named_parameters())
+    for name, param in params.items():
+        param.weight_loader(param, checkpoint[name])
+    finish_reload(model, model_config=None, device=torch.device("cpu"))
+
+    for name, param in model.named_parameters():
+        assert param is original_params[name]
+        torch.testing.assert_close(param, checkpoint[name])
 
 
 def test_restore_layer_replaces_postprocessed_tensor_attribute():

@@ -46,7 +46,11 @@ def finish_reload(
     if direct_reload_enabled():
         finish_direct_reload(model, model_config, device)
     else:
-        finalize_layerwise_reload(model, model_config)
+        try:
+            finalize_layerwise_reload(model, model_config)
+        except BaseException:
+            abort_layerwise_reload(model)
+            raise
         if hasattr(model, "process_weights_after_loading"):
             model.process_weights_after_loading()
 
