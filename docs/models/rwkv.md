@@ -108,12 +108,14 @@ environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
   on first use with their recurrent state restored before the request executes.
 
 Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Model tuning
-uses fully active metadata and startup state slots, which are reset before
-capture. The report records each selected configuration, fingerprint, device
-class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
-and new worker processes reuse profiles through FlashRWKV2's locking and
-compatibility checks.
+actual graph shape, including the separate head/sampling graphs. Graph warmup
+and padded eager tuning use fully active representative metadata. Startup state
+slots are reset before capture. Unpadded eager tuning uses the request's packed
+sequence boundaries. Request execution passes the actual active counts to the
+TokenShift and WKV recurrent kernels, which skip padding. The report records
+each selected configuration, fingerprint, device class, profile path, and
+fixed/hit/missing/tuned status. Same-class GPUs and new worker processes reuse
+profiles through FlashRWKV2's locking and compatibility checks.
 
 To prepare the graph shapes before serving, run with the same model and serving
 arguments as the target service, including its sequence limit, token budget,

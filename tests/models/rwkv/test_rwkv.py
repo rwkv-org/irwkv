@@ -296,6 +296,7 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert first.max_seqlen == metadata.max_query_len
     assert runtime.max_seqlen == runtime_metadata.max_query_len
     assert runtime.validated_metadata is None
+    assert runtime.has_padding
 
     eager_query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
     eager_metadata = SimpleNamespace(
@@ -876,23 +877,27 @@ def test_first_eager_shape_tunes_without_changing_request_state(
     monkeypatch, live_metadata
 ):
     module: Any = _fake_flashrwkv2()
+    request_offsets = [0, 4, 11, 11] if live_metadata else [0, 4, 11]
+    token_capacity = 12 if live_metadata else 11
+    sequence_capacity = len(request_offsets) - 1
     metadata = RwkvAttentionMetadata(
-        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
-        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens=torch.tensor(request_offsets, dtype=torch.int32),
+        state_indices=torch.arange(sequence_capacity, dtype=torch.int32),
         batch_size=2,
-        max_seqlen=2,
-        token_capacity=4,
-        sequence_capacity=2,
-        max_seqlen_capacity=2,
+        max_seqlen=7,
+        token_capacity=token_capacity,
+        sequence_capacity=sequence_capacity,
+        max_seqlen_capacity=7,
         num_active_tokens=(
-            torch.tensor([4], dtype=torch.int32) if live_metadata else None
+            torch.tensor([11], dtype=torch.int32) if live_metadata else None
         ),
         num_active_sequences=(
             torch.tensor([2], dtype=torch.int32) if live_metadata else None
         ),
+        has_padding=live_metadata,
     )
-    pools = [torch.full((1, 2, 1), 3.0) for _ in range(2)]
-    pools.append(torch.full((1, 2, 1, 1, 1), 3.0))
+    pools = [torch.full((1, sequence_capacity, 1), 3.0) for _ in range(2)]
+    pools.append(torch.full((1, sequence_capacity, 1, 1, 1), 3.0))
     calls = []
     modes = []
     context = metadata
@@ -906,7 +911,15 @@ def test_first_eager_shape_tunes_without_changing_request_state(
 
     def forward(input_ids, *args):
         calls.append((input_ids.clone(), pools[0][0, 0, 0].item()))
-        value = 9 if context is not metadata else 5
+        tuning = context is not metadata
+        assert context.cu_seqlens.tolist() == (
+            [0, 4, 8, 12] if tuning and live_metadata else request_offsets
+        )
+        assert context.max_seqlen == 7
+        if live_metadata:
+            assert context.num_active_tokens.item() == (12 if tuning else 11)
+            assert context.num_active_sequences.item() == (3 if tuning else 2)
+        value = 9 if tuning else 5
         for pool in pools:
             pool.fill_(value)
         return input_ids
@@ -939,9 +952,10 @@ def test_first_eager_shape_tunes_without_changing_request_state(
         irwkv_config=None,
         _prepared_tuning_shapes=set(),
     )
-    input_ids = torch.tensor([1, 2, 3, 4])
-    RwkvForCausalLM.forward(model, input_ids, torch.arange(4))
-    RwkvForCausalLM.forward(model, input_ids, torch.arange(4))
+    positions = torch.arange(token_capacity)
+    input_ids = positions + 1
+    RwkvForCausalLM.forward(model, input_ids, positions)
+    RwkvForCausalLM.forward(model, input_ids, positions)
 
     assert modes == ["tune", "require"]
     assert [value for _, value in calls] == [0, 3, 5]
