@@ -18,6 +18,14 @@ from irwkv.config.compilation import CompilationMode, CUDAGraphMode
 from irwkv.config.model import ModelConfig
 from irwkv.engine.arg_utils import EngineArgs
 from irwkv.exceptions import IRWKVValidationError
+from irwkv.model_executor.model_loader.reload import (
+    finish_reload,
+    record_metadata_for_reloading,
+    start_reload,
+    weight_update_active,
+)
+from irwkv.model_executor.model_loader.reload.direct import record_checkpoint_layout
+from irwkv.model_executor.model_loader.reload.lifecycle import abort_reload
 from irwkv.model_executor.models.config import RwkvForCausalLMConfig
 from irwkv.model_executor.models.rwkv import (
     RwkvFeedForward,
@@ -27,13 +35,23 @@ from irwkv.model_executor.models.rwkv import (
     _load_flashrwkv2,
 )
 from irwkv.sampling_params import SamplingParams
+from irwkv.utils.hashing import sha256
 from irwkv.v1.attention.backend import AttentionCGSupport
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
     RwkvAttentionMetadata,
     RwkvAttentionMetadataBuilder,
+    RwkvStateSpec,
 )
-from irwkv.v1.worker.gpu.model_states.rwkv import RwkvModelState, RwkvSampler
+from irwkv.v1.core.kv_cache_manager import KVCacheManager
+from irwkv.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from irwkv.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from irwkv.v1.request import Request
+from irwkv.v1.worker.gpu.model_states.rwkv import (
+    RwkvModelState,
+    RwkvSampler,
+    _RwkvSamplingGraph,
+)
 
 
 class _FakeStateHandle:
@@ -287,6 +305,7 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert first.max_seqlen == metadata.max_query_len
     assert runtime.max_seqlen == runtime_metadata.max_query_len
     assert runtime.validated_metadata is None
+    assert runtime.has_padding
 
     eager_query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
     eager_metadata = SimpleNamespace(
@@ -337,17 +356,15 @@ def test_live_metadata_prepares_and_retains_each_capture_ticket(monkeypatch) -> 
     assert state_layer._live_graph_tickets[2] is next_capture_ticket
 
 
-def test_feed_forward_prepares_value_weight_for_provider() -> None:
-    feed_forward = object.__new__(RwkvFeedForward)
-    torch.nn.Module.__init__(feed_forward)
+@pytest.mark.usefixtures("_single_rank")
+def test_feed_forward_loads_value_weight_for_provider() -> None:
+    config = SimpleNamespace(hidden_size=2, intermediate_size=8, rwkv_lora=None)
+    feed_forward = RwkvFeedForward(config, prefix="model.layers.0.mlp")
     checkpoint_weight = torch.arange(16, dtype=torch.bfloat16).view(2, 8)
-    feed_forward.value = SimpleNamespace(
-        weight=torch.nn.Parameter(checkpoint_weight.clone())
-    )
+    param = feed_forward.value.weight
+    param.weight_loader(param, checkpoint_weight)
 
-    feed_forward.process_weights_after_loading()
-
-    assert torch.equal(feed_forward.value.weight, checkpoint_weight.T.contiguous())
+    assert torch.equal(param, checkpoint_weight.T.contiguous())
 
 
 @pytest.mark.parametrize("fold_embedding_norm", [True, False])
@@ -522,6 +539,76 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     assert torch.equal(resets[0], torch.tensor([9], dtype=torch.int32))
     assert np.array_equal(model_state._state_block_columns, np.array([1]))
     assert np.array_equal(model_state._state_num_computed_tokens, np.array([32]))
+
+
+def _block_hashed_request(request_id: str, token_ids: list[int]) -> Request:
+    params = SamplingParams(max_tokens=64)
+    params.update_from_generation_config({}, eos_token_id=0)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=token_ids,
+        sampling_params=params,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec_cls", "cached_blocks", "continuation_hit"),
+    [(MambaSpec, {0}, 16), (RwkvStateSpec, {0, 2}, 48)],
+)
+def test_align_continuation_resumes_from_latest_committed_state(
+    spec_cls, cached_blocks, continuation_hit
+) -> None:
+    """A finished RWKV turn keeps only its latest committed state, so the next
+    turn resumes there instead of at the previous prompt boundary."""
+    init_none_hash(sha256)
+    spec = spec_cls(
+        block_size=16, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["state"], spec)],
+            prefix_cache_retention_interval=0,
+        ),
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    turn = _block_hashed_request("turn", list(range(1, 21)))
+    for chunk in (16, 4):
+        assert manager.allocate_slots(turn, chunk) is not None
+        turn.num_computed_tokens += chunk
+        manager.new_step_starts()
+    # Decode consumes each sampled token in the following step; the final
+    # sampled token is never consumed, so 51 of 52 tokens reach the state.
+    for token in range(100, 131):
+        turn.append_output_token_ids(token)
+        assert manager.allocate_slots(turn, 1) is not None
+        turn.num_computed_tokens += 1
+        manager.new_step_starts()
+    turn.append_output_token_ids(131)
+    # Only the prompt boundary goes to a connector; superseded latest
+    # checkpoints are not offloaded.
+    (state_manager,) = manager.coordinator.single_type_managers
+    assert [
+        boundary
+        for *_, boundary in state_manager.take_pending_boundary_state_offloads()
+    ] == [16]
+    manager.free(turn)
+
+    pool = manager.block_pool
+    assert {
+        i
+        for i, block_hash in enumerate(turn.block_hashes)
+        if pool.get_cached_block(block_hash, kv_cache_group_ids=[0]) is not None
+    } == cached_blocks
+    continuation = _block_hashed_request(
+        "continuation", [*turn.all_token_ids, *range(200, 210)]
+    )
+    _, num_computed_tokens, _ = manager.get_computed_blocks(continuation)
+    assert num_computed_tokens == continuation_hit
 
 
 def _config() -> SimpleNamespace:
@@ -799,23 +886,27 @@ def test_first_eager_shape_tunes_without_changing_request_state(
     monkeypatch, live_metadata
 ):
     module: Any = _fake_flashrwkv2()
+    request_offsets = [0, 4, 11, 11] if live_metadata else [0, 4, 11]
+    token_capacity = 12 if live_metadata else 11
+    sequence_capacity = len(request_offsets) - 1
     metadata = RwkvAttentionMetadata(
-        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
-        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens=torch.tensor(request_offsets, dtype=torch.int32),
+        state_indices=torch.arange(sequence_capacity, dtype=torch.int32),
         batch_size=2,
-        max_seqlen=2,
-        token_capacity=4,
-        sequence_capacity=2,
-        max_seqlen_capacity=2,
+        max_seqlen=7,
+        token_capacity=token_capacity,
+        sequence_capacity=sequence_capacity,
+        max_seqlen_capacity=7,
         num_active_tokens=(
-            torch.tensor([4], dtype=torch.int32) if live_metadata else None
+            torch.tensor([11], dtype=torch.int32) if live_metadata else None
         ),
         num_active_sequences=(
             torch.tensor([2], dtype=torch.int32) if live_metadata else None
         ),
+        has_padding=live_metadata,
     )
-    pools = [torch.full((1, 2, 1), 3.0) for _ in range(2)]
-    pools.append(torch.full((1, 2, 1, 1, 1), 3.0))
+    pools = [torch.full((1, sequence_capacity, 1), 3.0) for _ in range(2)]
+    pools.append(torch.full((1, sequence_capacity, 1, 1, 1), 3.0))
     calls = []
     modes = []
     context = metadata
@@ -829,7 +920,15 @@ def test_first_eager_shape_tunes_without_changing_request_state(
 
     def forward(input_ids, *args):
         calls.append((input_ids.clone(), pools[0][0, 0, 0].item()))
-        value = 9 if context is not metadata else 5
+        tuning = context is not metadata
+        assert context.cu_seqlens.tolist() == (
+            [0, 4, 8, 12] if tuning and live_metadata else request_offsets
+        )
+        assert context.max_seqlen == 7
+        if live_metadata:
+            assert context.num_active_tokens.item() == (12 if tuning else 11)
+            assert context.num_active_sequences.item() == (3 if tuning else 2)
+        value = 9 if tuning else 5
         for pool in pools:
             pool.fill_(value)
         return input_ids
@@ -862,9 +961,10 @@ def test_first_eager_shape_tunes_without_changing_request_state(
         irwkv_config=None,
         _prepared_tuning_shapes=set(),
     )
-    input_ids = torch.tensor([1, 2, 3, 4])
-    RwkvForCausalLM.forward(model, input_ids, torch.arange(4))
-    RwkvForCausalLM.forward(model, input_ids, torch.arange(4))
+    positions = torch.arange(token_capacity)
+    input_ids = positions + 1
+    RwkvForCausalLM.forward(model, input_ids, positions)
+    RwkvForCausalLM.forward(model, input_ids, positions)
 
     assert modes == ["tune", "require"]
     assert [value for _, value in calls] == [0, 3, 5]
@@ -967,8 +1067,11 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
     assert model.lm_head.lora_scale == 2.0
     assert model.lm_head.use_nora
 
-    loaded = model.load_weights(base.named_parameters())
-    assert loaded == {name for name, _ in model.named_parameters()}
+    loaded = model.load_weights(
+        (name, param.T if name.endswith(".mlp.value.weight") else param)
+        for name, param in base.named_parameters()
+    )
+    assert loaded == {name for name, _ in base.named_parameters()}
     assert all(not param.any() for param in adapters.values())
 
     weights = {name: torch.randn(shape) for name, shape in expected.items()}
@@ -983,14 +1086,14 @@ def test_lora_registers_fp32_peft_adapters_loaded_in_place() -> None:
 
 
 @pytest.mark.usefixtures("_single_rank")
-def test_lora_snapshots_preserve_inflight_versions_and_base(tmp_path) -> None:
+def test_lora_snapshots_switch_without_replacing_buffers(tmp_path) -> None:
     from safetensors.torch import save_file
 
     from irwkv.lora.request import LoRARequest
     from irwkv.lora.worker_manager import WorkerLoRAManager
 
     model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(_LORA))
-    manager = WorkerLoRAManager(model)
+    manager = WorkerLoRAManager(model, max_cpu_loras=2)
     pointers = (
         model.lm_head.lora_A.weight.data_ptr(),
         model.lm_head.lora_B.weight.data_ptr(),
@@ -1017,20 +1120,123 @@ def test_lora_snapshots_preserve_inflight_versions_and_base(tmp_path) -> None:
         )
         assert manager.add_adapter(LoRARequest("tenant", index, str(path)))
 
-    assert manager.pin_adapter(1)
-    assert manager.remove_adapter(1)
     manager.set_active_adapter(1)
     assert torch.all(model.lm_head.lora_B.weight == 1)
     manager.set_active_adapter(2)
     assert torch.all(model.lm_head.lora_B.weight == 2)
-    manager.unpin_adapter(1)
-    assert 1 not in manager.adapters
+    assert manager.remove_adapter(1)
     manager.set_active_adapter(None)
     assert not model.lm_head.lora_B.weight.any()
     assert pointers == (
         model.lm_head.lora_A.weight.data_ptr(),
         model.lm_head.lora_B.weight.data_ptr(),
     )
+
+
+@pytest.mark.usefixtures("_single_rank")
+@pytest.mark.parametrize("mode", ["layerwise", "direct"])
+@torch.no_grad()
+def test_checkpoint_reload_preserves_runtime_weights(monkeypatch, mode) -> None:
+    from irwkv.model_executor.model_loader.reload import layerwise
+
+    monkeypatch.setenv("IRWKV_RELOAD_MODE", mode)
+    warning = MagicMock()
+    monkeypatch.setattr(layerwise.logger, "warning", warning)
+    flash: Any = _fake_flashrwkv2()
+    flash.infer_embedding_ln0_forward_varlen = lambda x, weight, bias, eps: (
+        torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+    )
+    monkeypatch.setitem(sys.modules, "flashrwkv2", flash)
+    model = RwkvForCausalLM(irwkv_config=_tiny_model_irwkv_config(None))
+    record_metadata_for_reloading(model)
+    weights = {
+        name: torch.randn_like(param.T if name.endswith(".mlp.value.weight") else param)
+        for name, param in model.named_parameters()
+    }
+    model.load_weights(weights.items())
+    if mode == "direct":
+        record_checkpoint_layout(model)
+    model.process_weights_after_loading()
+    folded_buffer = model.model._embedding_norm_folded_buffer
+    pointers = {name: param.data_ptr() for name, param in model.named_parameters()}
+    buffer_pointers = {
+        name: buf.data_ptr()
+        for name, buf in model.named_buffers()
+        if "canonical" in name or "layer_zero" in name
+    }
+    model_config = SimpleNamespace(
+        dtype=torch.bfloat16, word_embeddings_untied_by_checkpoint=False
+    )
+
+    for _ in range(2):
+        weights = {name: torch.randn_like(weight) for name, weight in weights.items()}
+        items = list(weights.items())
+        start_reload(model)
+        split = len(items) // 2
+        model.load_weights(items[:split])
+        model.load_weights(items[split:])
+        finish_reload(model, model_config, torch.device("cpu"))
+
+        assert model.model._embedding_norm_folded_buffer is folded_buffer
+        assert folded_buffer.item()
+        assert not any(
+            call.args == ("%s: Failed to load weights", "RwkvModel")
+            for call in warning.call_args_list
+        )
+        assert {name: p.data_ptr() for name, p in model.named_parameters()} == pointers
+        assert {
+            name: buf.data_ptr()
+            for name, buf in model.named_buffers()
+            if "canonical" in name or "layer_zero" in name
+        } == buffer_pointers
+        expected_embedding = torch.nn.functional.layer_norm(
+            weights["model.embed_tokens.weight"],
+            (model.config.hidden_size,),
+            weights["model.embedding_norm.weight"],
+            weights["model.embedding_norm.bias"],
+            model.config.layer_norm_epsilon,
+        )
+        torch.testing.assert_close(model.model.embed_tokens.weight, expected_embedding)
+        for index, layer in enumerate(model.model.layers):
+            value = weights[f"model.layers.{index}.mlp.value.weight"]
+            torch.testing.assert_close(layer.mlp.value.weight, value.T)
+            names = ("w1", "a1", "g1", "w2", "a2", "g2")
+            if index:
+                names += ("v1", "v2")
+            for name in names:
+                torch.testing.assert_close(
+                    getattr(layer.linear_attn, f"{name}_canonical"),
+                    weights[f"model.layers.{index}.linear_attn.{name}"].T,
+                )
+
+    attention = model.model.layers[1].linear_attn
+    unchanged = attention.a0.clone()
+    weight = torch.randn_like(attention.w1)
+    start_reload(model)
+    model.load_weights([("model.layers.1.linear_attn.w1", weight)])
+    finish_reload(model, model_config, torch.device("cpu"))
+    torch.testing.assert_close(attention.a0, unchanged)
+    torch.testing.assert_close(attention.w1_canonical, weight.T)
+
+    start_reload(model)
+    model.load_weights(
+        [("model.embedding_norm.weight", weights["model.embedding_norm.weight"])]
+    )
+    with pytest.raises(ValueError, match="unfolded embedding weight"):
+        finish_reload(model, model_config, torch.device("cpu"))
+    assert not weight_update_active()
+    start_reload(model)
+    model.load_weights(weights.items())
+    finish_reload(model, model_config, torch.device("cpu"))
+
+    start_reload(model)
+    model.load_weights([("model.layers.1.linear_attn.w1", weight)])
+    abort_reload(model)
+    assert not weight_update_active()
+    start_reload(model)
+    model.load_weights(weights.items())
+    finish_reload(model, model_config, torch.device("cpu"))
+    torch.testing.assert_close(attention.w1, weights["model.layers.1.linear_attn.w1"])
 
 
 def _adapter_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1250,6 +1456,7 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
         sampling_params=None,
         num_computed_tokens=0,
         block_ids=[],
+        lora_request=None,
     )
     GPUModelRunner.add_requests(runner, SimpleNamespace(scheduled_new_reqs=[request]))
     runner._remove_request.assert_not_called()
@@ -1285,7 +1492,7 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
     assert "request" not in sampler._preserved_requests
 
 
-def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
+def _graph_sampler(monkeypatch, calls: list[str]) -> tuple[RwkvSampler, Any]:
     monkeypatch.setattr(
         "irwkv.v1.worker.gpu.model_states.rwkv.get_num_sampled_and_rejected",
         lambda *args: (
@@ -1293,19 +1500,20 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
             torch.zeros(4, dtype=torch.int32),
         ),
     )
-    graph = SimpleNamespace(
-        hidden_states=torch.empty(4, 3),
-        slot_indices=torch.empty(4, dtype=torch.int32),
-        presence_penalty=torch.empty(4),
-        frequency_penalty=torch.empty(4),
-        penalty_decay=torch.empty(4),
-        temperature=torch.empty(4),
-        top_k=torch.empty(4, dtype=torch.int32),
-        top_p=torch.empty(4),
-        num_active=torch.empty(1, dtype=torch.int32),
-        sampled=torch.tensor([10, 11, 12, -1], dtype=torch.int32),
-        graph=SimpleNamespace(replay=lambda: None),
-    )
+    graph = object.__new__(_RwkvSamplingGraph)
+    graph.hidden_states = torch.empty(4, 3)
+    graph.slot_indices = torch.empty(4, dtype=torch.int32)
+    graph.presence_penalty = torch.empty(4)
+    graph.frequency_penalty = torch.empty(4)
+    graph.penalty_decay = torch.empty(4)
+    graph.temperature = torch.empty(4)
+    graph.top_k = torch.empty(4, dtype=torch.int32)
+    graph.top_p = torch.empty(4)
+    graph.num_active = torch.empty(1, dtype=torch.int32)
+    graph.logits = torch.zeros(4, 8)
+    graph.sampled = torch.tensor([10, 11, 12, -1], dtype=torch.int32)
+    graph.logits_graph = SimpleNamespace(replay=lambda: calls.append("logits"))
+    graph.sample_graph = SimpleNamespace(replay=lambda: calls.append("sample"))
     sampler = object.__new__(RwkvSampler)
     sampler.compute_nans = False
     sampler.get_logprobs_dims = lambda idx_mapping_np: None
@@ -1313,6 +1521,11 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     sampler._sampling_graphs = {4: graph}
     active_rows = np.empty(4, dtype=np.int64)
     active_slots = np.empty(4, dtype=np.int32)
+    graph_cu_num_logits = np.full(5, -1, dtype=np.int32)
+    sampler._graph_cu_num_logits = SimpleNamespace(
+        np=graph_cu_num_logits,
+        copy_to_uva=lambda size: torch.from_numpy(graph_cu_num_logits[:size].copy()),
+    )
     sampler._active_rows = SimpleNamespace(
         np=active_rows,
         copy_to_uva=lambda size: torch.from_numpy(active_rows[:size]),
@@ -1332,22 +1545,34 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     sampler.req_states = SimpleNamespace(
         prefill_len=SimpleNamespace(gpu=torch.tensor([2, 8, 4, 1]))
     )
-    input_batch = SimpleNamespace(
+    return sampler, graph
+
+
+def _graph_input_batch(num_computed_prefill_tokens: list[int]) -> Any:
+    return SimpleNamespace(
+        req_ids=["a", "b", "c", "d"],
         num_reqs=4,
         idx_mapping_np=np.array([2, 1, 3, 0]),
         idx_mapping=torch.tensor([2, 1, 3, 0]),
-        num_computed_prefill_tokens_np=np.array([1, 2, 3, 0]),
+        num_computed_prefill_tokens_np=np.array(num_computed_prefill_tokens),
         num_scheduled_tokens=np.array([1, 2, 1, 1]),
         prefill_len_np=np.array([2, 8, 4, 1]),
         seq_lens=torch.tensor([2, 4, 4, 1]),
         cu_num_logits=torch.tensor([0, 1, 2, 3, 4]),
     )
+
+
+def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
+    calls: list[Any] = []
+    sampler, graph = _graph_sampler(monkeypatch, calls)
+    input_batch = _graph_input_batch([1, 2, 3, 0])
     hidden_states = torch.arange(12, dtype=torch.bfloat16).view(4, 3)
 
     output = sampler.sample_hidden_states(hidden_states, input_batch, None)
 
     assert output is not None
     assert torch.equal(output.sampled_token_ids[:, 0], torch.tensor([10, 0, 11, 12]))
+    assert calls == ["logits", "sample"]
     assert graph.num_active.item() == 3
     assert torch.equal(graph.hidden_states[:3], hidden_states[[0, 2, 3]])
     assert torch.equal(graph.slot_indices[:3], torch.tensor([2, 3, 0]))
@@ -1355,18 +1580,50 @@ def test_rapid_sampler_graph_compacts_completed_prefills(monkeypatch) -> None:
     assert torch.equal(graph.top_k[:3], torch.tensor([18, 19, 16]))
 
 
-def test_rapid_sampler_graph_defers_grammar_to_existing_path() -> None:
-    sampler = object.__new__(RwkvSampler)
-    sampler.compute_nans = False
-    sampler.get_logprobs_dims = lambda idx_mapping_np: None
-    sampler.needs_logits_processing = np.zeros(1, dtype=bool)
-    sampler._sampling_graphs = {1: object()}
-    input_batch = SimpleNamespace(idx_mapping_np=np.array([0]))
+def _grammar_worker(calls: list[Any]) -> Any:
+    def apply_grammar_bitmask(logits, input_batch, req_ids, bitmask) -> None:
+        cu_num_logits = input_batch.cu_num_logits.tolist()
+        assert cu_num_logits == input_batch.cu_num_logits_np.tolist()
+        calls.append(("grammar", logits, cu_num_logits, bitmask))
 
-    assert (
-        sampler.sample_hidden_states(torch.zeros(1, 1), input_batch, SimpleNamespace())
-        is None
+    return SimpleNamespace(apply_grammar_bitmask=apply_grammar_bitmask)
+
+
+@pytest.mark.parametrize(
+    ("num_computed_prefill_tokens", "cu_num_logits"),
+    [
+        # Every request samples: one graph row per batch row.
+        ([1, 6, 3, 0], [0, 1, 2, 3, 4]),
+        # Request "b" is mid-prefill and has no graph row, so "c" and "d"
+        # shift up one row.
+        ([1, 2, 3, 0], [0, 1, 1, 2, 3]),
+    ],
+)
+def test_rapid_sampler_graph_masks_grammar_between_logits_and_sampling(
+    monkeypatch, num_computed_prefill_tokens: list[int], cu_num_logits: list[int]
+) -> None:
+    """The bitmask is applied between the logits and sampling replays, with
+    ``cu_num_logits`` as full cumulative offsets into the compacted graph rows,
+    including in mixed prefill batches."""
+    calls: list[Any] = []
+    sampler, graph = _graph_sampler(monkeypatch, calls)
+    input_batch = _graph_input_batch(num_computed_prefill_tokens)
+    bitmask = np.zeros((3, 1), dtype=np.int32)
+    grammar_output = SimpleNamespace(
+        structured_output_request_ids=["a", "c", "d"], grammar_bitmask=bitmask
     )
+
+    output = sampler.sample_hidden_states(
+        torch.zeros(4, 3), input_batch, grammar_output, _grammar_worker(calls)
+    )
+
+    assert output is not None
+    assert calls == [
+        "logits",
+        ("grammar", graph.logits, cu_num_logits, bitmask),
+        "sample",
+    ]
+    assert torch.equal(input_batch.cu_num_logits, torch.tensor([0, 1, 2, 3, 4]))
 
 
 @pytest.mark.parametrize("factory", [SamplingParams, SamplingParams.from_optional])
@@ -1472,6 +1729,8 @@ async def test_real_model_lora_tenant_isolation(
     data_parallel_size: int,
     use_nora: bool,
 ) -> None:
+    from shutil import copyfile
+
     import httpx
     from safetensors.torch import save_file
 
@@ -1546,6 +1805,7 @@ async def test_real_model_lora_tenant_isolation(
         "--compilation-config",
         '{"cudagraph_capture_sizes":[1,2,4]}',
     ]
+    args += ["--max-cpu-loras", "3"]
     overrides = {
         "rwkv_lora": {
             "r": 4,
@@ -1594,6 +1854,16 @@ async def test_real_model_lora_tenant_isolation(
                 assert response.status_code == 200, response.text
                 return response.json()["choices"][0]["token_ids"]
 
+            if pipeline_parallel_size == 2:
+                response = await client.post(
+                    "/v1/load_lora_adapter",
+                    json={
+                        "lora_name": "tenant-a",
+                        "lora_path": str(tmp_path / "absent"),
+                    },
+                )
+                assert response.status_code == 404, response.text
+
             await load("tenant-a", paths[0])
             await load("tenant-b", paths[1])
             baseline = await generate("base")
@@ -1632,7 +1902,11 @@ async def test_real_model_lora_tenant_isolation(
                     stream_tokens.extend(choice["token_ids"] or [])
                     if stream_tokens and not reloaded:
                         assert choice["finish_reason"] is None
-                        await load("tenant-a", paths[1], inplace=True)
+                        copyfile(
+                            paths[1] / "adapter_model.safetensors",
+                            paths[0] / "adapter_model.safetensors",
+                        )
+                        await load("tenant-a", paths[0], inplace=True)
                         reloaded = True
                 assert reloaded
                 assert stream_tokens == expected_stream
@@ -1719,6 +1993,266 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             assert single.token_ids == reference.token_ids
             assert single.logprobs == reference.logprobs
         reference = single
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize("backend", ["nccl", "ipc"])
+def test_real_model_native_weight_reload(irwkv_runner, monkeypatch, backend) -> None:
+    """Two changed checkpoints update captured graphs after cache reset."""
+    from safetensors import safe_open
+
+    from irwkv.distributed.weight_transfer import (
+        ParamMeta,
+        WeightSource,
+        WeightTransferTrainerFactory,
+    )
+    from irwkv.distributed.weight_transfer.clients import _json_safe_update_payload
+    from irwkv.distributed.weight_transfer.ipc_engine import IPCTrainerInitInfo
+    from irwkv.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo
+    from irwkv.utils.network_utils import get_open_port
+
+    if backend == "nccl" and torch.accelerator.device_count() < 2:
+        pytest.skip("NCCL weight transfer requires two GPUs")
+    monkeypatch.setenv("IRWKV_ALLOW_INSECURE_SERIALIZATION", "1")
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    files = sorted(
+        os.path.join(model_path, name)
+        for name in os.listdir(model_path)
+        if name.endswith(".safetensors")
+    )
+
+    class CheckpointSource(WeightSource):
+        round_id = 0
+
+        def metadata(self):
+            result = []
+            for path in files:
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        tensor = f.get_tensor(name)
+                        result.append(
+                            ParamMeta(name, tensor.dtype, tuple(tensor.shape))
+                        )
+            return result
+
+        def __iter__(self):
+            for path in files:
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        tensor = f.get_tensor(name).to("cuda")
+                        if name == "lm_head.weight":
+                            tensor = tensor * (-1 if self.round_id == 1 else 0.5)
+                        elif name in {
+                            "model.embedding_norm.weight",
+                            "model.layers.1.linear_attn.w1",
+                            "model.layers.1.mlp.value.weight",
+                        }:
+                            tensor = tensor * (0.75 if self.round_id == 1 else 0.5)
+                        yield name, tensor
+
+    class Client:
+        def __init__(self, llm):
+            self.llm = llm
+
+        def init_weight_transfer_engine(self, init_info):
+            self.llm.collective_rpc(
+                "init_weight_transfer_engine",
+                timeout=600,
+                kwargs={"init_info": init_info},
+            )
+
+        def start_weight_update(self):
+            self.llm.collective_rpc("start_weight_update", timeout=600)
+
+        def update_weights(self, update_info):
+            self.llm.collective_rpc(
+                "update_weights",
+                timeout=600,
+                kwargs={"update_info": _json_safe_update_payload(update_info)},
+            )
+
+        def finish_weight_update(self, weight_version=None):
+            self.llm.collective_rpc("finish_weight_update", timeout=600)
+
+    def snapshot(worker):
+        model = worker.model_runner.get_model()
+        layer = model.model.layers[1]
+        manager = worker.model_runner.cudagraph_manager
+        sampler = worker.model_runner.model_state._sampler
+        importer = getattr(worker.weight_transfer_engine, "_packed_importer", None)
+        return {
+            "pointers": (
+                model.model.embed_tokens.weight.data_ptr(),
+                model.lm_head.weight.data_ptr(),
+                layer.mlp.value.weight.data_ptr(),
+                layer.linear_attn.w1_canonical.data_ptr(),
+            ),
+            "graph_ids": tuple(id(graph) for graph in manager.graphs.values()),
+            "sampler_graph_ids": tuple(
+                id(graph) for graph in sampler._sampling_graphs.values()
+            ),
+            "canonical_equal": torch.equal(
+                layer.linear_attn.w1_canonical, layer.linear_attn.w1.T
+            ),
+            "w1_sum": layer.linear_attn.w1.float().abs().sum().item(),
+            "value_sum": layer.mlp.value.weight.float().abs().sum().item(),
+            "embedding": model.model.embed_tokens.weight[1, :16].float().tolist(),
+            "ipc_released": importer is None or importer._entry is None,
+        }
+
+    def set_graph_enabled(worker, enabled):
+        worker.model_runner.cudagraph_manager._graphs_captured = enabled
+
+    params = SamplingParams(
+        temperature=0,
+        top_k=1,
+        max_tokens=4,
+        ignore_eos=True,
+        logprobs=1,
+        presence_penalty=0,
+        frequency_penalty=0,
+        penalty_decay=1,
+        detokenize=False,
+    )
+    fast_params = params.clone()
+    fast_params.logprobs = None
+    prompt = {"prompt_token_ids": list(range(1, 74))}
+    with irwkv_runner(
+        model_path,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.25,
+        num_gpu_blocks_override=64,
+        block_size=32,
+        mamba_ssm_cache_dtype="float32",
+        enable_prefix_caching=True,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+        weight_transfer_config={"backend": backend},
+    ) as runner:
+        llm = runner.llm
+        baseline = llm.generate([prompt], params, use_tqdm=False)[0]
+        assert llm.generate([prompt], params, use_tqdm=False)[0].num_cached_tokens > 0
+        before = llm.collective_rpc(snapshot)[0]
+        assert before["graph_ids"] and before["sampler_graph_ids"]
+        torch.accelerator.set_device_index(1 if backend == "nccl" else 0)
+        source = CheckpointSource()
+        if backend == "nccl":
+            info = NCCLTrainerInitInfo(
+                rank=0,
+                master_address="127.0.0.1",
+                master_port=get_open_port(),
+                world_size=2,
+                packed_buffer_size_bytes=512 * 1024**2,
+            )
+        else:
+            info = IPCTrainerInitInfo(
+                rank=0, packed=True, packed_buffer_size_bytes=512 * 1024**2
+            )
+        trainer = WeightTransferTrainerFactory.trainer_init(
+            info, client=Client(llm), source=source
+        )
+        try:
+            previous = baseline
+            for round_id in (1, 2):
+                source.round_id = round_id
+                trainer.send_weights()
+                after = llm.collective_rpc(snapshot)[0]
+                assert after["pointers"] == before["pointers"]
+                assert after["graph_ids"] == before["graph_ids"]
+                assert after["sampler_graph_ids"] == before["sampler_graph_ids"]
+                assert after["canonical_equal"] and after["ipc_released"]
+                scale = 0.75 if round_id == 1 else 0.5
+                assert after["w1_sum"] == pytest.approx(
+                    before["w1_sum"] * scale, rel=1e-4
+                )
+                assert after["value_sum"] == pytest.approx(
+                    before["value_sum"] * scale, rel=1e-4
+                )
+                assert after["embedding"] != before["embedding"]
+
+                assert llm.reset_prefix_cache()
+                graph = llm.generate([prompt], params, use_tqdm=False)[0]
+                assert graph.num_cached_tokens == 0
+                assert llm.reset_prefix_cache()
+                fast = llm.generate([prompt], fast_params, use_tqdm=False)[0]
+                assert fast.outputs[0].token_ids == graph.outputs[0].token_ids
+                assert llm.reset_prefix_cache()
+                llm.collective_rpc(set_graph_enabled, args=(False,))
+                eager = llm.generate([prompt], params, use_tqdm=False)[0]
+                llm.collective_rpc(set_graph_enabled, args=(True,))
+                assert eager.outputs[0].token_ids == graph.outputs[0].token_ids
+                for token, graph_probs, eager_probs in zip(
+                    graph.outputs[0].token_ids,
+                    graph.outputs[0].logprobs,
+                    eager.outputs[0].logprobs,
+                ):
+                    assert graph_probs[token].logprob == pytest.approx(
+                        eager_probs[token].logprob, abs=1e-3
+                    )
+                assert graph.outputs[0].token_ids != previous.outputs[0].token_ids
+                previous = graph
+        finally:
+            trainer.shutdown()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_real_model_continuation_matches_full_history_prefill(
+    irwkv_runner, state_dtype
+) -> None:
+    """Resuming the next turn from the previous turn's committed state matches
+    prefilling the whole history: S(P + delta) == Advance(S(P), delta)."""
+    model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
+    params = SamplingParams(
+        temperature=0.0,
+        top_k=1,
+        max_tokens=40,
+        ignore_eos=True,
+        logprobs=3,
+        presence_penalty=0,
+        frequency_penalty=0,
+        penalty_decay=1,
+        detokenize=False,
+    )
+    prompt = list(range(1, 66))
+    replies = {}
+    continuations = {}
+    for prefix_caching in (False, True):
+        with irwkv_runner(
+            model_path,
+            dtype="bfloat16",
+            max_model_len=256,
+            max_num_seqs=4,
+            gpu_memory_utilization=0.8,
+            num_gpu_blocks_override=64,
+            mamba_ssm_cache_dtype=state_dtype,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=prefix_caching,
+        ) as runner:
+            reply = runner.llm.generate([{"prompt_token_ids": prompt}], params)[0]
+            history = [*prompt, *reply.outputs[0].token_ids, *range(70, 80)]
+            replies[prefix_caching] = reply.outputs[0]
+            continuations[prefix_caching] = runner.llm.generate(
+                [{"prompt_token_ids": history}], params
+            )[0]
+
+    assert replies[True].token_ids == replies[False].token_ids
+    # The reply's last token is sampled but never consumed, so the first turn
+    # commits 65 + 40 - 1 = 104 tokens, last aligned at 96.
+    assert continuations[True].num_cached_tokens == 96
+    assert not continuations[False].num_cached_tokens
+    resumed = continuations[True].outputs[0]
+    prefilled = continuations[False].outputs[0]
+    assert resumed.token_ids == prefilled.token_ids
+    assert resumed.logprobs == prefilled.logprobs
 
 
 @pytest.mark.skipif(

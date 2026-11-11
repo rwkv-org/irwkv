@@ -742,6 +742,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
+            drain_lora_batch = bool(self.running)
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
@@ -759,15 +760,6 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                if self.running:
-                    active_lora = self.running[0].lora_request
-                    if (active_lora.lora_int_id if active_lora else None) != (
-                        request.lora_request.lora_int_id
-                        if request.lora_request
-                        else None
-                    ):
-                        break
-
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
                     skip_request(request_queue)
@@ -777,6 +769,17 @@ class Scheduler(SchedulerInterface):
                     # Deliverable stale output still in flight: resuming now
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
+                    skip_request(request_queue)
+                    continue
+
+                if (
+                    self.running
+                    and request.lora_request != self.running[0].lora_request
+                ):
+                    # Fill a new batch, then let it drain when another version is
+                    # waiting so sustained traffic cannot keep it active forever.
+                    if drain_lora_batch:
+                        break
                     skip_request(request_queue)
                     continue
 

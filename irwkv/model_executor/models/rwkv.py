@@ -24,6 +24,7 @@ from irwkv.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from irwkv.model_executor.model_loader.weight_utils import default_weight_loader
 from irwkv.model_executor.models.interfaces import (
     HasInnerState,
     IsAttentionFree,
@@ -31,6 +32,7 @@ from irwkv.model_executor.models.interfaces import (
     SupportsPP,
 )
 from irwkv.sequence import IntermediateTensors
+from irwkv.utils.math_utils import cdiv
 from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
@@ -432,6 +434,8 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
 
 
 class RwkvAttention(nn.Module):
+    v1_canonical: torch.Tensor
+
     def __init__(self, config: Any, layer_idx: int, prefix: str) -> None:
         super().__init__()
         channels = config.hidden_size
@@ -533,23 +537,27 @@ class RwkvAttention(nn.Module):
                 name, torch.empty(0, dtype=torch.float32), persistent=False
             )
 
+    @torch.no_grad()
     def process_weights_after_loading(self) -> None:
-        self.w1_canonical = self.w1.T.contiguous()
-        self.a1_canonical = self.a1.T.contiguous()
-        self.g1_canonical = self.g1.T.contiguous()
-        self.w2_canonical = self.w2.T.contiguous()
-        self.a2_canonical = self.a2.T.contiguous()
-        self.g2_canonical = self.g2.T.contiguous()
-        if self.layer_idx == 0:
+        names: tuple[str, ...] = ("w1", "a1", "g1", "w2", "a2", "g2")
+        if self.layer_idx != 0:
+            names += ("v1", "v2")
+        for name in names:
+            canonical_name = f"{name}_canonical"
+            canonical = getattr(self, canonical_name)
+            weight = getattr(self, name).T
+            if canonical.numel():
+                canonical.copy_(weight)
+            else:
+                setattr(self, canonical_name, weight.contiguous())
+
+        if self.layer_idx == 0 and not self.v1_canonical.numel():
             rank = self.config.v_low_rank_dim
             self.v1_canonical = self.w1.new_zeros((rank, self.hidden_size))
             self.v2_canonical = self.w1.new_zeros((self.hidden_size, rank))
             self.layer_zero_v0 = self.w1.new_zeros(self.hidden_size)
             self.layer_zero_v1_runtime = self.w1.new_zeros((self.hidden_size, rank))
             self.layer_zero_v2_runtime = self.w1.new_zeros((rank, self.hidden_size))
-        else:
-            self.v1_canonical = self.v1.T.contiguous()
-            self.v2_canonical = self.v2.T.contiguous()
 
     def forward(
         self,
@@ -691,9 +699,14 @@ class RwkvFeedForward(nn.Module):
         )
         _add_lora(self.key, config, "mlp.key", f"{prefix}.key")
         _add_lora(self.value, config, "mlp.value", f"{prefix}.value")
+        self.value.weight.data = torch.empty_like(
+            self.value.weight.T, memory_format=torch.contiguous_format
+        )
+        self.value.weight.weight_loader = self.weight_loader
 
-    def process_weights_after_loading(self) -> None:
-        self.value.weight.data = self.value.weight.T.contiguous()
+    @staticmethod
+    def weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight.T)
 
     def forward(
         self,
@@ -805,6 +818,7 @@ class RwkvModel(nn.Module):
             self.register_buffer(
                 "_embedding_norm_folded_buffer", torch.tensor(False), persistent=False
             )
+            self._embedding_norm_folded_buffer.weight_loader_numel = 0
         else:
             self.embed_tokens = PPMissingLayer()
             self.embedding_norm = PPMissingLayer()
@@ -836,14 +850,14 @@ class RwkvModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    @torch.no_grad()
     def _process_embedding_norm(self) -> None:
         if get_pp_group().is_first_rank and self._fold_embedding_norm:
             flashrwkv2 = _load_flashrwkv2()
             embedding = self.embed_tokens.weight
-            folded = torch.empty_like(embedding, dtype=torch.bfloat16)
             for start in range(0, embedding.shape[0], 4096):
                 end = min(start + 4096, embedding.shape[0])
-                folded[start:end].copy_(
+                embedding[start:end].copy_(
                     flashrwkv2.infer_embedding_ln0_forward_varlen(
                         embedding[start:end],
                         self.embedding_norm.weight,
@@ -851,16 +865,15 @@ class RwkvModel(nn.Module):
                         eps=self.config.layer_norm_epsilon,
                     )
                 )
-            self.embed_tokens.weight.data = folded
             self._embedding_norm_folded = True
             self._embedding_norm_folded_buffer.fill_(True)
 
-    def process_weights_after_loading(self) -> None:
-        self._process_embedding_norm()
+    def process_weights_after_loading(self, *, include_embedding: bool = True) -> None:
+        if include_embedding:
+            self._process_embedding_norm()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             assert isinstance(layer, RwkvDecoderLayer)
             layer.linear_attn.process_weights_after_loading()
-            layer.mlp.process_weights_after_loading()
 
     def forward(
         self,
@@ -964,6 +977,8 @@ class RwkvForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self._prepared_tuning_shapes: set[tuple[int, int, int, int]] = set()
+        self._reload_names: set[str] = set()
+        self._weights_processed = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1015,25 +1030,43 @@ class RwkvForCausalLM(
                 )
                 active_metadata = replace(
                     metadata,
-                    cu_seqlens=torch.arange(
-                        batch + 1, dtype=torch.int32, device=slots.device
-                    )
-                    * tokens
-                    // batch,
                     state_indices=slots,
-                    num_active_tokens=(
-                        torch.full_like(metadata.num_active_tokens, tokens)
-                        if metadata.num_active_tokens is not None
-                        else None
-                    ),
-                    num_active_sequences=(
-                        torch.full_like(metadata.num_active_sequences, batch)
-                        if metadata.num_active_sequences is not None
-                        else None
-                    ),
                     validated_metadata=None,
                     retain_ticket=False,
                 )
+                if metadata.retain_ticket or metadata.has_padding:
+                    # FlashRWKV2 requires fully active metadata for WKV tuning.
+                    assert metadata.num_active_tokens is not None
+                    assert metadata.num_active_sequences is not None
+                    active_metadata.cu_seqlens = (
+                        torch.arange(batch + 1, dtype=torch.int32, device=slots.device)
+                        * tokens
+                        // batch
+                    )
+                    active_metadata.num_active_tokens = torch.full_like(
+                        metadata.num_active_tokens, tokens
+                    )
+                    active_metadata.num_active_sequences = torch.full_like(
+                        metadata.num_active_sequences, batch
+                    )
+                    max_seqlen = max(metadata.max_seqlen, cdiv(tokens, batch))
+                    active_metadata.batch_size = batch
+                    active_metadata.max_seqlen = max_seqlen
+                    active_metadata.max_seqlen_capacity = max_seqlen
+                    active_metadata.has_padding = False
+                tuning_intermediates = intermediate_tensors
+                tuning_embeds = inputs_embeds
+                if metadata.has_padding and not metadata.retain_ticket:
+                    # Padding rows can contain undefined activations.
+                    if intermediate_tensors is not None:
+                        tuning_intermediates = IntermediateTensors(
+                            {
+                                key: torch.zeros_like(value)
+                                for key, value in intermediate_tensors.items()
+                            }
+                        )
+                    if inputs_embeds is not None:
+                        tuning_embeds = torch.zeros_like(inputs_embeds)
                 saved_state = None
                 if not metadata.retain_ticket:
                     indices = slots.long()
@@ -1053,8 +1086,8 @@ class RwkvForCausalLM(
                                 torch.zeros_like(input_ids)
                                 if input_ids is not None
                                 else None,
-                                intermediate_tensors,
-                                inputs_embeds,
+                                tuning_intermediates,
+                                tuning_embeds,
                             )
                         )
                 finally:
@@ -1086,18 +1119,45 @@ class RwkvForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from irwkv.model_executor.model_loader.reload import weight_update_active
+
         loaded = AutoWeightsLoader(self).load_weights(weights)
-        adapters = {
+        if weight_update_active():
+            self._reload_names.update(loaded)
+        return loaded
+
+    def get_checkpoint_optional_weights(self, loaded_weights: set[str]) -> set[str]:
+        adapter_weights = {
             name
             for name, _ in self.named_parameters()
             if name.endswith((".lora_A.weight", ".lora_B.weight"))
         }
-        if adapters.isdisjoint(loaded):
-            loaded.update(adapters)
-        return loaded
+        # A base checkpoint can omit the zero-initialized adapter as a whole.
+        return adapter_weights if adapter_weights.isdisjoint(loaded_weights) else set()
 
     def process_weights_after_loading(self) -> None:
-        self.model.process_weights_after_loading()
+        embedding_name = "model.embed_tokens.weight"
+        loaded = self._reload_names if self._weights_processed else None
+        try:
+            if loaded is not None and get_pp_group().is_first_rank:
+                norm_changed = any(
+                    name.startswith("model.embedding_norm.") for name in loaded
+                )
+                if (
+                    self.model._fold_embedding_norm
+                    and norm_changed
+                    and embedding_name not in loaded
+                ):
+                    raise ValueError(
+                        "Reloading RWKV embedding normalization requires the "
+                        "unfolded embedding weight in the same update."
+                    )
+            self.model.process_weights_after_loading(
+                include_embedding=loaded is None or embedding_name in loaded
+            )
+        finally:
+            self._reload_names.clear()
+        self._weights_processed = True
 
     def process_weights_after_tensorizer_loading(self) -> None:
         if get_pp_group().is_first_rank:
@@ -1112,3 +1172,4 @@ class RwkvForCausalLM(
                     )
             else:
                 self.model._process_embedding_norm()
+        self._weights_processed = True

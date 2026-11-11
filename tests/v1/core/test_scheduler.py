@@ -208,16 +208,18 @@ def test_schedule_separates_lora_versions_and_base() -> None:
     from irwkv.lora.request import LoRARequest
 
     scheduler = create_scheduler()
-    first, second, base = create_requests(num_requests=3)
+    first, second, same_version, base = create_requests(num_requests=4)
     first.lora_request = LoRARequest("tenant", 1, "/adapter")
     second.lora_request = LoRARequest("tenant", 2, "/adapter")
-    for request in (first, second, base):
+    same_version.lora_request = first.lora_request
+    for request in (first, second, same_version, base):
         scheduler.add_request(request)
 
-    for request in (first, second, base):
+    for requests in ((first, same_version), (second,), (base,)):
         output = scheduler.schedule()
-        assert set(output.num_scheduled_tokens) == {request.request_id}
-        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        request_ids = {request.request_id for request in requests}
+        assert set(output.num_scheduled_tokens) == request_ids
+        scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
 
 def test_async_scheduling_pp_reschedules_after_pipeline_cadence(monkeypatch):

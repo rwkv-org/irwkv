@@ -58,6 +58,20 @@ To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
 This uses irwkv's state-aligned cache blocks and copies recurrent state at block
 boundaries.
 
+With prefix caching, each request also keeps its latest committed block-aligned
+state after it finishes, is aborted, or is preempted. A newer boundary of the same
+request replaces it. A multi-turn client that resends the complete history
+resumes from that state and processes only the remaining tokens. Reuse requires
+an exact token-prefix match, so it applies to clients that resend the exact
+token history, such as the Completions API. Chat follow-ups re-render the
+history without the previous generation prompt, so they diverge before this
+state. If a re-rendered history differs, for example because reasoning was
+dropped, a tool call was re-serialized, or the chat template or
+`fake_cot_mode` changed, the hit falls back to the last matching retained
+boundary. The final sampled token of a turn is never consumed, so it
+and any unaligned tail are recomputed. Retained states are evictable blocks in
+the same state pool and are recomputed on a miss.
+
 For finer prefix reuse, set `--prefix-match-unit` to a divisor of the state
 block size. For example:
 
@@ -94,12 +108,14 @@ environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
   on first use with their recurrent state restored before the request executes.
 
 Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Model tuning
-uses fully active metadata and startup state slots, which are reset before
-capture. The report records each selected configuration, fingerprint, device
-class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
-and new worker processes reuse profiles through FlashRWKV2's locking and
-compatibility checks.
+actual graph shape, including the separate head/sampling graphs. Graph warmup
+and padded eager tuning use fully active representative metadata. Startup state
+slots are reset before capture. Unpadded eager tuning uses the request's packed
+sequence boundaries. Request execution passes the actual active counts to the
+TokenShift and WKV recurrent kernels, which skip padding. The report records
+each selected configuration, fingerprint, device class, profile path, and
+fixed/hit/missing/tuned status. Same-class GPUs and new worker processes reuse
+profiles through FlashRWKV2's locking and compatibility checks.
 
 To prepare the graph shapes before serving, run with the same model and serving
 arguments as the target service, including its sequence limit, token budget,
@@ -234,7 +250,7 @@ parameters with `rwkv_lora`:
 ```bash
 IRWKV_ALLOW_RUNTIME_LORA_UPDATING=1 irwkv serve <base-model> \
   --served-model-name base --dtype bfloat16 --enable-chunked-prefill \
-  --api-server-count 1 \
+  --api-server-count 1 --max-cpu-loras 8 \
   --hf-overrides '{"rwkv_lora": {"r": 32, "lora_alpha": 32, "use_nora": false, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"]}}'
 ```
 
@@ -254,7 +270,21 @@ already using an adapter retain their version until they finish. The base model
 and different adapter versions run in separate batches. All adapters must match
 the configured rank, scale, and NoRA setting, and target only configured layers.
 The runtime endpoints accept local paths accessible to the server. Dynamic
-updates require the Python API server with one API-server process.
+updates require a single Python API server. `--max-cpu-loras` bounds the
+number of resident adapter versions per worker, including a new version being
+loaded and retired versions still used by requests.
+
+## Online weight updates
+
+RWKV-7 accepts checkpoint-format updates through the native `nccl` and `ipc`
+weight-transfer backends. Pause generation during the update and reset the
+prefix cache before reusing cached states. The `IRWKV_RELOAD_MODE` environment
+variable selects upstream-style `layerwise` (the default) or `direct` reload.
+
+When embedding normalization is folded, an update that changes its weight or
+bias must include the original `model.embed_tokens.weight` in the same update.
+If an update fails after changing weights, send a complete checkpoint update
+before resuming generation.
 
 ## Runtime constraints
 

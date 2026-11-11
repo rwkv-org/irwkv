@@ -55,6 +55,7 @@ from irwkv.distributed.weight_transfer import (
     WeightTransferEngineFactory,
 )
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.model_executor.model_loader import get_model_loader
 from irwkv.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -1311,26 +1312,11 @@ class Worker(WorkerBase):
             model_config=self.model_config,
         )
 
-    def add_lora(self, lora_name: str, lora_id: int, lora_path: str) -> bool:
-        from irwkv.lora.request import LoRARequest
-        from irwkv.lora.worker_manager import WorkerLoRAManager
-
-        model = self.model_runner.get_model()
-        if not hasattr(model, "_lora_manager"):
-            model._lora_manager = WorkerLoRAManager(model)
-        return model._lora_manager.add_adapter(
-            LoRARequest(lora_name, lora_id, lora_path)
-        )
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        manager = getattr(self.model_runner.get_model(), "_lora_manager", None)
-        return manager.remove_adapter(lora_id) if manager is not None else False
-
-    def pin_lora(self, lora_id: int) -> bool:
-        return self.model_runner.get_model()._lora_manager.pin_adapter(lora_id)
-
-    def unpin_lora(self, lora_id: int) -> bool:
-        return self.model_runner.get_model()._lora_manager.unpin_adapter(lora_id)
+        return self.model_runner.remove_lora(lora_id)
 
     def _check_weight_transfer_engine(self) -> None:
         if self.weight_transfer_engine is None:
@@ -1364,6 +1350,8 @@ class Worker(WorkerBase):
                     "active. Call finish_weight_update first."
                 )
             try:
+                if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING:
+                    self.model_runner.deactivate_loras()
                 self.weight_transfer_engine.start_weight_update()
             except BaseException:
                 self.weight_transfer_engine.reset_weight_update_target()
@@ -1401,8 +1389,17 @@ class Worker(WorkerBase):
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
-                self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                from irwkv.model_executor.model_loader.reload.lifecycle import (
+                    abort_reload,
+                    weight_update_active,
+                )
+
+                try:
+                    if weight_update_active():
+                        abort_reload(self.weight_transfer_engine.model)
+                finally:
+                    self._weight_update_active = False
+                    self.weight_transfer_engine.reset_weight_update_target()
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1416,12 +1413,14 @@ class Worker(WorkerBase):
             )
 
         with set_current_irwkv_config(self.irwkv_config):
-            self.weight_transfer_engine.finish_weight_update()
-            self.weight_transfer_engine.reset_weight_update_target()
-            self._weight_update_active = False
+            try:
+                self.weight_transfer_engine.finish_weight_update()
+            finally:
+                self.weight_transfer_engine.reset_weight_update_target()
+                self._weight_update_active = False
 
-        # Weight transfer bypasses GPUModelRunner.reload_weights().
-        pass
+        if envs.IRWKV_ALLOW_RUNTIME_LORA_UPDATING:
+            self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
         gc.unfreeze()

@@ -126,10 +126,12 @@ async def merge_async_iterators(
                 except StopAsyncIteration:
                     pass
     finally:
-        # Cancel any remaining iterators
-        for f, (_, it) in awaits.items():
+        for f in awaits:
+            f.cancel()
+        if awaits:
+            await asyncio.gather(*awaits, return_exceptions=True)
+        for _, it in awaits.values():
             with contextlib.suppress(BaseException):
-                f.cancel()
                 await it.aclose()
 
 

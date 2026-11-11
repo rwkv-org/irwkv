@@ -101,9 +101,12 @@ def test_get_session_id_ignores_empty_and_non_string_values():
 
 
 @pytest.mark.asyncio
-async def test_lora_registry_reload_preserves_unique_versions():
+async def test_lora_reload_keeps_version_until_generation_is_cancelled():
+    import asyncio
+
     from irwkv.entrypoints.openai.models.protocol import BaseModelPath
     from irwkv.entrypoints.openai.models.serving import OpenAIServingModels
+    from irwkv.entrypoints.serve.engine.serving import BaseServing
     from irwkv.entrypoints.serve.lora.protocol import (
         LoadLoRAAdapterRequest,
         UnloadLoRAAdapterRequest,
@@ -113,19 +116,38 @@ async def test_lora_registry_reload_preserves_unique_versions():
         model_config=SimpleNamespace(max_model_len=128),
         renderer=None,
         input_processor=None,
-        collective_rpc=AsyncMock(return_value=[True]),
+        add_lora=AsyncMock(return_value=True),
+        remove_lora=AsyncMock(return_value=True),
     )
     models = OpenAIServingModels(engine, [BaseModelPath("base", "/base")])
     await models.load_lora_adapter(
         LoadLoRAAdapterRequest(lora_name="tenant", lora_path="/a")
     )
     first = models.get_lora("tenant")
+    assert first is not None
+    serving = BaseServing(models, engine.model_config)
+    generating = asyncio.Event()
+
+    async def generate():
+        yield first.lora_int_id
+        generating.set()
+        await asyncio.Future()
+
+    result = serving._with_lora(first, generate())
+    assert await anext(result) == first.lora_int_id
+    task = asyncio.create_task(anext(result))
+    await generating.wait()
     await models.load_lora_adapter(
         LoadLoRAAdapterRequest(lora_name="tenant", lora_path="/a", load_inplace=True)
     )
     second = models.get_lora("tenant")
-    assert first is not None and second is not None
+    assert second is not None
     assert first.lora_int_id != second.lora_int_id
+    engine.remove_lora.assert_not_awaited()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    engine.remove_lora.assert_awaited_once_with(first.lora_int_id)
     assert {card.id for card in (await models.show_available_models()).data} == {
         "base",
         "tenant",

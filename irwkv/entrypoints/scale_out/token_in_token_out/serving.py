@@ -368,6 +368,7 @@ class ServingTokens(GenerateBaseServing):
         )
 
         assert result_generator is not None
+        result_generator = self._with_lora(lora_request, result_generator)
 
         if request.stream:
             return self.serve_tokens_stream_generator(

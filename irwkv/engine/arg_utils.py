@@ -560,6 +560,7 @@ class EngineArgs:
     code_revision: str | None = ModelConfig.code_revision
     hf_token: bool | str | None = ModelConfig.hf_token
     hf_overrides: HfOverrides = get_field(ModelConfig, "hf_overrides")
+    max_cpu_loras: int = get_field(ModelConfig, "max_cpu_loras")
     model_class_overrides: dict[str, str] = get_field(
         ModelConfig, "model_class_overrides"
     )
@@ -872,6 +873,7 @@ class EngineArgs:
         model_group.add_argument("--config-format", **model_kwargs["config_format"])
         model_group.add_argument("--hf-token", **model_kwargs["hf_token"])
         model_group.add_argument("--hf-overrides", **model_kwargs["hf_overrides"])
+        model_group.add_argument("--max-cpu-loras", **model_kwargs["max_cpu_loras"])
         model_group.add_argument(
             "--model-class-overrides", **model_kwargs["model_class_overrides"]
         )
@@ -1717,6 +1719,7 @@ class EngineArgs:
             code_revision=self.code_revision,
             hf_token=self.hf_token,
             hf_overrides=self.hf_overrides,
+            max_cpu_loras=self.max_cpu_loras,
             model_class_overrides=self.model_class_overrides,
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,

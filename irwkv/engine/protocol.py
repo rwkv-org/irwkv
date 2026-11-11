@@ -197,6 +197,14 @@ class EngineClient(ABC):
         """Check whether the engine is sleeping."""
         ...
 
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load an adapter into the engine."""
+        raise NotImplementedError
+
+    async def remove_lora(self, lora_id: int) -> bool:
+        """Remove an adapter from the engine."""
+        raise NotImplementedError
+
     @abstractmethod
     async def pause_generation(
         self,

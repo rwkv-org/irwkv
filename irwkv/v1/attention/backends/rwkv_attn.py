@@ -82,6 +82,7 @@ class RwkvAttentionMetadata:
     num_active_sequences: torch.Tensor | None = None
     validated_metadata: object | None = None
     retain_ticket: bool = False
+    has_padding: bool = False
 
     @property
     def is_live(self) -> bool:
@@ -112,7 +113,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
         self._live_query_layouts: dict[
-            tuple[int, int, int], tuple[torch.Tensor, int]
+            tuple[int, int, int], tuple[torch.Tensor, int, int]
         ] = {}
         self._captured_descriptors: set[tuple[int, int, int]] = set()
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
@@ -180,6 +181,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             cu_seqlens.copy_(metadata.query_start_loc[: sequence_capacity + 1])
             num_active_tokens.zero_()
             num_active_sequences.zero_()
+            num_tokens = 0
             batch_size = sequence_capacity
             self._live_query_layouts.pop(descriptor, None)
         else:
@@ -192,10 +194,11 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
                 num_active_sequences.fill_(batch_size)
                 self._live_query_layouts[descriptor] = (
                     query_layout.clone(),
+                    num_tokens,
                     batch_size,
                 )
             else:
-                _, batch_size = cached_layout
+                _, num_tokens, batch_size = cached_layout
 
         rwkv_metadata = RwkvAttentionMetadata(
             cu_seqlens=cu_seqlens,
@@ -208,6 +211,7 @@ class RwkvAttentionMetadataBuilder(AttentionMetadataBuilder[RwkvAttentionMetadat
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
             retain_ticket=for_capture,
+            has_padding=num_tokens < token_capacity or batch_size < sequence_capacity,
         )
         if for_capture:
             self._captured_descriptors.add(descriptor)

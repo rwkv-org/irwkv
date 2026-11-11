@@ -438,6 +438,8 @@ class AsyncLLM(EngineClient):
             )
 
             request = prompt
+            if lora_request is not None:
+                request.lora_request = lora_request
             if request_id != request.request_id:
                 logger.warning_once(
                     "AsyncLLM.add_request() was passed a request_id parameter that "
@@ -465,6 +467,7 @@ class AsyncLLM(EngineClient):
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
                     kv_hints=kv_hints,
+                    lora_request=lora_request,
                 )
             else:
                 # Raw prompts require tokenization and possibly multimodal
@@ -481,11 +484,10 @@ class AsyncLLM(EngineClient):
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
                     kv_hints=kv_hints,
+                    lora_request=lora_request,
                 )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
-        if lora_request is not None:
-            request.lora_request = lora_request
         if reasoning_ended is not None:
             request.reasoning_ended = reasoning_ended
         if reasoning_parser_kwargs is not None:
@@ -505,7 +507,11 @@ class AsyncLLM(EngineClient):
         params = request.params
 
         if params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+            try:
+                await self._add_request(request, prompt_text, None, 0, queue)
+            except asyncio.CancelledError:
+                await self.abort(request.request_id, internal=True)
+                raise
             return queue
 
         parent_params = params
@@ -584,6 +590,7 @@ class AsyncLLM(EngineClient):
             data_parallel_rank=data_parallel_rank,
             session_id=session_id,
             kv_hints=kv_hints,
+            lora_request=lora_request,
         )
 
         if not sampling_params.skip_clone:
@@ -598,7 +605,6 @@ class AsyncLLM(EngineClient):
             params=sampling_params,
             **inputs,  # type: ignore[arg-type]
         )
-        final_req.lora_request = lora_request
         self.input_processor.assign_request_id(final_req)
         internal_req_id = final_req.request_id
 
@@ -623,7 +629,6 @@ class AsyncLLM(EngineClient):
                         resumable=True,
                         **inputs,  # type: ignore[arg-type]
                     )
-                    req.lora_request = lora_request
                     req.external_req_id = request_id
                     if req.prompt_embeds is not None:
                         raise IRWKVValidationError(
@@ -722,17 +727,7 @@ class AsyncLLM(EngineClient):
 
         """
         q: RequestOutputCollector | None = None
-        lora_pinned = False
         try:
-            if lora_request is not None:
-                pinned = await self.collective_rpc(
-                    "pin_lora", args=(lora_request.lora_int_id,)
-                )
-                if not all(pinned):
-                    raise ValueError(
-                        f"LoRA adapter {lora_request.lora_name!r} is unavailable"
-                    )
-                lora_pinned = True
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -812,10 +807,6 @@ class AsyncLLM(EngineClient):
         finally:
             if q is not None:
                 q.close()
-            if lora_pinned and lora_request is not None and not self.errored:
-                await self.collective_rpc(
-                    "unpin_lora", args=(lora_request.lora_int_id,)
-                )
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
@@ -1099,6 +1090,12 @@ class AsyncLLM(EngineClient):
 
     async def compute_weight_checksums(self) -> list[dict[str, str]]:
         return await self.engine_core.compute_weight_checksums_async()
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        return await self.engine_core.add_lora_async(lora_request)
+
+    async def remove_lora(self, lora_id: int) -> bool:
+        return await self.engine_core.remove_lora_async(lora_id)
 
     async def collective_rpc(
         self,

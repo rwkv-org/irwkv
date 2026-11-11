@@ -210,7 +210,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             generators.append(generator)
 
-        result_generator = merge_async_iterators(*generators)
+        result_generator = self._with_lora(
+            lora_request, merge_async_iterators(*generators)
+        )
 
         model_name = self.models.model_name(lora_request)
         num_prompts = len(engine_inputs)

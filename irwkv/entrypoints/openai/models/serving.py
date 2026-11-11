@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from itertools import count
 
@@ -19,6 +22,7 @@ from irwkv.entrypoints.serve.lora.protocol import (
     LoadLoRAAdapterRequest,
     UnloadLoRAAdapterRequest,
 )
+from irwkv.exceptions import IRWKVNotFoundError, LoRAAdapterNotFoundError
 from irwkv.logger import init_logger
 from irwkv.lora.request import LoRARequest
 
@@ -94,9 +98,33 @@ class OpenAIServingModels(OpenAIModelRegistry):
         self.lora_requests: dict[str, LoRARequest] = {}
         self._lora_id = count(1)
         self._lora_lock = asyncio.Lock()
+        self._lora_refs: Counter[int] = Counter()
+        self._retired_loras: set[int] = set()
 
     def get_lora(self, model_name: str | None) -> LoRARequest | None:
         return self.lora_requests.get(model_name) if model_name else None
+
+    @asynccontextmanager
+    async def use_lora(self, lora: LoRARequest) -> AsyncIterator[None]:
+        if self.get_lora(lora.lora_name) != lora:
+            raise IRWKVNotFoundError(f"The model `{lora.lora_name}` does not exist.")
+        lora_id = lora.lora_int_id
+        self._lora_refs[lora_id] += 1
+        try:
+            yield
+        finally:
+            self._lora_refs[lora_id] -= 1
+            if not self._lora_refs[lora_id]:
+                del self._lora_refs[lora_id]
+                if lora_id in self._retired_loras:
+                    self._retired_loras.remove(lora_id)
+                    await asyncio.shield(self.engine_client.remove_lora(lora_id))
+
+    async def _retire_lora(self, lora_id: int) -> None:
+        if self._lora_refs[lora_id]:
+            self._retired_loras.add(lora_id)
+        else:
+            await self.engine_client.remove_lora(lora_id)
 
     async def show_available_models(self) -> ModelList:
         models = await super().show_available_models()
@@ -115,6 +143,11 @@ class OpenAIServingModels(OpenAIModelRegistry):
     async def load_lora_adapter(
         self, request: LoadLoRAAdapterRequest
     ) -> ErrorResponse | str:
+        return await asyncio.shield(self._load_lora_adapter(request))
+
+    async def _load_lora_adapter(
+        self, request: LoadLoRAAdapterRequest
+    ) -> ErrorResponse | str:
         async with self._lora_lock:
             name, path = request.lora_name, request.lora_path
             if (
@@ -131,24 +164,28 @@ class OpenAIServingModels(OpenAIModelRegistry):
                 return create_error_response(f"LoRA adapter {name!r} is already loaded")
             lora = LoRARequest(name, next(self._lora_id), path)
             try:
-                added = await self.engine_client.collective_rpc(
-                    "add_lora", args=(name, lora.lora_int_id, path)
-                )
-                if not all(added):
-                    raise ValueError(f"Could not load LoRA adapter {name!r}")
+                if not await self.engine_client.add_lora(lora):
+                    raise RuntimeError(f"Could not load LoRA adapter {name!r}")
             except Exception as error:
-                await self.engine_client.collective_rpc(
-                    "remove_lora", args=(lora.lora_int_id,)
+                not_found = LoRAAdapterNotFoundError(name, path)
+                if str(not_found) in str(error):
+                    return create_error_response(not_found)
+                return create_error_response(
+                    str(error),
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                return create_error_response(str(error))
             self.lora_requests[name] = lora
             if previous is not None:
-                await self.engine_client.collective_rpc(
-                    "remove_lora", args=(previous.lora_int_id,)
-                )
+                await self._retire_lora(previous.lora_int_id)
             return f"Success: LoRA adapter '{name}' added successfully."
 
     async def unload_lora_adapter(
+        self, request: UnloadLoRAAdapterRequest
+    ) -> ErrorResponse | str:
+        return await asyncio.shield(self._unload_lora_adapter(request))
+
+    async def _unload_lora_adapter(
         self, request: UnloadLoRAAdapterRequest
     ) -> ErrorResponse | str:
         async with self._lora_lock:
@@ -159,7 +196,5 @@ class OpenAIServingModels(OpenAIModelRegistry):
                     err_type="NotFoundError",
                     status_code=HTTPStatus.NOT_FOUND,
                 )
-            await self.engine_client.collective_rpc(
-                "remove_lora", args=(lora.lora_int_id,)
-            )
+            await self._retire_lora(lora.lora_int_id)
             return f"Success: LoRA adapter '{request.lora_name}' removed successfully."

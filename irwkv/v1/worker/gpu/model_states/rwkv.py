@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
-from collections.abc import Sequence
+import copy
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -23,6 +24,7 @@ from irwkv.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from irwkv.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 from irwkv.v1.worker.gpu.sample.output import SamplerOutput
 from irwkv.v1.worker.gpu.sample.sampler import Sampler
+from irwkv.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 
 
 class _RwkvSamplingGraph:
@@ -53,9 +55,11 @@ class _RwkvSamplingGraph:
         self.top_p = torch.ones(capacity, device=device)
         self.num_active = torch.full((1,), capacity, dtype=torch.int32, device=device)
 
-        def forward() -> tuple[torch.Tensor, torch.Tensor]:
-            logits = model.compute_logits(self.hidden_states)
-            sampled = sample(
+        def compute_logits() -> torch.Tensor:
+            return model.compute_logits(self.hidden_states)
+
+        def sample_logits(logits: torch.Tensor) -> torch.Tensor:
+            return sample(
                 logits,
                 penalties,
                 states,
@@ -69,7 +73,10 @@ class _RwkvSamplingGraph:
                 sample_capacity=capacity,
                 num_active_samples=self.num_active,
             )
-            return logits, sampled
+
+        def forward() -> tuple[torch.Tensor, torch.Tensor]:
+            logits = compute_logits()
+            return logits, sample_logits(logits)
 
         capture_stream = torch.cuda.Stream(device=device)
         capture_stream.wait_stream(torch.cuda.current_stream(device))
@@ -78,9 +85,22 @@ class _RwkvSamplingGraph:
             for _ in range(2):
                 self.logits, self.sampled = forward()
         torch.cuda.current_stream(device).wait_stream(capture_stream)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=capture_stream):
-            self.logits, self.sampled = forward()
+        # Two graphs leave a gap for the grammar bitmask between logits and
+        # sampling, so structured output keeps the graphed path.
+        self.logits_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.logits_graph, stream=capture_stream):
+            self.logits = compute_logits()
+        self.sample_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            self.sample_graph, pool=self.logits_graph.pool(), stream=capture_stream
+        ):
+            self.sampled = sample_logits(self.logits)
+
+    def replay(self, apply_grammar_bitmask: Callable[[torch.Tensor], None] | None):
+        self.logits_graph.replay()
+        if apply_grammar_bitmask is not None:
+            apply_grammar_bitmask(self.logits)
+        self.sample_graph.replay()
 
 
 class RwkvSampler(Sampler):
@@ -122,6 +142,7 @@ class RwkvSampler(Sampler):
             tuple[int, tuple[torch.Tensor, torch.Tensor] | None]
         ] = []
         self._input_batch: InputBatch | None = None
+        self._graph_cu_num_logits = UvaBackedTensor(max_num_reqs + 1, dtype=torch.int32)
         self._sampling_graphs: dict[int, _RwkvSamplingGraph] = {}
         if capture_graphs:
             capacities = (1, 2, 4, 8, 16, 32, 64, 128, 256, 320, 512)
@@ -148,11 +169,11 @@ class RwkvSampler(Sampler):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: Any | None,
+        structured_outputs_worker: StructuredOutputsWorker | None = None,
     ) -> SamplerOutput | None:
         idx_mapping_np = input_batch.idx_mapping_np
         if (
-            grammar_output is not None
-            or self.compute_nans
+            self.compute_nans
             or self.get_logprobs_dims(idx_mapping_np) is not None
             or np.any(self.needs_logits_processing[idx_mapping_np])
             or not self._sampling_graphs
@@ -169,6 +190,30 @@ class RwkvSampler(Sampler):
         num_active = len(active_rows_np)
         if num_active == 0:
             return None
+
+        apply_grammar_bitmask = None
+        if grammar_output is not None:
+            assert structured_outputs_worker is not None
+            # Offsets into the compacted graph logits: one row per sampling
+            # request, none for requests still mid-prefill. The scheduler never
+            # asks the latter for a grammar mask.
+            cu_num_logits_np = self._graph_cu_num_logits.np[: num_reqs + 1]
+            cu_num_logits_np[0] = 0
+            np.cumsum(finishes_prefill, out=cu_num_logits_np[1:])
+            graph_batch = copy.copy(input_batch)
+            graph_batch.cu_num_logits_np = cu_num_logits_np
+            graph_batch.cu_num_logits = self._graph_cu_num_logits.copy_to_uva(
+                num_reqs + 1
+            )
+
+            def apply_grammar_bitmask(logits: torch.Tensor) -> None:
+                structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    graph_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
+
         capacity = next(size for size in self._sampling_graphs if size >= num_active)
         sampling_graph = self._sampling_graphs[capacity]
         active_slots_np = idx_mapping_np[active_rows_np]
@@ -201,7 +246,7 @@ class RwkvSampler(Sampler):
             self.sampling_states.top_p.gpu[active_slots_i64]
         )
         sampling_graph.num_active.fill_(num_active)
-        sampling_graph.graph.replay()
+        sampling_graph.replay(apply_grammar_bitmask)
 
         sampled = torch.zeros(num_reqs, dtype=torch.int64, device=hidden_states.device)
         sampled[active_rows] = sampling_graph.sampled[:num_active].to(torch.int64)
@@ -396,7 +441,6 @@ class RwkvModelState(DefaultModelState):
         self._rwkv_group_id: int | None = None
         self._sampler: RwkvSampler | None = None
         self._model = model
-        self._request_loras: dict[str, int | None] = {}
         cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
         self._capture_sampling_graphs = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
@@ -424,12 +468,11 @@ class RwkvModelState(DefaultModelState):
             hidden_states,
             input_batch,
             grammar_output,
+            self.structured_outputs_worker,
         )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
-        lora = new_req_data.lora_request
-        self._request_loras[new_req_data.req_id] = lora.lora_int_id if lora else None
         if self._sampler is not None:
             self._sampler.stage_request(req_index, new_req_data.req_id)
         self._state_block_columns[req_index] = (
@@ -443,7 +486,6 @@ class RwkvModelState(DefaultModelState):
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
-        self._request_loras.pop(req_id, None)
         if self._sampler is not None:
             self._sampler.remove_request(req_id)
 
@@ -474,10 +516,6 @@ class RwkvModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        if input_batch.num_reqs and hasattr(self._model, "_lora_manager"):
-            self._model._lora_manager.set_active_adapter(
-                self._request_loras[input_batch.req_ids[0]]
-            )
         if not self._align_mode or input_batch.num_reqs == 0:
             return
 

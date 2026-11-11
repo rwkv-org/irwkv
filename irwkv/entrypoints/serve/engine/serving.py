@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from http import HTTPStatus
+from typing import TypeVar
 
 from fastapi import Request
 
@@ -22,6 +25,8 @@ from irwkv.renderers.inputs.preprocess import (
 )
 from irwkv.sampling_params import BeamSearchParams
 from irwkv.utils import random_uuid
+
+_T = TypeVar("_T")
 
 
 class BaseServing:
@@ -78,6 +83,20 @@ class BaseServing:
                 param="model",
             )
         return lora
+
+    def _with_lora(
+        self, lora: LoRARequest | None, generator: AsyncGenerator[_T, None]
+    ) -> AsyncGenerator[_T, None]:
+        if lora is None:
+            return generator
+
+        async def generate() -> AsyncGenerator[_T, None]:
+            assert isinstance(self.models, OpenAIServingModels)
+            async with self.models.use_lora(lora), aclosing(generator):
+                async for output in generator:
+                    yield output
+
+        return generate()
 
     @staticmethod
     def create_error_response(

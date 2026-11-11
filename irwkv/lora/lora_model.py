@@ -9,7 +9,6 @@ import torch
 from irwkv.lora.lora_weights import LoRALayerWeights
 from irwkv.lora.peft_helper import PEFTHelper
 from irwkv.lora.utils import is_base_embedding_weights, parse_fine_tuned_lora_name
-from irwkv.utils.torch_utils import PIN_MEMORY
 
 
 class LoRAModel:
@@ -35,7 +34,6 @@ class LoRAModel:
         device: str = "cuda",
         dtype: torch.dtype | None = None,
     ) -> "LoRAModel":
-        pin_memory = device == "cpu" and PIN_MEMORY
         loras: dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
             if is_base_embedding_weights(tensor_name):
@@ -46,8 +44,6 @@ class LoRAModel:
                     module_name, peft_helper
                 )
             tensor = tensor.to(device=device, dtype=dtype)
-            if pin_memory:
-                tensor = tensor.pin_memory()
             if is_lora_a:
                 loras[module_name].lora_a = tensor
             else:

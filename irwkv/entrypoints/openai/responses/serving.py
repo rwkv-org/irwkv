@@ -5,7 +5,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 from http import HTTPStatus
 from typing import Any, Final
 
@@ -482,6 +482,7 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+        result_generator = self._with_lora(lora_request, result_generator)
 
         # Store the input messages.
         if request.store:
@@ -622,11 +623,12 @@ class OpenAIServingResponses(GenerateBaseServing):
                 lora_request=lora_request,
             )
 
-            async for res in generator:
-                context.request_metrics = res.metrics
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            async with aclosing(generator):
+                async for res in generator:
+                    context.request_metrics = res.metrics
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.

@@ -21,6 +21,9 @@ __all__ = [
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
+    "start_reload",
+    "finish_reload",
+    "weight_update_active",
 ]
 
 from .layerwise import (
@@ -29,3 +32,4 @@ from .layerwise import (
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
+from .lifecycle import finish_reload, start_reload, weight_update_active

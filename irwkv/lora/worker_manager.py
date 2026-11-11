@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 
+from irwkv.distributed import get_pp_group
+from irwkv.exceptions import LoRAAdapterNotFoundError
 from irwkv.lora.lora_model import LoRAModel
 from irwkv.lora.peft_helper import PEFTHelper
 from irwkv.lora.request import LoRARequest
@@ -18,8 +19,9 @@ from irwkv.utils.torch_utils import PIN_MEMORY
 class WorkerLoRAManager:
     """Manage RWKV LoRA snapshots and the model's captured adapter buffers."""
 
-    def __init__(self, model: torch.nn.Module) -> None:
+    def __init__(self, model: torch.nn.Module, max_cpu_loras: int) -> None:
         self.model = model
+        self.max_cpu_loras = max_cpu_loras
         config = getattr(model.config, "rwkv_lora", None)
         if config is None:
             raise ValueError("RWKV LoRA requires the rwkv_lora model configuration")
@@ -33,6 +35,11 @@ class WorkerLoRAManager:
             for name, param in params.items()
             if name.endswith(".lora_A.weight")
         }
+        self.adapters: dict[int, LoRAModel] = {}
+        self.active: int | None = None
+        self.refresh_base_weights()
+
+    def refresh_base_weights(self) -> None:
         self.base = {
             name: (
                 a.detach().cpu().pin_memory()
@@ -44,15 +51,16 @@ class WorkerLoRAManager:
             )
             for name, (a, b) in self.layers.items()
         }
-        self.adapters: dict[int, LoRAModel] = {}
-        self.pins: Counter[int] = Counter()
-        self.retired: set[int] = set()
-        self.active: int | None = None
 
     def _load_adapter(self, request: LoRARequest) -> LoRAModel:
         path = Path(request.lora_path).expanduser()
-        with (path / "adapter_config.json").open() as file:
-            config = json.load(file)
+        try:
+            with (path / "adapter_config.json").open() as file:
+                config = json.load(file)
+        except FileNotFoundError as exc:
+            raise LoRAAdapterNotFoundError(
+                request.lora_name, request.lora_path
+            ) from exc
         peft = PEFTHelper.from_dict(config)
         peft.validate_legal(SimpleNamespace(max_lora_rank=self.config["r"]))
         if (
@@ -77,6 +85,7 @@ class WorkerLoRAManager:
             device="cpu",
             dtype=torch.float32,
         )
+        local_loras = {}
         for name, weights in adapter.loras.items():
             if name not in self.layers:
                 parts = name.split(".")
@@ -89,7 +98,7 @@ class WorkerLoRAManager:
                         <= int(parts[2])
                         < self.model.model.end_layer
                     )
-                ) or (name == "lm_head" and "lm_head" not in self.layers):
+                ) or (name == "lm_head" and not get_pp_group().is_last_rank):
                     continue
                 raise ValueError(f"LoRA target {name!r} is not enabled for RWKV")
             a, b = self.layers[name]
@@ -100,37 +109,25 @@ class WorkerLoRAManager:
                 or weights.lora_b.shape != b.shape
             ):
                 raise ValueError(f"Invalid LoRA tensor shapes for {name!r}")
+            if PIN_MEMORY:
+                weights.lora_a = weights.lora_a.pin_memory()
+                weights.lora_b = weights.lora_b.pin_memory()
+            local_loras[name] = weights
+        adapter.loras = local_loras
         return adapter
 
     def add_adapter(self, request: LoRARequest) -> bool:
         if request.lora_int_id in self.adapters:
             return False
+        if len(self.adapters) >= self.max_cpu_loras:
+            raise ValueError(
+                f"LoRA capacity reached (--max-cpu-loras={self.max_cpu_loras})"
+            )
         self.adapters[request.lora_int_id] = self._load_adapter(request)
         return True
 
-    def pin_adapter(self, adapter_id: int) -> bool:
-        if adapter_id not in self.adapters or adapter_id in self.retired:
-            return False
-        self.pins[adapter_id] += 1
-        return True
-
     def remove_adapter(self, adapter_id: int) -> bool:
-        if adapter_id not in self.adapters:
-            return False
-        self.retired.add(adapter_id)
-        if not self.pins[adapter_id]:
-            del self.adapters[adapter_id]
-            self.retired.remove(adapter_id)
-        return True
-
-    def unpin_adapter(self, adapter_id: int) -> bool:
-        self.pins[adapter_id] -= 1
-        if self.pins[adapter_id] == 0:
-            del self.pins[adapter_id]
-            if adapter_id in self.retired:
-                del self.adapters[adapter_id]
-                self.retired.remove(adapter_id)
-        return True
+        return self.adapters.pop(adapter_id, None) is not None
 
     @torch.no_grad()
     def set_active_adapter(self, adapter_id: int | None) -> None:

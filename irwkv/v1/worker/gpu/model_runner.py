@@ -40,11 +40,14 @@ from irwkv.distributed.parallel_state import (
 )
 from irwkv.forward_context import BatchDescriptor, set_forward_context
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
+from irwkv.lora.worker_manager import WorkerLoRAManager
 from irwkv.model_executor.model_loader import get_model_loader
 from irwkv.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
+    finish_reload,
+    start_reload,
 )
+from irwkv.model_executor.model_loader.utils import get_missing_weights
 from irwkv.model_executor.models.interfaces import requires_raw_input_tokens
 from irwkv.model_executor.offloader import (
     create_offloader,
@@ -154,6 +157,8 @@ def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
 
 class GPUModelRunner:
     def __init__(self, irwkv_config: IrwkvConfig, device: torch.device):
+        self.lora_manager: WorkerLoRAManager | None = None
+        self.lora_requests: dict[str, LoRARequest] = {}
         self.irwkv_config = irwkv_config
         self.model_config = irwkv_config.model_config
         self.cache_config = irwkv_config.cache_config
@@ -369,6 +374,7 @@ class GPUModelRunner:
                 vocab_size=self.vocab_size,
                 device=self.device,
             )
+            self.model_state.structured_outputs_worker = self.structured_outputs_worker
 
         if not self.is_first_pp_rank:
             # For non-first PP ranks, create intermediate tensors sized
@@ -397,6 +403,31 @@ class GPUModelRunner:
     def get_model(self) -> nn.Module:
         return self.model
 
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        if self.lora_manager is None:
+            self.lora_manager = WorkerLoRAManager(
+                self.get_model(), self.model_config.max_cpu_loras
+            )
+        return self.lora_manager.add_adapter(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.lora_manager is not None and self.lora_manager.remove_adapter(
+            lora_id
+        )
+
+    def set_active_loras(self, req_ids: list[str]) -> None:
+        if self.lora_manager is not None:
+            lora = self.lora_requests.get(req_ids[0])
+            self.lora_manager.set_active_adapter(lora.lora_int_id if lora else None)
+
+    def deactivate_loras(self) -> None:
+        if self.lora_manager is not None:
+            self.lora_manager.set_active_adapter(None)
+
+    def reset_lora_state(self) -> None:
+        if self.lora_manager is not None:
+            self.lora_manager.refresh_base_weights()
+
     def reload_weights(
         self,
         weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
@@ -423,7 +454,6 @@ class GPUModelRunner:
             )
 
         model = self.get_model()
-        weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
 
         # load weights from disk if none are provided
@@ -448,11 +478,12 @@ class GPUModelRunner:
 
         # begin loading weights
         logger.info_once("Reloading weights inplace...")
+        self.deactivate_loras()
         if is_checkpoint_format:
             # load weights from checkpoint/ original model format
-            initialize_layerwise_reload(model)
+            start_reload(model)
             loaded_weights = model.load_weights(weights_iterator)
-            finalize_layerwise_reload(model, self.model_config)
+            finish_reload(model, self.model_config, self.device)
 
         else:
             # load weights from kernel format
@@ -474,13 +505,14 @@ class GPUModelRunner:
             diff_seconds,
         )
         if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
+            weights_not_loaded = get_missing_weights(model, loaded_weights)
             if weights_not_loaded:
                 logger.warning(
                     "Following weights were not loaded from checkpoint: %s",
                     weights_not_loaded,
                 )
 
+        self.reset_lora_state()
         self.reset_encoder_cache()
         self.reset_mm_cache()
 
@@ -840,6 +872,8 @@ class GPUModelRunner:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        if self.lora_manager is not None:
+            self.lora_requests.pop(req_id, None)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -901,6 +935,8 @@ class GPUModelRunner:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
+            if new_req_data.lora_request is not None:
+                self.lora_requests[req_id] = new_req_data.lora_request
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
@@ -1391,6 +1427,7 @@ class GPUModelRunner:
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            self.set_active_loras(input_batch.req_ids)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

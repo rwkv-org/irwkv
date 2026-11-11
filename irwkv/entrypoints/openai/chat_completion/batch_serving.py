@@ -22,6 +22,7 @@ from irwkv.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from irwkv.entrypoints.serve.utils.api_utils import get_max_tokens
 from irwkv.inputs import EngineInput
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.outputs import RequestOutput
 from irwkv.parser.abstract_parser import Parser
 from irwkv.tokenizers import TokenizerLike
@@ -200,6 +201,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             tokenizer,
             request_metadata,
             self.parser_cls,
+            lora_request,
         )
 
     async def chat_completion_full_generator_batch(
@@ -212,6 +214,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         parser_cls: type[Parser] | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         """Handle batched (non-streaming) chat completions.
 
@@ -225,7 +228,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         created_time = int(time.time())
         final_results: dict[int, RequestOutput] = {}
         try:
-            async for prompt_idx, res in merge_async_iterators(*generators):
+            async for prompt_idx, res in self._with_lora(
+                lora_request, merge_async_iterators(*generators)
+            ):
                 final_results[prompt_idx] = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")

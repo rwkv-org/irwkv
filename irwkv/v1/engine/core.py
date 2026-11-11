@@ -27,6 +27,7 @@ from irwkv.distributed import (
 from irwkv.envs import enable_envs_cache
 from irwkv.logger import configure_logging, init_logger
 from irwkv.logging_utils.dump_input import dump_engine_exception
+from irwkv.lora.request import LoRARequest
 from irwkv.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
@@ -931,6 +932,12 @@ class EngineCore:
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_executor.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_executor.remove_lora(lora_id)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
