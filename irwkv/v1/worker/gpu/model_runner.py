@@ -369,6 +369,7 @@ class GPUModelRunner:
                 vocab_size=self.vocab_size,
                 device=self.device,
             )
+            self.model_state.structured_outputs_worker = self.structured_outputs_worker
 
         if not self.is_first_pp_rank:
             # For non-first PP ranks, create intermediate tensors sized
