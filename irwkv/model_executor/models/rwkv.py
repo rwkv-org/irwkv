@@ -31,6 +31,7 @@ from irwkv.model_executor.models.interfaces import (
     SupportsPP,
 )
 from irwkv.sequence import IntermediateTensors
+from irwkv.utils.math_utils import cdiv
 from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
@@ -1015,29 +1016,43 @@ class RwkvForCausalLM(
                 )
                 active_metadata = replace(
                     metadata,
-                    cu_seqlens=torch.arange(
-                        batch + 1, dtype=torch.int32, device=slots.device
-                    )
-                    * tokens
-                    // batch
-                    if metadata.retain_ticket
-                    else metadata.cu_seqlens,
                     state_indices=slots,
-                    num_active_tokens=(
-                        torch.full_like(metadata.num_active_tokens, tokens)
-                        if metadata.retain_ticket
-                        and metadata.num_active_tokens is not None
-                        else metadata.num_active_tokens
-                    ),
-                    num_active_sequences=(
-                        torch.full_like(metadata.num_active_sequences, batch)
-                        if metadata.retain_ticket
-                        and metadata.num_active_sequences is not None
-                        else metadata.num_active_sequences
-                    ),
                     validated_metadata=None,
                     retain_ticket=False,
                 )
+                if metadata.retain_ticket or metadata.has_padding:
+                    # FlashRWKV2 requires fully active metadata for WKV tuning.
+                    assert metadata.num_active_tokens is not None
+                    assert metadata.num_active_sequences is not None
+                    active_metadata.cu_seqlens = (
+                        torch.arange(batch + 1, dtype=torch.int32, device=slots.device)
+                        * tokens
+                        // batch
+                    )
+                    active_metadata.num_active_tokens = torch.full_like(
+                        metadata.num_active_tokens, tokens
+                    )
+                    active_metadata.num_active_sequences = torch.full_like(
+                        metadata.num_active_sequences, batch
+                    )
+                    max_seqlen = max(metadata.max_seqlen, cdiv(tokens, batch))
+                    active_metadata.batch_size = batch
+                    active_metadata.max_seqlen = max_seqlen
+                    active_metadata.max_seqlen_capacity = max_seqlen
+                    active_metadata.has_padding = False
+                tuning_intermediates = intermediate_tensors
+                tuning_embeds = inputs_embeds
+                if metadata.has_padding and not metadata.retain_ticket:
+                    # Padding rows can contain undefined activations.
+                    if intermediate_tensors is not None:
+                        tuning_intermediates = IntermediateTensors(
+                            {
+                                key: torch.zeros_like(value)
+                                for key, value in intermediate_tensors.items()
+                            }
+                        )
+                    if inputs_embeds is not None:
+                        tuning_embeds = torch.zeros_like(inputs_embeds)
                 saved_state = None
                 if not metadata.retain_ticket:
                     indices = slots.long()
@@ -1057,8 +1072,8 @@ class RwkvForCausalLM(
                                 torch.zeros_like(input_ids)
                                 if input_ids is not None
                                 else None,
-                                intermediate_tensors,
-                                inputs_embeds,
+                                tuning_intermediates,
+                                tuning_embeds,
                             )
                         )
                 finally:
