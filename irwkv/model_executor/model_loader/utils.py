@@ -64,6 +64,14 @@ def process_weights_after_loading(
     # loaded, but it is identical to the input embeddings.
     maybe_retie_word_embeddings(model, model_config)
 
+    from irwkv.model_executor.model_loader.reload.direct import (
+        direct_reload_enabled,
+        record_checkpoint_layout,
+    )
+
+    if direct_reload_enabled():
+        record_checkpoint_layout(model)
+
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):

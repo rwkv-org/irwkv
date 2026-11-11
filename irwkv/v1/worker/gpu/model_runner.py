@@ -42,8 +42,8 @@ from irwkv.forward_context import BatchDescriptor, set_forward_context
 from irwkv.logger import init_logger
 from irwkv.model_executor.model_loader import get_model_loader
 from irwkv.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
+    finish_reload,
+    start_reload,
 )
 from irwkv.model_executor.models.interfaces import requires_raw_input_tokens
 from irwkv.model_executor.offloader import (
@@ -451,9 +451,9 @@ class GPUModelRunner:
         logger.info_once("Reloading weights inplace...")
         if is_checkpoint_format:
             # load weights from checkpoint/ original model format
-            initialize_layerwise_reload(model)
+            start_reload(model)
             loaded_weights = model.load_weights(weights_iterator)
-            finalize_layerwise_reload(model, self.model_config)
+            finish_reload(model, self.model_config, self.device)
 
         else:
             # load weights from kernel format

@@ -173,6 +173,27 @@ def test_update_resets_active_on_error():
     assert worker._weight_update_active is False
 
 
+def test_finish_failure_allows_next_update(monkeypatch):
+    engine = _RecordingEngine()
+    worker = _make_worker(engine)
+    finish = engine.finish_weight_update
+
+    def fail_finish():
+        raise ValueError("incomplete update")
+
+    monkeypatch.setattr(engine, "finish_weight_update", fail_finish)
+    Worker.start_weight_update(worker)
+    with pytest.raises(ValueError, match="incomplete update"):
+        Worker.finish_weight_update(worker)
+    assert worker._weight_update_active is False
+    assert engine.reset_count == 1
+
+    monkeypatch.setattr(engine, "finish_weight_update", finish)
+    Worker.start_weight_update(worker)
+    Worker.finish_weight_update(worker)
+    assert engine.finished
+
+
 def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):

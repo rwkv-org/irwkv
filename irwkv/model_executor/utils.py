@@ -33,6 +33,18 @@ def is_weights_pre_processed() -> bool:
     return _weights_pre_processed.get()
 
 
+def storage_view(
+    storage: torch.UntypedStorage,
+    offset: int,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """View a storage with the given dtype, offset, shape, and strides."""
+    view = torch.empty(0, dtype=dtype, device=storage.device)
+    return view.set_(storage, offset, shape, stride)
+
+
 def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: dict[str, Any] | None,

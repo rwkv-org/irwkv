@@ -1380,8 +1380,17 @@ class Worker(WorkerBase):
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
-                self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
+                from irwkv.model_executor.model_loader.reload.lifecycle import (
+                    abort_reload,
+                    weight_update_active,
+                )
+
+                try:
+                    if weight_update_active():
+                        abort_reload(self.weight_transfer_engine.model)
+                finally:
+                    self._weight_update_active = False
+                    self.weight_transfer_engine.reset_weight_update_target()
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1395,9 +1404,11 @@ class Worker(WorkerBase):
             )
 
         with set_current_irwkv_config(self.irwkv_config):
-            self.weight_transfer_engine.finish_weight_update()
-            self.weight_transfer_engine.reset_weight_update_target()
-            self._weight_update_active = False
+            try:
+                self.weight_transfer_engine.finish_weight_update()
+            finally:
+                self.weight_transfer_engine.reset_weight_update_target()
+                self._weight_update_active = False
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         pass
