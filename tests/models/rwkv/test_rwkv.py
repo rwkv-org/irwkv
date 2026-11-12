@@ -1832,9 +1832,7 @@ async def test_real_model_lora_tenant_isolation(
         args,
         env_dict={
             "IRWKV_ALLOW_RUNTIME_LORA_UPDATING": "1",
-            "IRWKV_RWKV_TUNING_MODE": os.environ.get(
-                "IRWKV_RWKV_TUNING_MODE", "inspect"
-            ),
+            "IRWKV_RWKV_TUNING_MODE": "inspect",
         },
         override_hf_configs=overrides,
         max_wait_seconds=300,
