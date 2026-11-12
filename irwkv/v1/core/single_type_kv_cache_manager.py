@@ -1953,7 +1953,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
-            request.num_prompt_tokens,
+            request.prompt_cache_boundary + 1,
             hash_block_size,
         )
         # The junction is the other position a sibling resumes at: where one was

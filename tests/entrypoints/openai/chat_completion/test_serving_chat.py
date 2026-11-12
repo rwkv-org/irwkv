@@ -478,6 +478,88 @@ async def test_chat_full_generator_gives_each_choice_parser_the_prompt():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("template_kwargs", "reasoning_parser", "stream", "generation_prompt", "prefix"),
+    [
+        ({"fake_cot_mode": False}, "", False, "<think", "<think"),
+        ({"fake_cot_mode": False}, "", True, "<think", "<think"),
+        ({"fake_cot_mode": True}, "", False, "<think></think", "<think></think"),
+        ({"rwkv_prompt_template": "assistant"}, "", False, "<think", "<think"),
+        ({"fake_cot_mode": False}, "rwkv", False, "<think", ""),
+    ],
+)
+async def test_rwkv_chat_caches_state_before_generation_prompt(
+    template_kwargs, reasoning_parser, stream, generation_prompt, prefix
+):
+    """The next turn renders this reply right after the assistant header, so
+    RWKV chat caches the prompt state there and returns the reply with its
+    generation prompt, which the client can resend unchanged."""
+    mock_engine = _build_mock_engine()
+    mock_engine.model_config.hf_config = MockHFConfig(model_type="rwkv")
+    mock_engine.model_config.generation_config = "irwkv"
+    serving_chat = _build_serving_chat(mock_engine, reasoning_parser=reasoning_parser)
+    serving_chat.chat_template = None
+    serving_chat.online_renderer.chat_template = None
+    tokenizer = mock_engine.renderer.tokenizer
+    reply = "先理解用户的问候。</think>你好！有什么可以帮你？"
+    if "rwkv_prompt_template" in template_kwargs:
+        header = "System: 你是一个助手。\n\nUser: 你好\n\nAssistant: "
+    else:
+        header = "System✿你是一个助手。✿\nUser✿你好✿\nBot✿"
+    prompt = header + generation_prompt
+    prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    mock_engine.generate.return_value = _single_request_output(
+        RequestOutput(
+            request_id="test-id",
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=reply,
+                    token_ids=tokenizer.encode(reply, add_special_tokens=False),
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+        )
+    )
+
+    response = await serving_chat.create_chat_completion(
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你是一个助手。"},
+                {"role": "user", "content": "你好"},
+            ],
+            chat_template_kwargs=template_kwargs,
+            stream=stream,
+        )
+    )
+
+    engine_input, params = mock_engine.generate.call_args.args[:2]
+    assert serving_chat._extract_prompt_components(engine_input).text == prompt
+    boundary = params.extra_args["prompt_cache_boundary"]
+    # The space after "Assistant:" tokenizes with the generation prompt.
+    header_ids = tokenizer.encode(header.rstrip(" "), add_special_tokens=False)
+    assert prompt_token_ids[:boundary] == header_ids
+    if stream:
+        content = ""
+        async for chunk in response:
+            if chunk.startswith("data: {"):
+                for choice in json.loads(chunk[6:])["choices"]:
+                    content += choice["delta"].get("content") or ""
+    else:
+        content = response.choices[0].message.content
+    assert content == prefix + (
+        reply if not reasoning_parser else "你好！有什么可以帮你？"
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_streaming_metrics_ride_on_usage_chunk():
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=True)
     chunks = await _collect_metrics_stream_chunks(

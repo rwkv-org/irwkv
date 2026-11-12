@@ -385,8 +385,15 @@ class Scheduler(SchedulerInterface):
         ckpt_block_size = (
             self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
         )
+        # The prompt is cached at its cache boundary; a resumed request also
+        # replays its output tokens.
+        cache_end = (
+            request.prompt_cache_boundary + 1
+            if request.num_tokens == request.num_prompt_tokens
+            else request.num_tokens
+        )
         last_cache_position = get_mamba_prefill_checkpoint_position(
-            request.num_tokens,
+            cache_end,
             block_size,
         )
 
@@ -426,7 +433,7 @@ class Scheduler(SchedulerInterface):
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             get_mamba_prefill_checkpoint_position(
-                request.num_prompt_tokens,
+                request.prompt_cache_boundary + 1,
                 self.hash_block_size,
             )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint

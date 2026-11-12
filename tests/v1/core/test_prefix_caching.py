@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from math import lcm
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -73,6 +74,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     session_id: str | None = None,
+    extra_args: dict[str, Any] | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -86,7 +88,9 @@ def make_request(
             )
             mm_features.append(mm_feature)
 
-    sampling_params = SamplingParams(max_tokens=17, prompt_logprobs=prompt_logprobs)
+    sampling_params = SamplingParams(
+        max_tokens=17, prompt_logprobs=prompt_logprobs, extra_args=extra_args
+    )
     sampling_params.update_from_generation_config({}, eos_token_id=100)
 
     return Request(
@@ -225,6 +229,101 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
     assert sibling_hit.blocks[0][-1] is checkpoint
     manager.block_pool.free_blocks(retained)
     manager.free(child)
+
+
+@pytest.mark.parametrize(
+    (
+        "hash_block_size",
+        "num_prompt_tokens",
+        "prompt_cache_boundary",
+        "chunks",
+        "follow_up_hit",
+        "resend_hit",
+    ),
+    [
+        (32, 65, None, [64, 1], 0, 64),
+        (32, 65, 63, [32, 33], 32, 32),
+        (8, 81, None, [64, 16, 1], 64, 80),
+        (8, 81, 79, [64, 8, 9], 72, 72),
+        # The boundary is the prompt-end checkpoint: nothing moves.
+        (32, 34, 32, [32, 2], 32, 32),
+    ],
+)
+def test_mamba_align_keeps_state_at_prompt_cache_boundary(
+    hash_block_size,
+    num_prompt_tokens,
+    prompt_cache_boundary,
+    chunks,
+    follow_up_hit,
+    resend_hit,
+):
+    """A chat follow-up shares the history up to the previous generation prompt
+    ("<think"), two tokens before the prompt end. A request declaring that
+    boundary keeps its state there instead of the prompt-end state, in as many
+    prefill steps; requests without one are unchanged."""
+    block_size = 32
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=((1,),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+    )
+    scheduler = SimpleNamespace(
+        block_size=block_size,
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=128,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=hash_block_size < block_size,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    prompt = list(range(num_prompt_tokens))
+    extra_args = (
+        None
+        if prompt_cache_boundary is None
+        else {"prompt_cache_boundary": prompt_cache_boundary}
+    )
+    turn = make_request("turn", prompt, hash_block_size, sha256, extra_args=extra_args)
+    scheduled = []
+    while turn.num_computed_tokens < num_prompt_tokens:
+        chunk = Scheduler._mamba_block_aligned_split(
+            self=scheduler,
+            request=turn,
+            num_new_tokens=num_prompt_tokens - turn.num_computed_tokens,
+        )
+        assert manager.allocate_slots(turn, chunk) is not None
+        _, retained = manager.take_kv_cache_block_copies()
+        manager.block_pool.free_blocks(retained)
+        turn.num_computed_tokens += chunk
+        manager.new_step_starts()
+        scheduled.append(chunk)
+    manager.free(turn)
+    assert scheduled == chunks
+
+    follow_up = make_request(
+        "follow_up", [*prompt[:-2], 1000, 1001, 1002], hash_block_size, sha256
+    )
+    _, num_computed, _ = manager.get_computed_blocks(follow_up)
+    assert num_computed == follow_up_hit
+    resend = make_request("resend", prompt, hash_block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(resend)
+    assert num_computed == resend_hit
 
 
 def make_kv_cache_config_hybrid_model(
