@@ -89,7 +89,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a18"
+    module.__version__ = "0.1.0a19"
     module.get_tuning_cache_dir = lambda: None
     module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
