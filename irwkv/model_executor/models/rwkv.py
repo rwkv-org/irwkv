@@ -50,7 +50,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a18"
+_FLASHRWKV2_VERSION = "0.1.0a19"
 logger = init_logger(__name__)
 
 
