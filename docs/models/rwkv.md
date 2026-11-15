@@ -23,7 +23,10 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a18`. FlashRWKV2 exposes the public
+commits and FlashRWKV2 revision
+`7b4df3029841cc4915a269f32e91749aa0e4e987` (based on 0.1.0a19). The source
+revision includes nonblocking state-slot operations; the 0.1.0a19 release alone
+does not provide them. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -90,10 +93,12 @@ OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
 Use `IRWKV_GPU_SYNC_CHECK=error` to detect host synchronization during inference.
 irwkv stages state-slot indices in pinned host memory where available and copies
-sampling state asynchronously during preemption and restoration. FlashRWKV2
-0.1.0a18 still synchronizes while validating recurrent-state slot indices in
-`reset_slots_` and `copy_slots_`, so these operations fail the strict check.
-Removing this remaining synchronization requires an upstream state-provider fix.
+sampling state asynchronously during preemption and restoration. State-slot
+reset, copy and materialization use FlashRWKV2's `non_blocking=True` path, which
+checks bounds and destination uniqueness on the GPU. Invalid device indices
+raise an asynchronous CUDA error and require restarting the worker. CPU metadata
+errors still fail immediately. Keep strict synchronization checks enabled for
+correctness validation; run timing separately without their instrumentation.
 
 ## Kernel preparation
 
@@ -253,6 +258,73 @@ RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes
 of one or two. Recurrent state uses Mamba cache mode `none` or `align`.
 Rapid-Sampling supports raw logprobs and additive frequency/presence penalties;
 its configuration validation checks sampling options before generation starts.
+
+## GPU validation and serving measurements
+
+Reuse an existing converted 7.2B checkpoint and the pinned dependencies above.
+With a CUDA Toolkit matching the PyTorch CUDA major version, run the real-model
+matrix before measuring performance:
+
+```bash
+export IRWKV_RWKV_TEST_MODEL=/path/to/existing/7.2B-hf-model
+PATH="$PWD/.venv/bin:$PATH" \
+IRWKV_GPU_SYNC_CHECK=error \
+  .venv/bin/python -m pytest tests/models/rwkv/test_rwkv.py \
+  -q -k real_model_batching --tb=short
+```
+
+This checks FP32 and FP16 state, greedy and seeded sampling, cold and reused
+prefixes, eager and graph execution, and both logprob and plain generation.
+It includes a 129-token prompt whose last prefill crosses a state-block boundary.
+All token/logprob comparisons and strict synchronization checks must pass.
+
+For timing, use the official serving benchmark with the same checkpoint and
+server settings for each revision. Start the server without
+`IRWKV_GPU_SYNC_CHECK`; preserve the chosen state dtype, caching policy and
+memory budget in the experiment record. For example, on a GPU with enough
+memory for 512 concurrent states:
+
+```bash
+env -u IRWKV_GPU_SYNC_CHECK .venv/bin/irwkv serve "$IRWKV_RWKV_TEST_MODEL" \
+  --served-model-name rwkv --dtype bfloat16 \
+  --mamba-ssm-cache-dtype float32 --max-model-len 2048 \
+  --max-num-seqs 512 --max-num-batched-tokens 2048 \
+  --enable-chunked-prefill --enable-prefix-caching \
+  --block-size 32 --mamba-block-size 32 --prefix-match-unit 8
+```
+
+In another terminal, run the same fixed-seed workload three times per concurrency:
+
+```bash
+for batch in 1 4 64 320 512; do
+  for run in 1 2 3; do
+    curl --fail --silent --show-error -X POST \
+      http://127.0.0.1:8000/reset_prefix_cache | \
+      .venv/bin/python -c \
+      'import json, sys; assert json.load(sys.stdin)["success"]' || exit 1
+    .venv/bin/irwkv bench serve \
+      --backend openai-chat --endpoint /v1/chat/completions \
+      --model rwkv --tokenizer "$IRWKV_RWKV_TEST_MODEL" \
+      --dataset-name random --random-input-len 512 --random-output-len 128 \
+      --random-range-ratio 1.0 --seed 20261026 --ignore-eos \
+      --num-prompts 1024 --num-warmups "$batch" \
+      --request-rate inf --max-concurrency "$batch" \
+      --percentile-metrics ttft,tpot,itl,e2el \
+      --save-result --save-detailed --result-dir artifacts/rwkv-serving \
+      --result-filename "batch-${batch}-run-${run}.json" || exit 1
+  done
+done
+```
+
+The cache reset keeps prior runs from warming the next run's prompts. Concurrency
+bounds the number of outstanding requests, not the scheduler's exact
+batch size. Report TTFT, inter-token latency, end-to-end latency, throughput and
+run-to-run variation. Record both repository revisions, GPU, driver, CUDA and
+PyTorch versions. Measure cold-cache and reused-prefix chat workloads separately;
+the random workload alone does not establish a prefix-cache speedup. For each
+request, compute prefill speed as prompt tokens / TTFT and decode speed as output
+tokens / (end-to-end latency - TTFT). Repeat on each target device before claiming
+that performance is unchanged across devices.
 
 ## References and weights
 

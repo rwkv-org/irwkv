@@ -48,7 +48,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a18"
+_FLASHRWKV2_VERSION = "0.1.0a19"
 logger = init_logger(__name__)
 
 
@@ -56,16 +56,22 @@ class _FlashRWKVStateHandle(Protocol):
     @property
     def memory_layout(self) -> dict[str, int]: ...
 
-    def reset_slots_(self, indices: torch.Tensor) -> None: ...
+    def reset_slots_(
+        self, indices: torch.Tensor, *, non_blocking: bool = False
+    ) -> None: ...
 
     def copy_slots_(
         self,
         source: "_FlashRWKVStateHandle",
         source_indices: torch.Tensor,
         destination_indices: torch.Tensor,
+        *,
+        non_blocking: bool = False,
     ) -> None: ...
 
-    def materialize_slots_(self, indices: torch.Tensor) -> None: ...
+    def materialize_slots_(
+        self, indices: torch.Tensor, *, non_blocking: bool = False
+    ) -> None: ...
 
 
 _FLASHRWKV2_APIS = (
@@ -346,7 +352,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if self._tmix_shift_pool is None:
             raise RuntimeError("RWKV state pool has not been bound")
         device = self._tmix_shift_pool.device
-        if isinstance(slot_ids, torch.Tensor):
+        if isinstance(slot_ids, torch.Tensor) and slot_ids.device.type != "cpu":
             return slot_ids.to(device=device, dtype=torch.int32).contiguous()
         return async_tensor_h2d(slot_ids, dtype=torch.int32, device=device)
 
@@ -360,7 +366,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._tmix_shift_pool.index_fill_(1, long_indices, 0)
         self._cmix_shift_pool.index_fill_(1, long_indices, 0)
         for handle in self._wkv_handles:
-            handle.reset_slots_(indices)
+            handle.reset_slots_(indices, non_blocking=True)
 
     def copy_state_slots(
         self,
@@ -382,7 +388,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._tmix_shift_pool.index_copy_(1, destination_long, tmix_values)
         self._cmix_shift_pool.index_copy_(1, destination_long, cmix_values)
         for handle in self._wkv_handles:
-            handle.copy_slots_(handle, source, destination)
+            handle.copy_slots_(handle, source, destination, non_blocking=True)
 
     def copy_state_block_pairs(self, block_copies: Sequence[tuple[int, int]]) -> None:
         if not block_copies:
@@ -393,7 +399,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
     def materialize_state_slots(self, slot_ids: Sequence[int] | torch.Tensor) -> None:
         indices = self._slot_tensor(slot_ids)
         for handle in self._wkv_handles:
-            handle.materialize_slots_(indices)
+            handle.materialize_slots_(indices, non_blocking=True)
 
     def _prepare_live_ticket(self, metadata: RwkvAttentionMetadata) -> object:
         flashrwkv2 = _load_flashrwkv2()

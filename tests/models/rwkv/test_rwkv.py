@@ -51,7 +51,8 @@ class _FakeStateHandle:
             "total_nbytes": self.state.numel() * self.state.element_size(),
         }
 
-    def reset_slots_(self, indices: torch.Tensor) -> None:
+    def reset_slots_(self, indices: torch.Tensor, *, non_blocking: bool) -> None:
+        assert non_blocking
         self.state.index_fill_(0, indices.long(), 0)
 
     def copy_slots_(
@@ -59,20 +60,24 @@ class _FakeStateHandle:
         source: "_FakeStateHandle",
         source_indices: torch.Tensor,
         destination_indices: torch.Tensor,
+        *,
+        non_blocking: bool,
     ) -> None:
+        assert non_blocking
         source_indices = source_indices.long()
         destination_indices = destination_indices.long()
         self.state.index_copy_(
             0, destination_indices, source.state.index_select(0, source_indices)
         )
 
-    def materialize_slots_(self, indices: torch.Tensor) -> None:
+    def materialize_slots_(self, indices: torch.Tensor, *, non_blocking: bool) -> None:
+        assert non_blocking
         self.materialized.append(indices.clone())
 
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a18"
+    module.__version__ = "0.1.0a19"
     module.get_tuning_cache_dir = lambda: None
     module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
@@ -125,9 +130,10 @@ def _state_irwkv_config(state_dtype: str = "float32") -> SimpleNamespace:
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
 @pytest.mark.parametrize("padded_page", [False, True])
 def test_state_spec_and_caller_backed_slot_lifecycle(
-    monkeypatch, state_dtype, padded_page
+    monkeypatch, state_dtype, padded_page, state_device
 ) -> None:
-    monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
+    if state_device.type == "cpu":
+        monkeypatch.setitem(sys.modules, "flashrwkv2", _fake_flashrwkv2())
     irwkv_config = _state_irwkv_config(state_dtype)
     state_layer = RwkvStateLayer(irwkv_config, 2, "model.layers.0.rwkv_state")
     spec = state_layer.get_kv_cache_spec(irwkv_config)
@@ -144,54 +150,60 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
     num_slots = 3
     page_size = spec.page_size_bytes
     allocation_page_size = page_size * 3 // 2 if padded_page else page_size
-    raw = torch.zeros((num_slots, 1, 1, allocation_page_size), dtype=torch.int8)
+    raw = torch.zeros(
+        (num_slots, 1, 1, allocation_page_size), dtype=torch.int8, device=state_device
+    )
     state_layer.bind_kv_cache(raw[..., :page_size])
-    tmix, handle, cmix = state_layer.get_layer_state(0)
-    assert handle.state.shape == (num_slots, 2, 64, 64)
-    assert handle.state.dtype == getattr(torch, state_dtype)
+    tmix, _, cmix = state_layer.get_layer_state(0)
+    assert state_layer._wkv_state_pool is not None
+    state = state_layer._wkv_state_pool[0]
+    assert state.shape == (num_slots, 2, 64, 64)
+    assert state.dtype == getattr(torch, state_dtype)
     assert spec.page_size_bytes == 2 * (
         2 * 128 * torch.empty((), dtype=torch.bfloat16).element_size()
-        + 2 * 64 * 64 * handle.state.element_size()
+        + 2 * 64 * 64 * state.element_size()
     )
     assert tmix.dtype == cmix.dtype == torch.bfloat16
-    assert handle.state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert state.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     tmix[1].fill_(1)
-    handle.state[1].fill_(2)
+    state[1].fill_(2)
     cmix[1].fill_(4)
 
     source = torch.tensor([1], dtype=torch.int32)
     destination = torch.tensor([2], dtype=torch.int32)
-    state_layer.copy_state_slots(source, destination)
+    gpu_sync_debug.with_gpu_sync_check(state_layer.copy_state_slots)(
+        source, destination
+    )
     assert torch.all(tmix[2] == 1)
-    assert torch.all(handle.state[2] == 2)
+    assert torch.all(state[2] == 2)
     assert torch.all(cmix[2] == 4)
 
-    state_layer.reset_state_slots(destination)
+    gpu_sync_debug.with_gpu_sync_check(state_layer.reset_state_slots)(destination)
     assert torch.count_nonzero(tmix[2]) == 0
-    assert torch.count_nonzero(handle.state[2]) == 0
+    assert torch.count_nonzero(state[2]) == 0
     assert torch.count_nonzero(cmix[2]) == 0
 
     tmix[0].fill_(5)
     tmix[1].fill_(1)
-    handle.state[0].fill_(6)
-    handle.state[1].fill_(2)
+    state[0].fill_(6)
+    state[1].fill_(2)
     cmix[0].fill_(8)
     cmix[1].fill_(4)
-    state_layer.copy_state_slots(
+    gpu_sync_debug.with_gpu_sync_check(state_layer.copy_state_slots)(
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([1, 0], dtype=torch.int32),
     )
     assert torch.all(tmix[0] == 1) and torch.all(tmix[1] == 5)
-    assert torch.all(handle.state[0] == 2) and torch.all(handle.state[1] == 6)
+    assert torch.all(state[0] == 2) and torch.all(state[1] == 6)
     assert torch.all(cmix[0] == 4) and torch.all(cmix[1] == 8)
     assert torch.count_nonzero(raw.view(-1)[num_slots * page_size :]) == 0
 
-    state_layer.materialize_state_slots(source)
+    gpu_sync_debug.with_gpu_sync_check(state_layer.materialize_state_slots)(source)
     handles = []
     for layer_idx in range(2):
         layer_handle = state_layer.get_layer_state(layer_idx)[1]
-        assert isinstance(layer_handle, _FakeStateHandle)
-        handles.append(layer_handle)
+        if isinstance(layer_handle, _FakeStateHandle):
+            handles.append(layer_handle)
     assert all(
         len(layer_handle.materialized) == 1
         and torch.equal(layer_handle.materialized[0], source)
@@ -1497,6 +1509,13 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             expected_hit = max_hit // hit_unit * hit_unit if prefix_caching else 0
             assert hit.num_cached_tokens == expected_hit
             single, mixed = cold.outputs[0], hit.outputs[0]
+            plain_params = params.clone()
+            plain_params.logprobs = None
+            plain = runner.llm.generate(
+                [{"prompt_token_ids": [7, 8, 9]}, prompt], plain_params
+            )[1].outputs[0]
+            assert plain.token_ids == single.token_ids
+            assert plain.logprobs is None
         assert len(single.token_ids) == 4
         assert mixed.token_ids == single.token_ids
         assert mixed.logprobs == single.logprobs
