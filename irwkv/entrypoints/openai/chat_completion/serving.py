@@ -171,9 +171,9 @@ class OpenAIServingChat(GenerateBaseServing):
         self.splits_rwkv_generation_prompt = (
             self.model_config.hf_config.model_type == "rwkv"
         )
-        self._apply_chat_template_async: Callable[..., Awaitable[str | list[int]]] = (
-            make_async(safe_apply_chat_template)
-        )
+        self._split_rwkv_generation_prompt_async: Callable[
+            ..., Awaitable[tuple[str, int] | None]
+        ] = make_async(self._split_rwkv_generation_prompt)
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
@@ -260,7 +260,7 @@ class OpenAIServingChat(GenerateBaseServing):
             "reasoning_parser_kwargs": reasoning_parser_kwargs,
         }
 
-    async def _split_rwkv_generation_prompt(
+    def _split_rwkv_generation_prompt(
         self,
         request: ChatCompletionRequest,
         conversation: list[ConversationMessage],
@@ -298,7 +298,7 @@ class OpenAIServingChat(GenerateBaseServing):
             else [tool.model_dump() for tool in request.tools]
         )
         try:
-            reply_text = await self._apply_chat_template_async(
+            reply_text = safe_apply_chat_template(
                 self.model_config,
                 cast(Any, tokenizer),
                 [*conversation, {"role": "assistant", "content": "0"}],
@@ -407,7 +407,7 @@ class OpenAIServingChat(GenerateBaseServing):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
             mm_token_counts = _get_mm_token_counts(engine_input)
             rwkv_generation_prompt = (
-                await self._split_rwkv_generation_prompt(
+                await self._split_rwkv_generation_prompt_async(
                     request, conversation, chat_template_kwargs, engine_input
                 )
                 if self.splits_rwkv_generation_prompt
@@ -451,7 +451,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     }
                     # Return the reply as the next turn renders it, unless a
                     # reasoning parser already separates the reasoning.
-                    if parser is None or parser.reasoning_parser is None:
+                    if sampling_params.structured_outputs is None and (
+                        parser is None or parser.reasoning_parser is None
+                    ):
                         content_prefix = generation_prompt
 
             self._log_inputs(

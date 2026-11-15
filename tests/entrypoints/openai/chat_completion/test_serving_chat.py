@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -479,17 +480,50 @@ async def test_chat_full_generator_gives_each_choice_parser_the_prompt():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("template_kwargs", "reasoning_parser", "stream", "generation_prompt", "prefix"),
+    (
+        "template_kwargs",
+        "reasoning_parser",
+        "stream",
+        "generation_prompt",
+        "prefix",
+        "response_format",
+    ),
     [
-        ({"fake_cot_mode": False}, "", False, "<think", "<think"),
-        ({"fake_cot_mode": False}, "", True, "<think", "<think"),
-        ({"fake_cot_mode": True}, "", False, "<think></think", "<think></think"),
-        ({"rwkv_prompt_template": "assistant"}, "", False, "<think", "<think"),
-        ({"fake_cot_mode": False}, "rwkv", False, "<think", ""),
+        ({"fake_cot_mode": False}, "", False, "<think", "<think", None),
+        ({"fake_cot_mode": False}, "", True, "<think", "<think", None),
+        ({"fake_cot_mode": True}, "", False, "<think></think", "<think></think", None),
+        ({"rwkv_prompt_template": "assistant"}, "", False, "<think", "<think", None),
+        ({"fake_cot_mode": False}, "rwkv", False, "<think", "", None),
+        *[
+            ({"fake_cot_mode": True}, "", stream, "<think></think", "", response_format)
+            for response_format in (
+                {"type": "json_object"},
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "result",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            )
+            for stream in (False, True)
+        ],
     ],
 )
 async def test_rwkv_chat_caches_state_before_generation_prompt(
-    template_kwargs, reasoning_parser, stream, generation_prompt, prefix
+    template_kwargs,
+    reasoning_parser,
+    stream,
+    generation_prompt,
+    prefix,
+    response_format,
+    monkeypatch,
 ):
     """The next turn renders this reply right after the assistant header, so
     RWKV chat caches the prompt state there and returns the reply with its
@@ -502,6 +536,8 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     serving_chat.online_renderer.chat_template = None
     tokenizer = mock_engine.renderer.tokenizer
     reply = "先理解用户的问候。</think>你好！有什么可以帮你？"
+    if response_format is not None:
+        reply = '{"ok":true}'
     if "rwkv_prompt_template" in template_kwargs:
         header = "System: 你是一个助手。\n\nUser: 你好\n\nAssistant: "
     else:
@@ -528,17 +564,28 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
         )
     )
 
-    response = await serving_chat.create_chat_completion(
-        ChatCompletionRequest(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "你是一个助手。"},
-                {"role": "user", "content": "你好"},
-            ],
-            chat_template_kwargs=template_kwargs,
-            stream=stream,
+    event_loop_thread = threading.get_ident()
+    encode = tokenizer.encode
+
+    def encode_off_event_loop(text, *args, **kwargs):
+        if text.startswith(header):
+            assert threading.get_ident() != event_loop_thread
+        return encode(text, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tokenizer, "encode", encode_off_event_loop)
+        response = await serving_chat.create_chat_completion(
+            ChatCompletionRequest(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "你是一个助手。"},
+                    {"role": "user", "content": "你好"},
+                ],
+                chat_template_kwargs=template_kwargs,
+                stream=stream,
+                response_format=response_format,
+            )
         )
-    )
 
     engine_input, params = mock_engine.generate.call_args.args[:2]
     assert serving_chat._extract_prompt_components(engine_input).text == prompt
@@ -557,6 +604,8 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     assert content == prefix + (
         reply if not reasoning_parser else "你好！有什么可以帮你？"
     )
+    if response_format is not None:
+        assert json.loads(content) == {"ok": True}
 
 
 @pytest.mark.asyncio

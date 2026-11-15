@@ -27,6 +27,7 @@ from irwkv.multimodal.inputs import (
 )
 from irwkv.sampling_params import SamplingParams
 from irwkv.utils.hashing import sha256, sha256_cbor
+from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
 from irwkv.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from irwkv.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
 from irwkv.v1.core.kv_cache_utils import (
@@ -233,6 +234,9 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
 
 @pytest.mark.parametrize(
     (
+        "spec_cls",
+        "retention_interval",
+        "shared_prefix_boundary",
         "hash_block_size",
         "num_prompt_tokens",
         "prompt_cache_boundary",
@@ -241,15 +245,24 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
         "resend_hit",
     ),
     [
-        (32, 65, None, [64, 1], 0, 64),
-        (32, 65, 63, [32, 33], 32, 32),
-        (8, 81, None, [64, 16, 1], 64, 80),
-        (8, 81, 79, [64, 8, 9], 72, 72),
+        (MambaSpec, 0, 0, 32, 65, None, [64, 1], 0, 64),
+        (MambaSpec, 0, 0, 32, 65, 63, [32, 33], 32, 32),
+        (MambaSpec, 0, 0, 8, 81, None, [64, 16, 1], 64, 80),
+        (MambaSpec, 0, 0, 8, 81, 79, [64, 8, 9], 72, 72),
         # The boundary is the prompt-end checkpoint: nothing moves.
-        (32, 34, 32, [32, 2], 32, 32),
+        (MambaSpec, 0, 0, 32, 34, 32, [32, 2], 32, 32),
+        (MambaSpec, 0, 0, 8, 129, 127, [96, 24, 8, 1], 120, 120),
+        (RwkvStateSpec, 0, 0, 8, 129, 127, [96, 24, 9], 120, 120),
+        (RwkvStateSpec, 0, 0, 8, 129, 125, [96, 24, 9], 120, 120),
+        (RwkvStateSpec, None, 0, 8, 129, 127, [96, 24, 8, 1], 120, 128),
+        (RwkvStateSpec, 128, 0, 8, 129, 127, [96, 24, 8, 1], 120, 128),
+        (RwkvStateSpec, 0, 128, 8, 129, 127, [96, 24, 8, 1], 120, 128),
     ],
 )
 def test_mamba_align_keeps_state_at_prompt_cache_boundary(
+    spec_cls,
+    retention_interval,
+    shared_prefix_boundary,
     hash_block_size,
     num_prompt_tokens,
     prompt_cache_boundary,
@@ -259,39 +272,40 @@ def test_mamba_align_keeps_state_at_prompt_cache_boundary(
 ):
     """A chat follow-up shares the history up to the previous generation prompt
     ("<think"), two tokens before the prompt end. A request declaring that
-    boundary keeps its state there instead of the prompt-end state, in as many
-    prefill steps; requests without one are unchanged."""
+    boundary keeps its state there instead of the prompt-end state. RWKV can
+    cross an unretained block boundary in the final chunk without caching the
+    earlier state under that block's hash."""
     block_size = 32
+    spec = spec_cls(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
     manager = make_kv_cache_manager(
         KVCacheConfig(
             num_blocks=16,
             kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["mamba"],
-                    MambaSpec(
-                        block_size=block_size,
-                        shapes=((1,),),
-                        dtypes=(torch.float32,),
-                        mamba_cache_mode="align",
-                    ),
-                )
-            ],
+            kv_cache_groups=[KVCacheGroupSpec(["mamba"], spec)],
         ),
-        max_model_len=128,
+        max_model_len=256,
         enable_caching=True,
         hash_block_size=hash_block_size,
-        retention_interval=0,
+        retention_interval=retention_interval,
     )
     scheduler = SimpleNamespace(
         block_size=block_size,
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            prefix_cache_retention_interval=retention_interval,
+        ),
         max_num_scheduled_tokens=128,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=hash_block_size,
         mamba_partial_cache_hit=hash_block_size < block_size,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_supports_unaligned_prefill=spec.supports_unaligned_prefill,
     )
     prompt = list(range(num_prompt_tokens))
     extra_args = (
@@ -300,6 +314,7 @@ def test_mamba_align_keeps_state_at_prompt_cache_boundary(
         else {"prompt_cache_boundary": prompt_cache_boundary}
     )
     turn = make_request("turn", prompt, hash_block_size, sha256, extra_args=extra_args)
+    turn.shared_prefix_boundary = shared_prefix_boundary
     scheduled = []
     while turn.num_computed_tokens < num_prompt_tokens:
         chunk = Scheduler._mamba_block_aligned_split(
@@ -1102,6 +1117,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_supports_unaligned_prefill=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(

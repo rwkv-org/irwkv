@@ -319,6 +319,11 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        self.mamba_supports_unaligned_prefill = self.has_mamba_layers and all(
+            not isinstance(group.kv_cache_spec, MambaSpec)
+            or group.kv_cache_spec.supports_unaligned_prefill
+            for group in kv_cache_config.kv_cache_groups
+        )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -451,11 +456,24 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        # RWKV copies the running state to the final chunk's destination slot.
+        # Once its checkpoint is saved, an unretained block end needs no stop.
+        skip_tail_alignment = (
+            self.mamba_supports_unaligned_prefill
+            and self.cache_config.prefix_cache_retention_interval == 0
+            and request.num_tokens == request.num_prompt_tokens
+            and 0 < tail_boundary <= start
+            and end >= prefill_end
+            and end - start <= block_size
+            and not start < junction < end
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
+            if start % block_size != 0
+            and not use_internal_checkpoint
+            and not skip_tail_alignment
             else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,

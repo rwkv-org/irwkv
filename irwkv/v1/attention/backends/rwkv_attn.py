@@ -29,6 +29,10 @@ class RwkvStateSpec(MambaSpec):
     def requires_block_zeroing(self) -> bool:
         return True
 
+    @property
+    def supports_unaligned_prefill(self) -> bool:
+        return True
+
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:

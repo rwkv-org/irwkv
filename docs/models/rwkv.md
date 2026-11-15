@@ -77,9 +77,13 @@ For RWKV chat requests, the server finds where the assistant reply starts, after
 `Bot✿` and before the generation prompt (`<think` or `<think></think`). Prefix
 caching keeps the prompt state there instead of before the last prompt token,
 because the next turn renders the reply at that position. Without a reasoning
-parser, the returned content starts with the generation prompt, so a client can
-resend the reply unchanged. Completions and other requests keep the prompt-end
+parser, unconstrained text responses start with the generation prompt, so a
+client can resend the reply unchanged. Structured outputs retain their requested
+format without that prefix. Completions and other requests keep the prompt-end
 checkpoint; clients can set it with `"irwkv_xargs": {"prompt_cache_boundary": N}`.
+With fine-grained matching and the default sparse retention policy, RWKV can
+finish a short prefill tail across an unretained state-block boundary. Required
+prompt and shared-prefix checkpoints are still saved before continuation.
 
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.

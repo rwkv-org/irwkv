@@ -442,7 +442,16 @@ def test_tensorized_embedding_norm_state(
     )
 
 
-def test_align_state_advance_uses_execution_owned_token_counts() -> None:
+@pytest.mark.parametrize(
+    ("query_lens", "sources", "destinations", "columns", "computed"),
+    [
+        ([1, 1], [3], [4], [0, 1], [16, 17]),
+        ([3, 1], [1, 3], [2, 4], [1, 1], [18, 17]),
+    ],
+)
+def test_align_state_advance_uses_execution_owned_token_counts(
+    query_lens, sources, destinations, columns, computed
+) -> None:
     copies: list[tuple[torch.Tensor, torch.Tensor]] = []
     resets: list[torch.Tensor] = []
     state_layer = SimpleNamespace(
@@ -465,7 +474,7 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
         num_reqs=2,
         idx_mapping_np=np.array([0, 1]),
         num_computed_tokens_np=np.array([31, 32], dtype=np.int32),
-        num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
+        num_scheduled_tokens=np.array(query_lens, dtype=np.int32),
     )
     block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     model_state.preprocess_state(
@@ -477,12 +486,12 @@ def test_align_state_advance_uses_execution_owned_token_counts() -> None:
 
     assert len(copies) == 1
     assert not resets
-    assert torch.equal(copies[0][0], torch.tensor([3], dtype=torch.int32))
-    assert torch.equal(copies[0][1], torch.tensor([4], dtype=torch.int32))
+    assert torch.equal(copies[0][0], torch.tensor(sources, dtype=torch.int32))
+    assert torch.equal(copies[0][1], torch.tensor(destinations, dtype=torch.int32))
     assert np.array_equal(
-        model_state._state_block_columns, np.array([0, 1], dtype=np.int32)
+        model_state._state_block_columns, np.array(columns, dtype=np.int32)
     )
-    assert np.array_equal(model_state._state_num_computed_tokens, np.array([16, 17]))
+    assert np.array_equal(model_state._state_num_computed_tokens, np.array(computed))
 
 
 def test_align_state_advance_resets_new_request_destination() -> None:
@@ -1398,13 +1407,24 @@ def test_config_accepts_async_scheduling() -> None:
     reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
 )
 @pytest.mark.parametrize(
-    ("prefix_caching", "prefix_match_unit"),
-    [(False, None), (True, None), (True, 32), (True, 8)],
+    ("prefix_caching", "prefix_match_unit", "prompt_cache_boundary"),
+    [
+        (False, None, None),
+        (True, None, None),
+        (True, 32, None),
+        (True, 8, None),
+        (True, 8, 127),
+    ],
 )
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
 def test_real_model_batching_preserves_tokens_and_logprobs(
-    irwkv_runner, prefix_caching, prefix_match_unit, state_dtype, temperature
+    irwkv_runner,
+    prefix_caching,
+    prefix_match_unit,
+    prompt_cache_boundary,
+    state_dtype,
+    temperature,
 ) -> None:
     """Each state mode agrees across prefill, batching and graph execution."""
     model_path = os.environ["IRWKV_RWKV_TEST_MODEL"]
@@ -1419,15 +1439,21 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
         frequency_penalty=0,
         penalty_decay=1,
         detokenize=False,
+        extra_args=(
+            {"prompt_cache_boundary": prompt_cache_boundary}
+            if prompt_cache_boundary is not None
+            else None
+        ),
     )
-    prompt_token_ids = list(range(1, 74))
+    prompt_len = 73 if prompt_cache_boundary is None else 129
+    prompt_token_ids = list(range(1, prompt_len + 1))
     prompt = {"prompt_token_ids": prompt_token_ids}
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with irwkv_runner(
             model_path,
             dtype="bfloat16",
-            max_model_len=128,
+            max_model_len=256,
             max_num_batched_tokens=token_budget,
             max_num_seqs=4,
             gpu_memory_utilization=0.8,
@@ -1445,8 +1471,8 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
                 [{"prompt_token_ids": [7, 8, 9]}, prompt], params
             )[1]
             assert cold.num_cached_tokens == 0
-            # The last prompt token is always recomputed to produce logits.
-            max_hit = len(prompt_token_ids) - 1
+            # An explicit chat boundary replaces the prompt-end checkpoint.
+            max_hit = prompt_cache_boundary or len(prompt_token_ids) - 1
             hit_unit = prefix_match_unit or 32
             expected_hit = max_hit // hit_unit * hit_unit if prefix_caching else 0
             assert hit.num_cached_tokens == expected_hit
