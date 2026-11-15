@@ -12,6 +12,7 @@ import torch.nn as nn
 from irwkv.config import IrwkvConfig
 from irwkv.model_executor.models.rwkv import _load_flashrwkv2, _prepare_tuning
 from irwkv.sampling_params import SamplingParams
+from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.core.sched.output import NewRequestData
 from irwkv.v1.kv_cache_interface import KVCacheConfig
 from irwkv.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -226,8 +227,12 @@ class RwkvSampler(Sampler):
     def preempt_request(self, req_id: str) -> None:
         req_idx = self.req_states.req_id_to_index[req_id]
         self._preserved_requests[req_id] = (
-            self._rapid_sampling_states[req_idx].to(device="cpu", copy=True),
-            self._rapid_penalties[req_idx].to(device="cpu", copy=True),
+            self._rapid_sampling_states[req_idx].to(
+                device="cpu", copy=True, non_blocking=True
+            ),
+            self._rapid_penalties[req_idx].to(
+                device="cpu", copy=True, non_blocking=True
+            ),
         )
 
     def remove_request(self, req_id: str) -> None:
@@ -271,8 +276,11 @@ class RwkvSampler(Sampler):
                 self._rapid_penalties[req_idx].zero_()
             else:
                 request_state, penalties = preserved
-                self._rapid_sampling_states[req_idx].copy_(request_state)
-                self._rapid_penalties[req_idx].copy_(penalties)
+                # Snapshot and restore are ordered on the model execution stream.
+                self._rapid_sampling_states[req_idx].copy_(
+                    request_state, non_blocking=True
+                )
+                self._rapid_penalties[req_idx].copy_(penalties, non_blocking=True)
         self._new_requests.clear()
 
     def __call__(
@@ -482,10 +490,10 @@ class RwkvModelState(DefaultModelState):
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
         if reset_rows_np.size:
-            reset_rows = torch.as_tensor(
+            reset_rows = async_tensor_h2d(
                 reset_rows_np, dtype=torch.int64, device=self.device
             )
-            reset_columns = torch.as_tensor(
+            reset_columns = async_tensor_h2d(
                 new_columns[reset_rows_np], dtype=torch.int64, device=self.device
             )
             reset_indices = block_table[reset_rows, reset_columns].contiguous()
@@ -494,13 +502,13 @@ class RwkvModelState(DefaultModelState):
             (old_columns >= 0) & (old_columns != new_columns)
         )
         if row_indices_np.size:
-            row_indices = torch.as_tensor(
+            row_indices = async_tensor_h2d(
                 row_indices_np, dtype=torch.int64, device=self.device
             )
-            source_columns = torch.as_tensor(
+            source_columns = async_tensor_h2d(
                 old_columns[row_indices_np], dtype=torch.int64, device=self.device
             )
-            destination_columns = torch.as_tensor(
+            destination_columns = async_tensor_h2d(
                 new_columns[row_indices_np], dtype=torch.int64, device=self.device
             )
             source_indices = block_table[row_indices, source_columns].contiguous()

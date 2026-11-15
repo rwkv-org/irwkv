@@ -26,6 +26,8 @@ from irwkv.model_executor.models.rwkv import (
     _load_flashrwkv2,
 )
 from irwkv.sampling_params import SamplingParams
+from irwkv.utils import gpu_sync_debug
+from irwkv.utils.platform_utils import is_pin_memory_available
 from irwkv.v1.attention.backend import AttentionCGSupport
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
@@ -442,6 +444,17 @@ def test_tensorized_embedding_norm_state(
     )
 
 
+@pytest.fixture(params=["cpu", "cuda"])
+def state_device(request, monkeypatch) -> torch.device:
+    if request.param == "cuda":
+        if not torch.cuda.is_available() or not is_pin_memory_available():
+            pytest.skip("requires CUDA with pinned host memory")
+        monkeypatch.setattr(gpu_sync_debug, "_SYNC_CHECK_MODE", "error")
+        monkeypatch.setattr(gpu_sync_debug, "_sync_check_enabled", True)
+        gpu_sync_debug.enable_gpu_sync_check()
+    return torch.device(request.param)
+
+
 @pytest.mark.parametrize(
     ("query_lens", "sources", "destinations", "columns", "computed"),
     [
@@ -450,7 +463,7 @@ def test_tensorized_embedding_norm_state(
     ],
 )
 def test_align_state_advance_uses_execution_owned_token_counts(
-    query_lens, sources, destinations, columns, computed
+    state_device, query_lens, sources, destinations, columns, computed
 ) -> None:
     copies: list[tuple[torch.Tensor, torch.Tensor]] = []
     resets: list[torch.Tensor] = []
@@ -468,7 +481,7 @@ def test_align_state_advance_uses_execution_owned_token_counts(
     model_state._state_num_computed_tokens = np.array([15, 16], dtype=np.int64)
     model_state._state_layer = state_layer
     model_state._rwkv_group_id = 0
-    model_state.device = torch.device("cpu")
+    model_state.device = state_device
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -476,8 +489,8 @@ def test_align_state_advance_uses_execution_owned_token_counts(
         num_computed_tokens_np=np.array([31, 32], dtype=np.int32),
         num_scheduled_tokens=np.array(query_lens, dtype=np.int32),
     )
-    block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-    model_state.preprocess_state(
+    block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=state_device)
+    gpu_sync_debug.with_gpu_sync_check(model_state.preprocess_state)(
         input_batch,
         (block_table,),
         SimpleNamespace(kv_cache_groups=[]),
@@ -486,15 +499,17 @@ def test_align_state_advance_uses_execution_owned_token_counts(
 
     assert len(copies) == 1
     assert not resets
-    assert torch.equal(copies[0][0], torch.tensor(sources, dtype=torch.int32))
-    assert torch.equal(copies[0][1], torch.tensor(destinations, dtype=torch.int32))
+    assert torch.equal(copies[0][0].cpu(), torch.tensor(sources, dtype=torch.int32))
+    assert torch.equal(
+        copies[0][1].cpu(), torch.tensor(destinations, dtype=torch.int32)
+    )
     assert np.array_equal(
         model_state._state_block_columns, np.array(columns, dtype=np.int32)
     )
     assert np.array_equal(model_state._state_num_computed_tokens, np.array(computed))
 
 
-def test_align_state_advance_resets_new_request_destination() -> None:
+def test_align_state_advance_resets_new_request_destination(state_device) -> None:
     resets: list[torch.Tensor] = []
     state_layer = SimpleNamespace(
         prefix="model.layers.0.rwkv_state",
@@ -508,7 +523,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     model_state._state_num_computed_tokens = np.array([0], dtype=np.int64)
     model_state._state_layer = state_layer
     model_state._rwkv_group_id = 0
-    model_state.device = torch.device("cpu")
+    model_state.device = state_device
 
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -516,8 +531,8 @@ def test_align_state_advance_resets_new_request_destination() -> None:
         num_computed_tokens_np=np.array([0], dtype=np.int32),
         num_scheduled_tokens=np.array([32], dtype=np.int32),
     )
-    block_table = torch.tensor([[7, 9]], dtype=torch.int32)
-    model_state.preprocess_state(
+    block_table = torch.tensor([[7, 9]], dtype=torch.int32, device=state_device)
+    gpu_sync_debug.with_gpu_sync_check(model_state.preprocess_state)(
         input_batch,
         (block_table,),
         SimpleNamespace(kv_cache_groups=[]),
@@ -525,7 +540,7 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     )
 
     assert len(resets) == 1
-    assert torch.equal(resets[0], torch.tensor([9], dtype=torch.int32))
+    assert torch.equal(resets[0].cpu(), torch.tensor([9], dtype=torch.int32))
     assert np.array_equal(model_state._state_block_columns, np.array([1]))
     assert np.array_equal(model_state._state_num_computed_tokens, np.array([32]))
 
@@ -1153,24 +1168,25 @@ def test_sampling_params_verify_rejects_unsupported_rwkv_controls() -> None:
             raise AssertionError(f"{message} must be rejected")
 
 
-def test_rapid_sampler_preserves_preempted_request_state() -> None:
+def test_rapid_sampler_preserves_preempted_request_state(state_device) -> None:
     sampler = object.__new__(RwkvSampler)
     sampler.req_states = SimpleNamespace(req_id_to_index={"request": 1})
-    sampler._rapid_sampling_states = torch.arange(8, dtype=torch.int8).view(2, 4)
-    sampler._rapid_penalties = torch.arange(12, dtype=torch.float32).view(2, 6)
+    sampler._rapid_sampling_states = torch.arange(
+        8, dtype=torch.int8, device=state_device
+    ).view(2, 4)
+    sampler._rapid_penalties = torch.arange(
+        12, dtype=torch.float32, device=state_device
+    ).view(2, 6)
     sampler._preserved_requests = {}
     sampler._new_requests = []
 
-    sampler.preempt_request("request")
+    gpu_sync_debug.with_gpu_sync_check(sampler.preempt_request)("request")
     state, penalties = sampler._preserved_requests["request"]
+    if state_device.type == "cuda":
+        assert state.is_pinned() and penalties.is_pinned()
     sampler._rapid_sampling_states[1].zero_()
     sampler._rapid_penalties[1].zero_()
 
-    assert torch.equal(state, torch.tensor([4, 5, 6, 7], dtype=torch.int8))
-    assert torch.equal(
-        penalties,
-        torch.tensor([6, 7, 8, 9, 10, 11], dtype=torch.float32),
-    )
     sampler.remove_request("request")
     assert "request" in sampler._preserved_requests
 
@@ -1222,9 +1238,13 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
         "_penalty_decay",
     ):
         setattr(sampler, name, writes)
-    sampler.apply_staged_writes()
-    assert torch.equal(sampler._rapid_sampling_states[0], state)
-    assert torch.equal(sampler._rapid_penalties[0], penalties)
+    gpu_sync_debug.with_gpu_sync_check(sampler.apply_staged_writes)()
+    assert torch.equal(sampler._rapid_sampling_states[0].cpu(), state)
+    assert torch.equal(sampler._rapid_penalties[0].cpu(), penalties)
+    assert torch.equal(state, torch.tensor([4, 5, 6, 7], dtype=torch.int8))
+    assert torch.equal(
+        penalties, torch.tensor([6, 7, 8, 9, 10, 11], dtype=torch.float32)
+    )
     assert not sampler._rapid_sampling_states[1].any()
     assert not sampler._rapid_penalties[1].any()
 

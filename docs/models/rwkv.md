@@ -88,6 +88,13 @@ prompt and shared-prefix checkpoints are still saved before continuation.
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
+Use `IRWKV_GPU_SYNC_CHECK=error` to detect host synchronization during inference.
+irwkv stages state-slot indices in pinned host memory where available and copies
+sampling state asynchronously during preemption and restoration. FlashRWKV2
+0.1.0a18 still synchronizes while validating recurrent-state slot indices in
+`reset_slots_` and `copy_slots_`, so these operations fail the strict check.
+Removing this remaining synchronization requires an upstream state-provider fix.
+
 ## Kernel preparation
 
 FlashRWKV2 stores verified tuning profiles and native builds under
