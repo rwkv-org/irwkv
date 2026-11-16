@@ -193,6 +193,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         http_timeout_keep_alive: None,
                         chat_template: None,
                         default_chat_template_kwargs: None,
+                        trust_request_chat_template: false,
                         limit_mm_per_prompt: {},
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
@@ -929,6 +930,7 @@ fn frontend_args_accept_json() {
                         http_timeout_keep_alive: None,
                         chat_template: None,
                         default_chat_template_kwargs: None,
+                        trust_request_chat_template: false,
                         limit_mm_per_prompt: {},
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
@@ -1103,7 +1105,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
         "--output-listener-fd",
         "999998",
         "--args-json",
-        r#"{"model_tag":"rwkv-rs/rwkv7-g1-st","generation_config":"irwkv","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"rwkv","tokenizer_mode":"hf","language_model_only":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
+        r#"{"model_tag":"rwkv-rs/rwkv7-g1-st","generation_config":"irwkv","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"rwkv","tokenizer_mode":"hf","language_model_only":true,"trust_request_chat_template":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
     ])
     .unwrap();
 
@@ -1125,6 +1127,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
     assert!(args.runtime.language_model_only);
     assert_eq!(args.runtime.max_logprobs, Some(-1));
     assert_eq!(args.runtime.shutdown_timeout, 3);
+    assert!(args.into_config().trust_request_chat_template);
 }
 
 #[test]
@@ -1607,6 +1610,7 @@ fn serve_args_accept_handshake_aliases() {
                         http_timeout_keep_alive: None,
                         chat_template: None,
                         default_chat_template_kwargs: None,
+                        trust_request_chat_template: false,
                         limit_mm_per_prompt: {},
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
@@ -1762,6 +1766,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             language_model_only: false,
             chat_template: None,
             default_chat_template_kwargs: None,
+            trust_request_chat_template: false,
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,
@@ -1857,6 +1862,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             language_model_only: false,
             chat_template: None,
             default_chat_template_kwargs: None,
+            trust_request_chat_template: false,
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,
@@ -1996,6 +2002,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             language_model_only: false,
             chat_template: None,
             default_chat_template_kwargs: None,
+            trust_request_chat_template: false,
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,

@@ -48,6 +48,15 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "IRWKV_API_KEY" not in envs.compile_factors()
 
 
+def test_rust_chat_template_fuel_is_opaque_to_python(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("IRWKV_CHAT_TEMPLATE_FUEL", "invalid")
+    try:
+        enable_envs_cache()
+        assert "IRWKV_CHAT_TEMPLATE_FUEL" not in envs.compile_factors()
+    finally:
+        disable_envs_cache()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("IRWKV_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("IRWKV_P2P_SIDE_CHANNEL_PORT", raising=False)

@@ -15,7 +15,7 @@ use tracing::{info, trace, warn};
 use self::format::{
     ChatTemplateContentFormat, ChatTemplateContentFormatOption as ContentFormatOption,
 };
-use self::template::{CompiledChatTemplate, TemplateContext};
+use self::template::{CompiledChatTemplate, TemplateContext, request_template_fuel};
 use super::{ChatRenderer, RenderedPrompt};
 use crate::error::Result;
 use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
@@ -77,6 +77,8 @@ pub struct HfChatRenderer {
     content_format: ContentFormatOption,
     special_tokens: Option<HfSpecialTokens>,
     multimodal: Option<MultimodalRenderInfo>,
+    trust_request_chat_template: bool,
+    request_template_fuel: Option<u64>,
 }
 
 impl HfChatRenderer {
@@ -97,6 +99,11 @@ impl HfChatRenderer {
             content_format,
             special_tokens: None,
             multimodal: None,
+            trust_request_chat_template: false,
+            request_template_fuel: request_template_fuel(
+                std::env::var_os("IRWKV_CHAT_TEMPLATE_FUEL").as_deref(),
+            )
+            .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
         })
     }
 
@@ -107,6 +114,12 @@ impl HfChatRenderer {
 
     pub fn with_multimodal(mut self, multimodal: Option<MultimodalRenderInfo>) -> Self {
         self.multimodal = multimodal;
+        self
+    }
+
+    /// Allow request-supplied chat templates.
+    pub fn with_trust_request_chat_template(mut self, trust_request_chat_template: bool) -> Self {
+        self.trust_request_chat_template = trust_request_chat_template;
         self
     }
 
@@ -156,7 +169,8 @@ impl HfChatRenderer {
             options.chat_template_content_format,
         )?
         .with_special_tokens(special_tokens)
-        .with_multimodal(multimodal))
+        .with_multimodal(multimodal)
+        .with_trust_request_chat_template(options.trust_request_chat_template))
     }
 
     /// Apply the chat template to one chat request, rendering the prompt string
@@ -164,14 +178,20 @@ impl HfChatRenderer {
     ///
     /// If the request carries a per-request `chat_template` override, a
     /// temporary template is compiled from that string and used instead of
-    /// the model's default.
+    /// the model's default. Request overrides require opt-in and run with
+    /// their own fuel budget.
     fn apply_chat_template(&self, request: &ChatRequest) -> Result<RenderedPrompt> {
+        if request.chat_options.chat_template.is_some() && !self.trust_request_chat_template {
+            return Err(Error::UntrustedRequestChatTemplate);
+        }
+
         let override_template = request
             .chat_options
             .chat_template
             .as_ref()
             .map(|template| {
                 CompiledChatTemplate::new(template.clone(), self.content_format)
+                    .map(|template| template.with_fuel(self.request_template_fuel))
                     .map_err(|error| Error::ChatTemplate(error.to_report_string()))
             })
             .transpose()?;
@@ -679,6 +699,7 @@ mod tests {
             HashMap::new(),
             ChatTemplateContentFormatOption::Auto,
         )?
+        .with_trust_request_chat_template(true)
         .render(request)?
         .prompt
         .into_text()
@@ -1072,6 +1093,46 @@ mod tests {
         request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
         let overridden = render(Some("{{ messages[0].content }}"), &request).unwrap();
         assert_eq!(overridden, "override:hello");
+    }
+
+    #[test]
+    fn only_request_templates_have_a_fuel_budget() {
+        let template = "{% for m in messages %}{% for _ in range(10) %}{{ m.content }}{% endfor %}{% endfor %}";
+        let mut request = sample_request((0..20_000).map(|_| ChatMessage::user("x")).collect());
+
+        let mut renderer = HfChatRenderer::new(
+            Some(template.to_owned()),
+            HashMap::new(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap()
+        .with_trust_request_chat_template(true);
+        renderer.request_template_fuel = super::request_template_fuel(None).unwrap();
+
+        let rendered = renderer.render(&request).unwrap().prompt.into_text().unwrap();
+        assert_eq!(rendered, "x".repeat(200_000));
+
+        request.chat_options.chat_template = Some(template.to_owned());
+        let Err(Error::ChatTemplate(message)) = renderer.render(&request) else {
+            panic!("expected the request template to run out of fuel");
+        };
+        assert!(message.contains("chat template exceeded its fuel budget"));
+        assert!(message.contains("IRWKV_CHAT_TEMPLATE_FUEL"));
+    }
+
+    #[test]
+    fn chat_template_refuses_untrusted_request_override() {
+        let mut request = sample_request(vec![ChatMessage::user("hello")]);
+        request.chat_options.chat_template = Some("override".to_owned());
+        let renderer = HfChatRenderer::new(
+            Some("{{ messages[0].content }}".to_owned()),
+            HashMap::new(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap();
+
+        let error = renderer.render(&request).unwrap_err();
+        assert!(matches!(error, Error::UntrustedRequestChatTemplate));
     }
 
     #[test]
