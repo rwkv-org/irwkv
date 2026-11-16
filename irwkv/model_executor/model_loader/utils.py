@@ -31,6 +31,13 @@ from irwkv.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
+def get_missing_weights(model: nn.Module, loaded_weights: set[str]) -> set[str]:
+    missing = {name for name, _ in model.named_parameters()} - loaded_weights
+    if missing and hasattr(model, "get_checkpoint_optional_weights"):
+        missing.difference_update(model.get_checkpoint_optional_weights(loaded_weights))
+    return missing
+
+
 @instrument(span_name="Initialize model")
 def initialize_model(
     irwkv_config: IrwkvConfig,
@@ -63,6 +70,14 @@ def process_weights_after_loading(
     # Reclaim memory when an explicit lm_head has been
     # loaded, but it is identical to the input embeddings.
     maybe_retie_word_embeddings(model, model_config)
+
+    from irwkv.model_executor.model_loader.reload.direct import (
+        direct_reload_enabled,
+        record_checkpoint_layout,
+    )
+
+    if direct_reload_enabled():
+        record_checkpoint_layout(model)
 
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)

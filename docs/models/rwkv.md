@@ -23,10 +23,7 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and FlashRWKV2 revision
-`7b4df3029841cc4915a269f32e91749aa0e4e987` (based on 0.1.0a19). The source
-revision includes nonblocking state-slot operations; the 0.1.0a19 release alone
-does not provide them. FlashRWKV2 exposes the public
+commits and `FlashRWKV2==0.1.0a19`. FlashRWKV2 exposes the public
 `prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
 recurrent-state provider.
 
@@ -61,6 +58,20 @@ To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
 This uses irwkv's state-aligned cache blocks and copies recurrent state at block
 boundaries.
 
+With prefix caching, each request also keeps its latest committed block-aligned
+state after it finishes, is aborted, or is preempted. A newer boundary of the same
+request replaces it. A multi-turn client that resends the complete history
+resumes from that state and processes only the remaining tokens. Reuse requires
+an exact token-prefix match, so it applies to clients that resend the exact
+token history, such as the Completions API. Chat follow-ups re-render the
+history without the previous generation prompt, so they diverge before this
+state. If a re-rendered history differs, for example because reasoning was
+dropped, a tool call was re-serialized, or the chat template or
+`fake_cot_mode` changed, the hit falls back to the last matching retained
+boundary. The final sampled token of a turn is never consumed, so it
+and any unaligned tail are recomputed. Retained states are evictable blocks in
+the same state pool and are recomputed on a miss.
+
 For finer prefix reuse, set `--prefix-match-unit` to a divisor of the state
 block size. For example:
 
@@ -92,13 +103,11 @@ Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
 Use `IRWKV_GPU_SYNC_CHECK=error` to detect host synchronization during inference.
-irwkv stages state-slot indices in pinned host memory where available and copies
-sampling state asynchronously during preemption and restoration. State-slot
-reset, copy and materialization use FlashRWKV2's `non_blocking=True` path, which
-checks bounds and destination uniqueness on the GPU. Invalid device indices
-raise an asynchronous CUDA error and require restarting the worker. CPU metadata
-errors still fail immediately. Keep strict synchronization checks enabled for
-correctness validation; run timing separately without their instrumentation.
+irwkv stages state-slot indices in pinned host memory where available, resets
+and copies caller-backed shift and recurrent state pools directly on the GPU,
+and transfers sampling state asynchronously during preemption and restoration.
+Keep strict synchronization checks enabled for correctness validation; run
+timing separately without their instrumentation.
 
 ## Kernel preparation
 
@@ -118,12 +127,14 @@ environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
   on first use with their recurrent state restored before the request executes.
 
 Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Model tuning
-uses fully active metadata and startup state slots, which are reset before
-capture. The report records each selected configuration, fingerprint, device
-class, profile path, and fixed/hit/missing/tuned status. Same-class GPUs
-and new worker processes reuse profiles through FlashRWKV2's locking and
-compatibility checks.
+actual graph shape, including the separate head/sampling graphs. Graph warmup
+and padded eager tuning use fully active representative metadata. Startup state
+slots are reset before capture. Unpadded eager tuning uses the request's packed
+sequence boundaries. Request execution passes the actual active counts to the
+TokenShift and WKV recurrent kernels, which skip padding. The report records
+each selected configuration, fingerprint, device class, profile path, and
+fixed/hit/missing/tuned status. Same-class GPUs and new worker processes reuse
+profiles through FlashRWKV2's locking and compatibility checks.
 
 To prepare the graph shapes before serving, run with the same model and serving
 arguments as the target service, including its sequence limit, token budget,
@@ -252,6 +263,49 @@ the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
 `rwkv_lora`, the model has no adapter parameters and passes no adapter
 arguments.
 
+To serve multiple adapters, enable runtime LoRA updates and reserve the adapter
+parameters with `rwkv_lora`:
+
+```bash
+IRWKV_ALLOW_RUNTIME_LORA_UPDATING=1 irwkv serve <base-model> \
+  --served-model-name base --dtype bfloat16 --enable-chunked-prefill \
+  --api-server-count 1 --max-cpu-loras 8 \
+  --hf-overrides '{"rwkv_lora": {"r": 32, "lora_alpha": 32, "use_nora": false, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"]}}'
+```
+
+Load a PEFT adapter directory containing `adapter_config.json` and
+`adapter_model.safetensors` (or `adapter_model.bin`/`.pt`):
+
+```bash
+curl -X POST localhost:8000/v1/load_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name":"tenant-a","lora_path":"/path/to/adapter"}'
+```
+
+Use `tenant-a` as the request's `model`. To replace it, load the new path with
+`"load_inplace": true`; to remove it, POST `{"lora_name":"tenant-a"}` to
+`/v1/unload_lora_adapter`. Each load gets a distinct cache identity. Requests
+already using an adapter retain their version until they finish. The base model
+and different adapter versions run in separate batches. All adapters must match
+the configured rank, scale, and NoRA setting, and target only configured layers.
+The runtime endpoints accept local paths accessible to the server. Dynamic
+updates require a single Python API server. `--max-cpu-loras` sets the
+per-worker adapter capacity. A replacement can use one extra slot while the
+old version is being retired. The old version stays resident until requests
+using it finish.
+
+## Online weight updates
+
+RWKV-7 accepts checkpoint-format updates through the native `nccl` and `ipc`
+weight-transfer backends. Pause generation during the update and reset the
+prefix cache before reusing cached states. The `IRWKV_RELOAD_MODE` environment
+variable selects upstream-style `layerwise` (the default) or `direct` reload.
+
+When embedding normalization is folded, an update that changes its weight or
+bias must include the original `model.embed_tokens.weight` in the same update.
+If an update fails after changing weights, send a complete checkpoint update
+before resuming generation.
+
 ## Runtime constraints
 
 RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes
@@ -285,7 +339,8 @@ memory budget in the experiment record. For example, on a GPU with enough
 memory for 512 concurrent states:
 
 ```bash
-env -u IRWKV_GPU_SYNC_CHECK .venv/bin/irwkv serve "$IRWKV_RWKV_TEST_MODEL" \
+env -u IRWKV_GPU_SYNC_CHECK IRWKV_SERVER_DEV_MODE=1 \
+  .venv/bin/irwkv serve "$IRWKV_RWKV_TEST_MODEL" \
   --served-model-name rwkv --dtype bfloat16 \
   --mamba-ssm-cache-dtype float32 --max-model-len 2048 \
   --max-num-seqs 512 --max-num-batched-tokens 2048 \

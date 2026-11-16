@@ -626,7 +626,12 @@ def generate_block_hash_extra_keys(
         request, start_token_idx, end_token_idx
     )
 
-    extra_keys: list[Any] = mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+    lora_keys = (
+        [("lora", request.lora_request.lora_int_id)] if request.lora_request else []
+    )
+    extra_keys: list[Any] = (
+        mm_extra_keys + cache_salt_keys + prompt_embeds_keys + lora_keys
+    )
 
     if not extra_keys:
         return None, new_start_mm_idx

@@ -25,6 +25,7 @@ from irwkv.v1.structured_output.request import StructuredOutputRequest
 from irwkv.v1.utils import ConstantList
 
 if TYPE_CHECKING:
+    from irwkv.lora.request import LoRARequest
     from irwkv.v1.core.kv_cache_utils import BlockHash
 
 
@@ -76,10 +77,12 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
+        lora_request: "LoRARequest | None" = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        self.lora_request = lora_request
         self.sampling_params = sampling_params
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
@@ -137,7 +140,11 @@ class Request:
         self.prompt_cache_boundary = self.num_prompt_tokens - 1
         if sampling_params.extra_args is not None:
             boundary = sampling_params.extra_args.get("prompt_cache_boundary")
-            if isinstance(boundary, int) and 0 < boundary < self.num_prompt_tokens:
+            if (
+                isinstance(boundary, int)
+                and not isinstance(boundary, bool)
+                and 0 < boundary < self.num_prompt_tokens
+            ):
                 self.prompt_cache_boundary = boundary
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
@@ -255,6 +262,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            lora_request=request.lora_request,
         )
 
     def append_output_token_ids(

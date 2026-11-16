@@ -339,6 +339,14 @@ def test_mamba_align_keeps_state_at_prompt_cache_boundary(
     resend = make_request("resend", prompt, hash_block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(resend)
     assert num_computed == resend_hit
+    bool_boundary = make_request(
+        "bool_boundary",
+        prompt,
+        hash_block_size,
+        sha256,
+        extra_args={"prompt_cache_boundary": True},
+    )
+    assert bool_boundary.prompt_cache_boundary == num_prompt_tokens - 1
 
 
 def make_kv_cache_config_hybrid_model(

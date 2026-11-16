@@ -171,6 +171,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.splits_rwkv_generation_prompt = (
             self.model_config.hf_config.model_type == "rwkv"
         )
+        self._rwkv_prompt_suffix_cache: dict[Any, tuple[str, str, str] | None] = {}
         self._split_rwkv_generation_prompt_async: Callable[
             ..., Awaitable[tuple[str, int] | None]
         ] = make_async(self._split_rwkv_generation_prompt)
@@ -259,6 +260,142 @@ class OpenAIServingChat(GenerateBaseServing):
             ),
             "reasoning_parser_kwargs": reasoning_parser_kwargs,
         }
+
+    def _get_rwkv_prompt_suffixes(
+        self,
+        request: ChatCompletionRequest,
+        conversation: list[ConversationMessage],
+        chat_template_kwargs: dict[str, Any],
+    ) -> tuple[str, str, str] | None:
+        has_tools = bool(
+            request.tools is not None
+            and not (
+                request.tool_choice == "none"
+                and self.exclude_tools_when_tool_choice_none
+            )
+        )
+        has_tool_history = any(
+            msg.get("role") == "tool" or msg.get("tool_calls") for msg in conversation
+        )
+        template = request.chat_template or self.chat_template
+        try:
+            kwargs_key = tuple(
+                sorted((k, repr(v)) for k, v in chat_template_kwargs.items())
+            )
+        except Exception:
+            return None
+        cache_key = (template, has_tools, has_tool_history, kwargs_key)
+        if cache_key in self._rwkv_prompt_suffix_cache:
+            return self._rwkv_prompt_suffix_cache[cache_key]
+
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        probe_messages: list[ConversationMessage] = [
+            ConversationMessage(role="user", content="x")
+        ]
+        if has_tool_history:
+            probe_messages.insert(0, ConversationMessage(role="tool", content="x"))
+        probe_tools: list[dict[str, Any]] | None = (
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "probe", "parameters": {"type": "object"}},
+                }
+            ]
+            if has_tools
+            else None
+        )
+        try:
+            probe_prompt = safe_apply_chat_template(
+                self.model_config,
+                cast(Any, tokenizer),
+                probe_messages,
+                tools=probe_tools,
+                chat_template=template,
+                tokenize=False,
+                add_generation_prompt=True,
+                continue_final_message=False,
+                **chat_template_kwargs,
+            )
+            probe_reply = safe_apply_chat_template(
+                self.model_config,
+                cast(Any, tokenizer),
+                [
+                    *probe_messages,
+                    ConversationMessage(role="assistant", content="0"),
+                ],
+                tools=probe_tools,
+                chat_template=template,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=False,
+                **chat_template_kwargs,
+            )
+        except Exception:
+            self._rwkv_prompt_suffix_cache[cache_key] = None
+            return None
+
+        probe_common = len(os.path.commonprefix([probe_prompt, probe_reply]))
+        generation_prompt = probe_prompt[probe_common:]
+        line_start = probe_prompt.rfind("\n", 0, probe_common)
+        if not generation_prompt or line_start < 0:
+            self._rwkv_prompt_suffix_cache[cache_key] = None
+            return None
+        result = (
+            probe_prompt[line_start:],
+            probe_reply[line_start:],
+            generation_prompt,
+        )
+        if len(self._rwkv_prompt_suffix_cache) < 64:
+            self._rwkv_prompt_suffix_cache[cache_key] = result
+        return result
+
+    def _try_fast_split_rwkv_generation_prompt(
+        self,
+        request: ChatCompletionRequest,
+        conversation: list[ConversationMessage],
+        chat_template_kwargs: dict[str, Any],
+        engine_input: EngineInput,
+    ) -> tuple[str, int] | None:
+        if not request.add_generation_prompt or request.continue_final_message:
+            return None
+        components = self._extract_prompt_components(engine_input)
+        prompt_text, prompt_token_ids = components.text, components.token_ids
+        if (
+            prompt_text is None
+            or prompt_token_ids is None
+            or len(prompt_token_ids) <= 32
+        ):
+            return None
+        suffixes = self._get_rwkv_prompt_suffixes(
+            request, conversation, chat_template_kwargs
+        )
+        if suffixes is None:
+            return None
+        prompt_suffix, reply_suffix, generation_prompt = suffixes
+        if not prompt_text.endswith(prompt_suffix):
+            return None
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        tail_ids = list(prompt_token_ids[-32:])
+        tail_text = tokenizer.decode(tail_ids, skip_special_tokens=False)
+        if (
+            not prompt_text.endswith(tail_text)
+            or len(tail_text) < len(prompt_suffix) + 32
+        ):
+            return None
+        tail_reply_text = tail_text[: -len(prompt_suffix)] + reply_suffix
+        tail_reply_ids = tokenizer.encode(tail_reply_text, add_special_tokens=False)
+        if tail_ids[:8] != tail_reply_ids[:8]:
+            return None
+        num_prefix_tokens = (
+            len(prompt_token_ids)
+            - len(tail_ids)
+            + len(os.path.commonprefix([tail_ids, tail_reply_ids]))
+        )
+        if num_prefix_tokens <= 0 or num_prefix_tokens >= len(prompt_token_ids):
+            return None
+        return generation_prompt, num_prefix_tokens
 
     def _split_rwkv_generation_prompt(
         self,
@@ -393,7 +530,10 @@ class OpenAIServingChat(GenerateBaseServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        model_name = self.models.model_name()
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
+        model_name = self.models.model_name(lora_request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -406,13 +546,17 @@ class OpenAIServingChat(GenerateBaseServing):
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
             mm_token_counts = _get_mm_token_counts(engine_input)
-            rwkv_generation_prompt = (
-                await self._split_rwkv_generation_prompt_async(
+            rwkv_generation_prompt = None
+            if self.splits_rwkv_generation_prompt:
+                rwkv_generation_prompt = self._try_fast_split_rwkv_generation_prompt(
                     request, conversation, chat_template_kwargs, engine_input
                 )
-                if self.splits_rwkv_generation_prompt
-                else None
-            )
+                if rwkv_generation_prompt is None:
+                    rwkv_generation_prompt = (
+                        await self._split_rwkv_generation_prompt_async(
+                            request, conversation, chat_template_kwargs, engine_input
+                        )
+                    )
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
@@ -445,10 +589,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     generation_prompt, num_prefix_tokens = rwkv_generation_prompt
                     # Cache the state before the generation prompt, which the
                     # next turn replaces with this reply.
-                    sampling_params.extra_args = {
-                        **(sampling_params.extra_args or {}),
-                        "prompt_cache_boundary": num_prefix_tokens,
-                    }
+                    extra_args = dict(sampling_params.extra_args or {})
+                    extra_args.setdefault("prompt_cache_boundary", num_prefix_tokens)
+                    sampling_params.extra_args = extra_args
                     # Return the reply as the next turn renders it, unless a
                     # reasoning parser already separates the reasoning.
                     if sampling_params.structured_outputs is None and (
@@ -476,6 +619,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     params=sampling_params,
                     trace_headers=trace_headers,
                     session_id=session_id,
+                    lora_request=lora_request,
                 )
             else:
                 generator = self.engine_client.generate(
@@ -486,6 +630,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    lora_request=lora_request,
                     **self._engine_reasoning_kwargs(
                         request, parser, chat_template_kwargs, prompt_token_ids
                     ),
@@ -495,6 +640,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+        result_generator = await self._with_lora(lora_request, result_generator)
 
         if request.stream:
             return self.chat_completion_stream_generator(
@@ -611,6 +757,10 @@ class OpenAIServingChat(GenerateBaseServing):
             stream_options, self.enable_force_include_usage
         )
 
+        defer_content_prefix = bool(content_prefix) and parsers[0] is not None
+        pending_prefixes = [
+            content_prefix if defer_content_prefix else "" for _ in range(num_choices)
+        ]
         last_res: RequestOutput | None = None
         try:
             async for res in result_generator:
@@ -640,7 +790,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             index=i,
                             delta=DeltaMessage(
                                 role=role,
-                                content=content_prefix,
+                                content="" if defer_content_prefix else content_prefix,
                             ),
                             logprobs=None,
                             finish_reason=None,
@@ -766,6 +916,23 @@ class OpenAIServingChat(GenerateBaseServing):
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
+
+                    if pending_prefixes[i]:
+                        if delta_message is not None and delta_message.content:
+                            delta_message.content = (
+                                pending_prefixes[i] + delta_message.content
+                            )
+                            pending_prefixes[i] = ""
+                        elif output.finish_reason is not None and not tools_streamed[i]:
+                            if delta_message is None:
+                                delta_message = DeltaMessage(
+                                    content=pending_prefixes[i]
+                                )
+                            else:
+                                delta_message.content = pending_prefixes[i] + (
+                                    delta_message.content or ""
+                                )
+                            pending_prefixes[i] = ""
 
                     previous_texts[i] += delta_text
 

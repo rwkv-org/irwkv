@@ -134,6 +134,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
             return result
 
         engine_inputs = result
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
@@ -191,6 +194,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     params=sampling_params,
                     trace_headers=trace_headers,
                     session_id=session_id,
+                    lora_request=lora_request,
                 )
             else:
                 generator = self.engine_client.generate(
@@ -201,13 +205,16 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    lora_request=lora_request,
                 )
 
             generators.append(generator)
 
-        result_generator = merge_async_iterators(*generators)
+        result_generator = await self._with_lora(
+            lora_request, merge_async_iterators(*generators)
+        )
 
-        model_name = self.models.model_name()
+        model_name = self.models.model_name(lora_request)
         num_prompts = len(engine_inputs)
 
         # Streaming response

@@ -22,6 +22,7 @@ from irwkv.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from irwkv.entrypoints.serve.utils.api_utils import get_max_tokens
 from irwkv.inputs import EngineInput
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.outputs import RequestOutput
 from irwkv.parser.abstract_parser import Parser
 from irwkv.tokenizers import TokenizerLike
@@ -128,7 +129,10 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        model_name = self.models.model_name()
+        lora_request = self._maybe_get_adapters(request.model)
+        if isinstance(lora_request, ErrorResponse):
+            return lora_request
+        model_name = self.models.model_name(lora_request)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         max_model_len = self.model_config.max_model_len
 
@@ -178,6 +182,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    lora_request=lora_request,
                     **self._engine_reasoning_kwargs(
                         single_request,
                         parser,
@@ -196,6 +201,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             tokenizer,
             request_metadata,
             self.parser_cls,
+            lora_request,
         )
 
     async def chat_completion_full_generator_batch(
@@ -208,6 +214,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         parser_cls: type[Parser] | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         """Handle batched (non-streaming) chat completions.
 
@@ -221,7 +228,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         created_time = int(time.time())
         final_results: dict[int, RequestOutput] = {}
         try:
-            async for prompt_idx, res in merge_async_iterators(*generators):
+            async for prompt_idx, res in await self._with_lora(
+                lora_request, merge_async_iterators(*generators)
+            ):
                 final_results[prompt_idx] = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")

@@ -361,7 +361,9 @@ async def test_concurrent_single_request_admission_respects_limit():
     llm.log_requests = False
 
     requests = [
-        SimpleNamespace(request_id=f"request-{idx}", prompt_token_ids=[idx])
+        SimpleNamespace(
+            request_id=f"request-{idx}", prompt_token_ids=[idx], lora_request=None
+        )
         for idx in range(2)
     ]
     results = await asyncio.gather(
@@ -424,6 +426,35 @@ async def test_parallel_admission_cancellation_cleans_up_all_children():
     assert llm.output_processor.get_num_unfinished_requests() == 0
     aborted_ids = llm.engine_core.abort_requests_async.await_args.args[0]
     assert set(aborted_ids) == {"0_parallel", "1_parallel", "2_parallel"}
+
+
+@pytest.mark.asyncio
+async def test_lora_admission_requires_a_registered_version():
+    from irwkv.exceptions import IRWKVValidationError
+    from irwkv.lora.request import LoRARequest
+
+    llm = _make_request_test_llm(3, AsyncMock())
+    llm._lora_requests = {}
+    llm._lora_lock = asyncio.Lock()
+    llm.engine_core.add_lora_async = AsyncMock(return_value=True)
+    llm.engine_core.remove_lora_async = AsyncMock(return_value=True)
+    request = _make_engine_request("adapter-request", 1)
+    lora = LoRARequest("tenant", 1, "/adapter")
+    request.lora_request = lora
+    with pytest.raises(IRWKVValidationError, match="not loaded"):
+        await llm.add_request(request.request_id, request, request.params)
+    llm.engine_core.add_request_async.assert_not_awaited()
+
+    assert await llm.add_lora(lora)
+    assert await llm.add_lora(lora)
+    assert not await llm.add_lora(LoRARequest("tenant", 1, "/different-adapter"))
+    llm.engine_core.add_lora_async.assert_awaited_once_with(lora)
+
+    await llm.add_request(request.request_id, request, request.params)
+    assert not await llm.remove_lora(lora.lora_int_id)
+    llm.engine_core.remove_lora_async.assert_not_awaited()
+    await llm.abort(request.request_id, internal=True)
+    assert await llm.remove_lora(lora.lora_int_id)
 
 
 # ---------------------------------------------------------------------------

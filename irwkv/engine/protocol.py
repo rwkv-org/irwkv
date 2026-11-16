@@ -13,6 +13,7 @@ from irwkv.distributed.weight_transfer.base import (
     WeightTransferUpdateRequest,
 )
 from irwkv.inputs import EngineInput, PromptType
+from irwkv.lora.request import LoRARequest
 from irwkv.outputs import RequestOutput
 from irwkv.renderers import BaseRenderer
 from irwkv.sampling_params import SamplingParams
@@ -102,6 +103,7 @@ class EngineClient(ABC):
         kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        lora_request: LoRARequest | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...
@@ -194,6 +196,14 @@ class EngineClient(ABC):
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping."""
         ...
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load an adapter into the engine."""
+        raise NotImplementedError
+
+    async def remove_lora(self, lora_id: int) -> bool:
+        """Remove an adapter from the engine."""
+        raise NotImplementedError
 
     @abstractmethod
     async def pause_generation(

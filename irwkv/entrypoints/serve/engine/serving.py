@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from http import HTTPStatus
+from typing import TypeVar, cast
 
 from fastapi import Request
 
@@ -15,12 +18,15 @@ from irwkv.entrypoints.serve.engine.protocol import ErrorResponse
 from irwkv.entrypoints.serve.engine.typing import AnyRequest
 from irwkv.entrypoints.serve.utils.request_logger import RequestLogger
 from irwkv.inputs import EngineInput
+from irwkv.lora.request import LoRARequest
 from irwkv.renderers.inputs.preprocess import (
     extract_prompt_components,
     extract_prompt_len,
 )
 from irwkv.sampling_params import BeamSearchParams
 from irwkv.utils import random_uuid
+
+_T = TypeVar("_T")
 
 
 class BaseServing:
@@ -60,7 +66,42 @@ class BaseServing:
             return True
         if envs.IRWKV_SKIP_MODEL_NAME_VALIDATION:
             return True
-        return self.models.is_base_model(model_name)
+        return (
+            self.models.is_base_model(model_name)
+            or self.models.get_lora(model_name) is not None
+        )
+
+    def _maybe_get_adapters(
+        self, model_name: str | None
+    ) -> LoRARequest | ErrorResponse | None:
+        lora = self.models.get_lora(model_name)
+        if lora is None and not self._is_model_supported(model_name):
+            return self.create_error_response(
+                f"The model `{model_name}` does not exist.",
+                err_type="NotFoundError",
+                status_code=HTTPStatus.NOT_FOUND,
+                param="model",
+            )
+        return lora
+
+    async def _with_lora(
+        self, lora: LoRARequest | None, generator: AsyncGenerator[_T, None]
+    ) -> AsyncGenerator[_T, None]:
+        if lora is None:
+            return generator
+
+        async def generate() -> AsyncGenerator[_T | None, None]:
+            assert isinstance(self.models, OpenAIServingModels)
+            async with self.models.use_lora(lora), aclosing(generator):
+                yield None
+                async for output in generator:
+                    yield output
+
+        result = generate()
+        # Start the lifetime before handing off the stream or background task.
+        # The first yield acquires the version without starting generation.
+        await anext(result)
+        return cast(AsyncGenerator[_T, None], result)
 
     @staticmethod
     def create_error_response(

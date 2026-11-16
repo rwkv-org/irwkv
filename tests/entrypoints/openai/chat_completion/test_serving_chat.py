@@ -176,13 +176,22 @@ def _build_renderer(model_config: MockModelConfig):
     )
 
 
-def _build_online_renderer(engine) -> OnlineRenderer:
+def _build_online_renderer(
+    engine,
+    *,
+    reasoning_parser: str = "",
+    tool_parser: str | None = None,
+    enable_auto_tools: bool = False,
+) -> OnlineRenderer:
     return OnlineRenderer(
         model_config=engine.model_config,
         renderer=engine.renderer,
         request_logger=None,
         chat_template=CHAT_TEMPLATE,
         chat_template_content_format="auto",
+        reasoning_parser=reasoning_parser,
+        tool_parser=tool_parser,
+        enable_auto_tools=enable_auto_tools,
     )
 
 
@@ -206,7 +215,12 @@ def _build_serving_chat(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
     )
-    online_renderer = _build_online_renderer(engine)
+    online_renderer = _build_online_renderer(
+        engine,
+        reasoning_parser=reasoning_parser,
+        tool_parser=tool_parser,
+        enable_auto_tools=enable_auto_tools,
+    )
 
     serving_chat = OpenAIServingChat(
         engine,
@@ -531,6 +545,8 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     mock_engine = _build_mock_engine()
     mock_engine.model_config.hf_config = MockHFConfig(model_type="rwkv")
     mock_engine.model_config.generation_config = "irwkv"
+    mock_engine.model_config.max_model_len = 2048
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
     serving_chat = _build_serving_chat(mock_engine, reasoning_parser=reasoning_parser)
     serving_chat.chat_template = None
     serving_chat.online_renderer.chat_template = None
@@ -606,6 +622,85 @@ async def test_rwkv_chat_caches_state_before_generation_prompt(
     )
     if response_format is not None:
         assert json.loads(content) == {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_rwkv_chat_fast_split_and_tool_call_prefix_consistency(stream):
+    mock_engine = _build_mock_engine()
+    mock_engine.model_config.hf_config = MockHFConfig(model_type="rwkv")
+    mock_engine.model_config.generation_config = "irwkv"
+    mock_engine.model_config.max_model_len = 2048
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+    serving_chat = _build_serving_chat(
+        mock_engine, tool_parser="rwkv", enable_auto_tools=True
+    )
+    serving_chat.chat_template = None
+    serving_chat.online_renderer.chat_template = None
+    tokenizer = mock_engine.renderer.tokenizer
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "probe", "parameters": {"type": "object"}},
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "你是一个工具助手。" * 8},
+        {"role": "user", "content": "请调用 probe 工具查询状态。" * 6},
+    ]
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=messages,
+        tools=tools,
+        chat_template_kwargs={"fake_cot_mode": True},
+        stream=stream,
+    )
+    _, engine_inputs = await serving_chat.render_chat_request(request)
+    prompt_comp = serving_chat._extract_prompt_components(engine_inputs[0])
+    assert prompt_comp.token_ids is not None and len(prompt_comp.token_ids) > 32
+    tool_output = '**Tool Call:**\n```json\n{"name": "probe", "arguments": {}}\n```'
+    mock_engine.generate.return_value = _single_request_output(
+        RequestOutput(
+            request_id="tool-id",
+            prompt=prompt_comp.text,
+            prompt_token_ids=prompt_comp.token_ids,
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=tool_output,
+                    token_ids=tokenizer.encode(tool_output, add_special_tokens=False),
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+        )
+    )
+    response = await serving_chat.create_chat_completion(request)
+    _, params = mock_engine.generate.call_args.args[:2]
+    expected_split = serving_chat._split_rwkv_generation_prompt(
+        request, messages, {"fake_cot_mode": True}, engine_inputs[0]
+    )
+    assert expected_split is not None
+    assert params.extra_args["prompt_cache_boundary"] == expected_split[1]
+    if stream:
+        content = ""
+        tool_names = []
+        async for chunk in response:
+            if chunk.startswith("data: {"):
+                delta = json.loads(chunk[6:])["choices"][0]["delta"]
+                content += delta.get("content") or ""
+                for tc in delta.get("tool_calls") or []:
+                    if tc.get("function", {}).get("name"):
+                        tool_names.append(tc["function"]["name"])
+        assert content == ""
+        assert tool_names == ["probe"]
+    else:
+        msg = response.choices[0].message
+        assert msg.content is None
+        assert [tc.function.name for tc in msg.tool_calls] == ["probe"]
 
 
 @pytest.mark.asyncio

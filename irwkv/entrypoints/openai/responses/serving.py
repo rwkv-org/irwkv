@@ -5,7 +5,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 from http import HTTPStatus
 from typing import Any, Final
 
@@ -73,6 +73,7 @@ from irwkv.inputs import EngineInput
 from irwkv.logger import init_logger
 from irwkv.logprobs import Logprob as SampleLogprob
 from irwkv.logprobs import SampleLogprobs
+from irwkv.lora.request import LoRARequest
 from irwkv.outputs import CompletionOutput
 from irwkv.parser import Parser, ParserManager
 from irwkv.renderers.online_renderer import (
@@ -330,8 +331,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         else:
             prev_response = None
 
-        model_name = self.models.model_name()
-
         render_result = await self._render_resolved_response_inputs(
             request,
             prev_response,
@@ -348,6 +347,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[ConversationContext, None]] = []
+        lora_request: LoRARequest | None = None
 
         # Only include builtin tools that the request actually asked for.
         # Without this filter, tools registered on the server (e.g. via
@@ -463,6 +463,10 @@ class OpenAIServingResponses(GenerateBaseServing):
                             )
                         ),
                     )
+            adapter = self._maybe_get_adapters(request.model)
+            if isinstance(adapter, ErrorResponse):
+                return adapter
+            lora_request = adapter
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
@@ -472,11 +476,13 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                lora_request=lora_request,
             )
             generators.append(generator)
 
         assert len(generators) == 1
         (result_generator,) = generators
+        model_name = self.models.model_name(lora_request)
 
         # Store the input messages.
         if request.store:
@@ -494,6 +500,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 usage=None,
             )
             async with self.response_store_lock:
+                result_generator = await self._with_lora(lora_request, result_generator)
                 self.response_store[response.id] = response
 
             # Run the request in the background.
@@ -538,7 +545,23 @@ class OpenAIServingResponses(GenerateBaseServing):
             return response
 
         if request.stream:
-            return self.responses_stream_generator(
+            return await self._with_lora(
+                lora_request,
+                self.responses_stream_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                ),
+            )
+
+        async with aclosing(
+            await self._with_lora(lora_request, result_generator)
+        ) as result_generator:
+            return await self.responses_full_generator(
                 request,
                 sampling_params,
                 result_generator,
@@ -547,16 +570,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 tokenizer,
                 request_metadata,
             )
-
-        return await self.responses_full_generator(
-            request,
-            sampling_params,
-            result_generator,
-            context,
-            model_name,
-            tokenizer,
-            request_metadata,
-        )
 
     async def _render_next_turn(
         self,
@@ -590,6 +603,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        lora_request: "LoRARequest | None" = None,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -613,13 +627,15 @@ class OpenAIServingResponses(GenerateBaseServing):
                 priority=priority,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                lora_request=lora_request,
             )
 
-            async for res in generator:
-                context.request_metrics = res.metrics
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            async with aclosing(generator):
+                async for res in generator:
+                    context.request_metrics = res.metrics
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
@@ -1166,7 +1182,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         self,
         request: ResponsesRequest,
         sampling_params: SamplingParams,
-        result_generator: AsyncIterator[ConversationContext | None],
+        result_generator: AsyncGenerator[ConversationContext | None, None],
         context: ConversationContext,
         model_name: str,
         tokenizer: TokenizerLike,
@@ -1218,18 +1234,19 @@ class OpenAIServingResponses(GenerateBaseServing):
         )
 
         try:
-            async for event_data in processor(
-                request,
-                sampling_params,
-                result_generator,
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-                created_time,
-                _increment_sequence_number_and_return,
-            ):
-                yield event_data
+            async with aclosing(result_generator):
+                async for event_data in processor(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time,
+                    _increment_sequence_number_and_return,
+                ):
+                    yield event_data
         except GenerationError as e:
             error_json = self._convert_generation_error_to_streaming_response(e)
             yield _increment_sequence_number_and_return(

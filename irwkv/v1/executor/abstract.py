@@ -16,6 +16,7 @@ from irwkv.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.tasks import SupportedTask
 from irwkv.tracing import instrument
 from irwkv.utils.import_utils import resolve_obj_by_qualname
@@ -230,6 +231,12 @@ class Executor(ABC):
         self,
     ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:
         return self.collective_rpc("get_kv_connector_handshake_metadata")
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return all(self.collective_rpc("add_lora", args=(lora_request,)))
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return all(self.collective_rpc("remove_lora", args=(lora_id,)))
 
     @overload
     def execute_model(

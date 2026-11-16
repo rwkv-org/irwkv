@@ -25,6 +25,7 @@ from irwkv.config import IrwkvConfig
 from irwkv.config.kv_events import KVEventsConfig
 from irwkv.envs import IRWKV_ENGINE_READY_TIMEOUT_S
 from irwkv.logger import init_logger
+from irwkv.lora.request import LoRARequest
 from irwkv.renderers import BaseRenderer
 from irwkv.tasks import SupportedTask
 from irwkv.tracing import instrument
@@ -278,6 +279,12 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        raise NotImplementedError
+
+    async def remove_lora_async(self, lora_id: int) -> bool:
         raise NotImplementedError
 
     async def save_sharded_state_async(
@@ -1114,13 +1121,16 @@ class AsyncMPClient(MPClient):
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
-    async def call_utility_all_async(self, method: str, *args) -> list[Any]:
+    async def call_utility_all_async(
+        self, method: str, *args, return_exceptions: bool = False
+    ) -> list[Any]:
         # Like the Rust client's call_utility: one result per managed engine.
         return await asyncio.gather(
             *[
                 self._call_utility_async(method, *args, engine=engine)
                 for engine in self.core_engines
-            ]
+            ],
+            return_exceptions=return_exceptions,
         )
 
     async def call_utility_consensus_async(self, method: str, *args) -> Any:
@@ -1238,6 +1248,22 @@ class AsyncMPClient(MPClient):
     async def compute_weight_checksums_async(self) -> list[dict[str, str]]:
         per_engine = await self.call_utility_all_async("compute_weight_checksums")
         return [worker for workers in per_engine for worker in workers]
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        # Wait for every replica before rolling back any successful additions.
+        results = await self.call_utility_all_async(
+            "add_lora", lora_request, return_exceptions=True
+        )
+        if all(result is True for result in results):
+            return True
+        await self.remove_lora_async(lora_request.lora_int_id)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return False
+
+    async def remove_lora_async(self, lora_id: int) -> bool:
+        return all(await self.call_utility_all_async("remove_lora", lora_id))
 
 
 class DPAsyncMPClient(AsyncMPClient):

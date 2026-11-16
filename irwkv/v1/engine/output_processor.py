@@ -140,8 +140,10 @@ class RequestState:
         temperature: float,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        lora_int_id: int | None = None,
     ):
         self.request_id = request_id
+        self.lora_int_id = lora_int_id
         self.external_req_id = external_req_id
         self.parent_req = parent_req
         self.request_index = request_index
@@ -244,6 +246,9 @@ class RequestState:
         assert request.external_req_id is not None
         return cls(
             request_id=request.request_id,
+            lora_int_id=request.lora_request.lora_int_id
+            if request.lora_request
+            else None,
             external_req_id=request.external_req_id,
             parent_req=parent_req,
             request_index=request_index,

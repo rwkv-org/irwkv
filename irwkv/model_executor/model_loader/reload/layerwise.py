@@ -280,6 +280,16 @@ def finalize_layerwise_reload(*args, **kwargs):
     finalize_layerwise_processing(*args, **kwargs)
 
 
+def abort_layerwise_reload(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        info = get_layerwise_info(layer)
+        if info.can_load():
+            if info.kernel_tensors is not None:
+                _place_kernel_tensors(layer, info)
+            info.reset()
+    LOADING_LAYERS.clear()
+
+
 def _finalize_attention_layer(
     layer: torch.nn.Module, info: LayerReloadingInfo, model_config: ModelConfig
 ) -> None:
@@ -386,6 +396,11 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = {name for name, _ in info.loaded_weights}
     for name, param in parameters.items():
+        if (
+            getattr(layer, "quant_method", None) is None
+            and name not in loaded_tensor_names
+        ):
+            continue
         param.data.copy_(getattr(layer, name))
     for name, buffer in buffers.items():
         if name not in layer._buffers:

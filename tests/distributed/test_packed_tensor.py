@@ -6,9 +6,13 @@ Unit tests for packed_nccl_broadcast_producer and packed_nccl_broadcast_consumer
 These utilities enable efficient batched tensor transfer over NCCL.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from irwkv.config.weight_transfer import WeightTransferConfig
+from irwkv.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
 from irwkv.distributed.weight_transfer.packed_tensor import (
     pack_tensors,
     packed_ipc_consumer,
@@ -17,6 +21,37 @@ from irwkv.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_producer,
     unpack_tensor,
 )
+
+
+def test_ipc_releases_imported_buffer_when_reload_finalization_fails(monkeypatch):
+    class FailingModel(torch.nn.Module):
+        def process_weights_after_loading(self):
+            raise ValueError("invalid checkpoint update")
+
+    monkeypatch.setenv("IRWKV_RELOAD_MODE", "layerwise")
+    config = SimpleNamespace(parallel_config=SimpleNamespace(), model_config=None)
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"), config, torch.device("cpu"), FailingModel()
+    )
+    engine.start_weight_update()
+    engine._packed_importer._entry = ((), torch.ones(1))
+    with pytest.raises(ValueError, match="invalid checkpoint update"):
+        engine.finish_weight_update()
+    assert engine._packed_importer._entry is None
+
+
+def test_ipc_releases_imported_buffer_when_update_fails():
+    config = SimpleNamespace(parallel_config=SimpleNamespace(), model_config=None)
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"),
+        config,
+        torch.device("cpu"),
+        torch.nn.Module(),
+    )
+    engine._packed_importer._entry = ((), torch.ones(1))
+    with pytest.raises(ValueError, match="Invalid update_info"):
+        engine.update_weights({})
+    assert engine._packed_importer._entry is None
 
 
 class MockCommunicationGroup:
