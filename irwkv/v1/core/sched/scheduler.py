@@ -25,6 +25,7 @@ from irwkv.distributed.kv_transfer.kv_connector.v1 import (
 )
 from irwkv.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from irwkv.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import init_logger
 from irwkv.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from irwkv.multimodal.encoder_budget import MultiModalBudget
@@ -225,7 +226,7 @@ class Scheduler(SchedulerInterface):
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
-        self.grammar_compile_error_reqs: dict[str, str] = {}
+        self.grammar_compile_error_reqs: dict[str, str | None] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
 
         # Encoder-related.
@@ -2689,9 +2690,11 @@ class Scheduler(SchedulerInterface):
             struct_output_req = request.structured_output_request
             if not struct_output_req or struct_output_req.grammar is None:
                 return False
-            if isinstance(struct_output_req.grammar, Exception):
+            if isinstance(error := struct_output_req.grammar, Exception):
                 self.grammar_compile_error_reqs[request.request_id] = (
-                    f"Invalid structured outputs: {struct_output_req.grammar}"
+                    f"Invalid structured outputs: {error}"
+                    if isinstance(error, IRWKVValidationError)
+                    else None
                 )
                 return False
             # Grammar is ready, promote to waiting state.

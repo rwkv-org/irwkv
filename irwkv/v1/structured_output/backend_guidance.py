@@ -216,7 +216,7 @@ class GuidanceBackend(StructuredOutputBackend):
         )
 
         if error := ll_matcher.get_error():
-            raise ValueError(f"Grammar error: {error}")
+            raise IRWKVValidationError(f"Grammar error: {error}")
 
         return GuidanceGrammar(
             ll_matcher=ll_matcher,

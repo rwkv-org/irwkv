@@ -3,6 +3,7 @@
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from typing import TYPE_CHECKING, NamedTuple
 
 from irwkv.config import IrwkvConfig
@@ -16,7 +17,10 @@ from irwkv.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
 )
-from irwkv.v1.structured_output.backend_xgrammar import XgrammarBackend
+from irwkv.v1.structured_output.backend_xgrammar import (
+    XgrammarBackend,
+    validate_xgrammar_grammar,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -207,7 +211,16 @@ class StructuredOutputManager:
             return self.backend.compile_grammar(
                 request_type, grammar_spec, stop_token_ids=stop_token_ids
             )
-        except Exception:
+        except Exception as error:
+            if self.backend_name == "xgrammar" and isinstance(
+                error, (ValueError, RuntimeError)
+            ):
+                # A compiler failure can also be an internal fault. Run the
+                # syntax validator only on failure, against a request-local copy.
+                assert request.sampling_params is not None
+                params = copy(request.sampling_params)
+                params.structured_outputs = copy(params.structured_outputs)
+                validate_xgrammar_grammar(params)
             logger.exception(
                 "Failed to compile grammar for request %s", request.request_id
             )

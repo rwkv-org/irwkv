@@ -56,6 +56,7 @@ from irwkv.entrypoints.openai.responses.serving import (
     extract_tool_types,
 )
 from irwkv.entrypoints.serve.engine.protocol import ErrorResponse
+from irwkv.exceptions import GenerationError, IRWKVValidationError
 from irwkv.inputs import tokens_input
 from irwkv.logprobs import Logprob as SampleLogprob
 from irwkv.outputs import CompletionOutput, RequestOutput
@@ -1016,6 +1017,47 @@ async def test_responses_streaming_metrics_only_on_completed_event():
     assert isinstance(events[-1], ResponseCompletedEvent)
     assert events[-1].response.metrics is not None
     assert events[-1].response.metrics.time_to_first_token_ms == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code", "param"),
+    [
+        (
+            IRWKVValidationError("bad grammar", parameter="structured_outputs"),
+            "invalid_request_error",
+            "structured_outputs",
+        ),
+        (GenerationError("failed generation"), "server_error", None),
+    ],
+)
+async def test_responses_stream_reports_generation_error(error, code, param):
+    serving = _make_serving_instance()
+    request = ResponsesRequest(input="hi", stream=True, store=False)
+    context = _make_simple_context_with_output("hello", [10, 20])
+
+    async def failing_generation():
+        yield context
+        raise error
+
+    events = [
+        event
+        async for event in serving.responses_stream_generator(
+            request=request,
+            sampling_params=SamplingParams(max_tokens=16),
+            result_generator=failing_generation(),
+            context=context,
+            model_name="test-model",
+            tokenizer=MagicMock(),
+            request_metadata=RequestResponseMetadata(request_id="req"),
+        )
+    ]
+
+    assert events[-1].type == "error"
+    assert events[-1].code == code
+    assert events[-1].param == param
+    assert events[-1].message == str(error)
+    assert all(event.type != "response.completed" for event in events)
 
 
 @pytest.mark.asyncio

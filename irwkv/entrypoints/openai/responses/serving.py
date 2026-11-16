@@ -11,13 +11,13 @@ from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseErrorEvent,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
-from pydantic import TypeAdapter
 
 from irwkv import envs
 from irwkv.config.utils import replace
@@ -1247,10 +1247,20 @@ class OpenAIServingResponses(GenerateBaseServing):
                     _increment_sequence_number_and_return,
                 ):
                     yield event_data
-        except GenerationError as e:
-            error_json = self._convert_generation_error_to_streaming_response(e)
+        except (GenerationError, IRWKVValidationError) as error:
+            validation_error = isinstance(error, IRWKVValidationError)
             yield _increment_sequence_number_and_return(
-                TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                ResponseErrorEvent(
+                    type="error",
+                    sequence_number=-1,
+                    code="invalid_request_error"
+                    if validation_error
+                    else "server_error",
+                    message=str(error),
+                    param=error.parameter
+                    if isinstance(error, IRWKVValidationError)
+                    else None,
+                )
             )
             return
 

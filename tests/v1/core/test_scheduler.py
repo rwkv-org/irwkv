@@ -2031,13 +2031,22 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 
 
 @pytest.mark.parametrize("async_grammar", [True, False])
-def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
+@pytest.mark.parametrize(
+    "error",
+    [
+        IRWKVValidationError("invalid grammar syntax"),
+        RuntimeError("compiler execution failed"),
+        MemoryError("grammar compiler allocation failed"),
+    ],
+    ids=["invalid", "runtime", "memory"],
+)
+def test_grammar_compile_error_finishes_only_request(
+    async_grammar: bool, error: Exception
+):
     scheduler = create_scheduler()
     manager = scheduler.structured_output_manager
     manager.backend = Mock()
-    manager.backend.compile_grammar.side_effect = RuntimeError(
-        "forced FSM compilation error"
-    )
+    manager.backend.compile_grammar.side_effect = error
     manager._use_async_grammar_compilation = async_grammar
     if async_grammar:
         manager.executor = ThreadPoolExecutor(max_workers=1)
@@ -2057,7 +2066,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert request.structured_output_request is not None
     grammar_future = request.structured_output_request._grammar
     assert isinstance(grammar_future, Future)
-    assert isinstance(grammar_future.exception(timeout=5), RuntimeError)
+    assert grammar_future.exception(timeout=5) is error
     if async_grammar:
         manager.executor.shutdown()
 
@@ -2076,10 +2085,13 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason is None
-    assert (
-        output.validation_error
-        == "Invalid structured outputs: forced FSM compilation error"
-    )
+    if isinstance(error, IRWKVValidationError):
+        assert (
+            output.validation_error
+            == "Invalid structured outputs: invalid grammar syntax"
+        )
+    else:
+        assert output.validation_error is None
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)

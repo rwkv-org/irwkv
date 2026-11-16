@@ -1706,6 +1706,7 @@ class EngineCoreProc(EngineCore):
                             self._handle_mm_cache_miss(req, e)
                             continue
                         except IRWKVValidationError as error:
+                            self._enqueue_abort_requests([req.request_id])
                             self._send_finish_outputs_to_client(
                                 [req.request_id],
                                 req.client_index,
@@ -1720,14 +1721,16 @@ class EngineCoreProc(EngineCore):
                         request = generic_decoder.decode(data_frames)
 
                         if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts are added to *both* queues, allows us to eagerly
-                            # process aborts while also ensuring ordering in the input
-                            # queue to avoid leaking requests. This is ok because
-                            # aborting in the scheduler is idempotent.
-                            self.aborts_queue.put_nowait(request)
+                            self._enqueue_abort_requests(request)
+                            continue
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
+
+    def _enqueue_abort_requests(self, request_ids: list[str]) -> None:
+        # Cancel promptly, and also process the abort after any queued ADD.
+        self.aborts_queue.put_nowait(request_ids)
+        self.input_queue.put_nowait((EngineCoreRequestType.ABORT, request_ids))
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
