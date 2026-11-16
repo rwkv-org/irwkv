@@ -220,7 +220,13 @@ class StructuredOutputManager:
                 assert request.sampling_params is not None
                 params = copy(request.sampling_params)
                 params.structured_outputs = copy(params.structured_outputs)
-                validate_xgrammar_grammar(params)
+                try:
+                    validate_xgrammar_grammar(params)
+                except IRWKVValidationError as validation:
+                    if not isinstance(
+                        validation.__cause__, (MemoryError, AssertionError)
+                    ):
+                        raise
             logger.exception(
                 "Failed to compile grammar for request %s", request.request_id
             )

@@ -2101,6 +2101,27 @@ def test_grammar_compile_error_finishes_only_request(
     ]
 
 
+def test_validation_probe_failure_keeps_the_compiler_error(monkeypatch):
+    manager = create_scheduler().structured_output_manager
+    manager.backend = Mock()
+    manager.backend_name = "xgrammar"
+    manager.backend.compile_grammar.side_effect = RuntimeError("compiler failed")
+    request = Request(
+        request_id="validation-probe",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(json='{"type":"object"}')
+        ),
+    )
+    monkeypatch.setattr(
+        "xgrammar.Grammar.from_json_schema",
+        Mock(side_effect=MemoryError("validator allocation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="compiler failed"):
+        manager._create_grammar(request)
+
+
 def test_engine_rejects_a_different_structured_output_backend():
     manager = create_scheduler().structured_output_manager
     manager.backend = Mock()
