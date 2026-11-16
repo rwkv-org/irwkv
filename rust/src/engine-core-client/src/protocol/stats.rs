@@ -315,8 +315,10 @@ pub struct SchedulerStats {
     #[serde(default)]
     pub num_skipped_waiting_reqs: u64,
     /// Internal DP load-balancing step counter.
+    #[serde(default)]
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.
+    #[serde(default)]
     pub current_wave: u64,
     /// KV-cache usage. `1.0` means 100% usage.
     pub kv_cache_usage: f64,
@@ -338,7 +340,32 @@ pub struct SchedulerStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedTokensBySource, PrefixCacheStats};
+    use super::{CachedTokensBySource, PrefixCacheStats, SchedulerStats};
+
+    #[test]
+    fn scheduler_stats_without_wave_preserve_dense_engine_counts() {
+        let payload = serde_json::json!({
+            "num_running_reqs": 1,
+            "num_waiting_reqs": 2,
+            "num_skipped_waiting_reqs": 0,
+            "num_kv_fetch_reqs_by_stage": {"in_progress": 0},
+            "kv_cache_usage": 0.25,
+            "iteration_details": null,
+            "prefix_cache_stats": {
+                "reset": false, "requests": 1, "queries": 8, "hits": 4,
+                "preempted_requests": 0, "preempted_queries": 0, "preempted_hits": 0
+            },
+            "kv_cache_eviction_events": [],
+        });
+        let wire = rmp_serde::to_vec_named(&payload).unwrap();
+        let stats: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(stats.num_running_reqs, 1);
+        assert_eq!(stats.num_waiting_reqs, 2);
+        assert_eq!(stats.kv_cache_usage, 0.25);
+        assert_eq!(stats.prefix_cache_stats.base.hits, 4);
+        assert_eq!(stats.step_counter, 0);
+        assert_eq!(stats.current_wave, 0);
+    }
 
     #[test]
     fn prefix_cache_stats_hits_by_source_defaults_and_decodes() {
