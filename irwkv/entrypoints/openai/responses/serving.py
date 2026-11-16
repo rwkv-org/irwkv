@@ -990,6 +990,8 @@ class OpenAIServingResponses(GenerateBaseServing):
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
+                if event.type == "error":
+                    await self._mark_background_request_failed(request.request_id)
                 event_deque.append(event)
                 new_event_signal.set()  # Signal new event available
         finally:
@@ -1001,16 +1003,19 @@ class OpenAIServingResponses(GenerateBaseServing):
         *args,
         **kwargs,
     ):
-        response = await self.responses_full_generator(request, *args, **kwargs)
-
+        try:
+            response = await self.responses_full_generator(request, *args, **kwargs)
+        except (GenerationError, IRWKVValidationError):
+            await self._mark_background_request_failed(request.request_id)
+            return
         if isinstance(response, ErrorResponse):
-            # If the request has failed, update the status to "failed".
-            response_id = request.request_id
-            async with self.response_store_lock:
-                stored_response = self.response_store.get(response_id)
-                assert stored_response is not None
-                if stored_response.status not in ("completed", "cancelled"):
-                    stored_response.status = "failed"
+            await self._mark_background_request_failed(request.request_id)
+
+    async def _mark_background_request_failed(self, response_id: str) -> None:
+        async with self.response_store_lock:
+            stored_response = self.response_store[response_id]
+            if stored_response.status not in ("completed", "cancelled"):
+                stored_response.status = "failed"
 
     async def responses_background_stream_generator(
         self,
@@ -1035,10 +1040,14 @@ class OpenAIServingResponses(GenerateBaseServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
-                    return
                 current_index += 1
 
+            if event_deque and event_deque[-1].type in (
+                "response.completed",
+                "response.incomplete",
+                "error",
+            ):
+                return
             await new_event_signal.wait()
 
     async def retrieve_responses(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1020,6 +1021,7 @@ async def test_responses_streaming_metrics_only_on_completed_event():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize(
     ("error", "code", "param"),
     [
@@ -1031,27 +1033,49 @@ async def test_responses_streaming_metrics_only_on_completed_event():
         (GenerationError("failed generation"), "server_error", None),
     ],
 )
-async def test_responses_stream_reports_generation_error(error, code, param):
+async def test_responses_stream_reports_generation_error(
+    error, code, param, background
+):
     serving = _make_serving_instance()
-    request = ResponsesRequest(input="hi", stream=True, store=False)
+    request = ResponsesRequest(
+        input="hi", stream=True, store=background, background=background
+    )
     context = _make_simple_context_with_output("hello", [10, 20])
 
     async def failing_generation():
         yield context
         raise error
 
-    events = [
-        event
-        async for event in serving.responses_stream_generator(
-            request=request,
-            sampling_params=SamplingParams(max_tokens=16),
-            result_generator=failing_generation(),
-            context=context,
-            model_name="test-model",
-            tokenizer=MagicMock(),
-            request_metadata=RequestResponseMetadata(request_id="req"),
-        )
-    ]
+    args = dict(
+        sampling_params=SamplingParams(max_tokens=16),
+        result_generator=failing_generation(),
+        context=context,
+        model_name="test-model",
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="req"),
+    )
+    if background:
+        stored = MagicMock(status="queued")
+        serving.response_store[request.request_id] = stored
+        await serving._run_background_request_stream(request, **args)
+        async with asyncio.timeout(2):
+            events = [
+                event
+                async for event in serving.responses_background_stream_generator(
+                    request.request_id
+                )
+            ]
+            assert not [
+                event
+                async for event in serving.responses_background_stream_generator(
+                    request.request_id, starting_after=events[-1].sequence_number
+                )
+            ]
+        assert stored.status == "failed"
+    else:
+        events = [
+            event async for event in serving.responses_stream_generator(request, **args)
+        ]
 
     assert events[-1].type == "error"
     assert events[-1].code == code
