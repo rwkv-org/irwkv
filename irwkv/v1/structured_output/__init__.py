@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple
 
 from irwkv.config import IrwkvConfig
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import init_logger
 from irwkv.parser.engine.adapters import ParserEngineReasoningAdapter
 from irwkv.reasoning import ReasoningParserManager
@@ -47,6 +48,7 @@ class StructuredOutputManager:
 
     def __init__(self, irwkv_config: IrwkvConfig):
         self.backend: StructuredOutputBackend | None = None
+        self.backend_name: str | None = None
         # We only store the class of the reasoner in the manager.
         # The parser instance is request-scoped because some reasoning parsers
         # depend on per-request chat-template kwargs.
@@ -125,20 +127,20 @@ class StructuredOutputManager:
         if request.structured_output_request is None:
             return
 
-        if TYPE_CHECKING:
-            assert (
-                request.sampling_params is not None
-                and request.sampling_params.structured_outputs is not None
+        assert request.sampling_params is not None
+        structured_outputs = request.sampling_params.structured_outputs
+        assert structured_outputs is not None
+        backend = structured_outputs._backend
+        if self.backend_name is not None and backend != self.backend_name:
+            raise IRWKVValidationError(
+                f"The engine uses structured output backend '{self.backend_name}', "
+                f"but this request resolved to '{backend}'. Use a schema supported "
+                "by the current backend or configure a backend explicitly.",
+                parameter="structured_outputs",
             )
 
         # Initialize the backend the first time it is needed.
-        #
-        # NOTE: We only support a single backend. We do NOT support different
-        # backends on a per-request basis in V1 (for now, anyway...).
-        # _backend is set in Processor._validate_structured_output
         if self.backend is None:
-            assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
             vocab_size = self.irwkv_config.model_config.get_vocab_size()
             if backend == "xgrammar":
                 self.backend = XgrammarBackend(
@@ -174,6 +176,7 @@ class StructuredOutputManager:
                 )
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
+            self.backend_name = backend
 
         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
         if self._use_async_grammar_compilation:

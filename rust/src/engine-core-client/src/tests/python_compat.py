@@ -114,6 +114,7 @@ class EngineCoreOutput(
     new_sampling_mask: object | None = None
     spec_decode_metrics: object | None = None
     prompt_token_id_logprobs: object | None = None
+    validation_error: str | None = None
 
 
 class ExtendedEngineCoreOutput(EngineCoreOutput):

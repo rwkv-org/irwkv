@@ -25,6 +25,7 @@ from irwkv.distributed import (
     cleanup_dist_env_and_memory,
 )
 from irwkv.envs import enable_envs_cache
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import configure_logging, init_logger
 from irwkv.logging_utils.dump_input import dump_engine_exception
 from irwkv.lora.request import LoRARequest
@@ -1704,6 +1705,14 @@ class EngineCoreProc(EngineCore):
                             # drops the stale entry, client resends with data).
                             self._handle_mm_cache_miss(req, e)
                             continue
+                        except IRWKVValidationError as error:
+                            self._send_finish_outputs_to_client(
+                                [req.request_id],
+                                req.client_index,
+                                FinishReason.ERROR,
+                                validation_error=str(error),
+                            )
+                            continue
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
@@ -1900,10 +1909,20 @@ class EngineCoreProc(EngineCore):
         return not self.has_work()
 
     def _send_finish_outputs_to_client(
-        self, req_ids: list[str], client_index: int, finish_reason: FinishReason
+        self,
+        req_ids: list[str],
+        client_index: int,
+        finish_reason: FinishReason,
+        *,
+        validation_error: str | None = None,
     ) -> None:
         outputs = [
-            EngineCoreOutput(req_id, [], finish_reason=finish_reason)
+            EngineCoreOutput(
+                req_id,
+                [],
+                finish_reason=finish_reason,
+                validation_error=validation_error,
+            )
             for req_id in req_ids
         ]
         eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)

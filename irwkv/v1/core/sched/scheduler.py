@@ -225,7 +225,7 @@ class Scheduler(SchedulerInterface):
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
-        self.grammar_compile_error_reqs: set[str] = set()
+        self.grammar_compile_error_reqs: dict[str, str] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
 
         # Encoder-related.
@@ -1900,8 +1900,9 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
             self.deferred_waiting.difference_update(stopped_preempted_reqs)
 
-        error_req_ids = set(self.grammar_compile_error_reqs)
-        self.grammar_compile_error_reqs.clear()
+        grammar_errors = self.grammar_compile_error_reqs
+        self.grammar_compile_error_reqs = {}
+        error_req_ids = set(grammar_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -1923,6 +1924,7 @@ class Scheduler(SchedulerInterface):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        validation_error=grammar_errors.get(request.request_id),
                     )
                 )
 
@@ -2688,7 +2690,9 @@ class Scheduler(SchedulerInterface):
             if not struct_output_req or struct_output_req.grammar is None:
                 return False
             if isinstance(struct_output_req.grammar, Exception):
-                self.grammar_compile_error_reqs.add(request.request_id)
+                self.grammar_compile_error_reqs[request.request_id] = (
+                    f"Invalid structured outputs: {struct_output_req.grammar}"
+                )
                 return False
             # Grammar is ready, promote to waiting state.
             request.status = RequestStatus.WAITING

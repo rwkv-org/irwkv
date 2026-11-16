@@ -140,6 +140,9 @@ pub struct EngineCoreOutput {
     /// the first output of a request that asked for them.
     #[serde(default)]
     pub prompt_token_id_logprobs: Option<Box<WireNdArray>>,
+    /// Diagnostic for a request rejected during structured output validation.
+    #[serde(default)]
+    pub validation_error: Option<Box<str>>,
 }
 
 /// Raw per-sequence speculative-decoding accumulator.
@@ -543,6 +546,7 @@ mod tests {
                             new_sampling_mask: None,
                             spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
+                            validation_error: None,
                         },
                     ],
                     scheduler_stats: None,

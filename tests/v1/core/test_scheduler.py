@@ -13,6 +13,7 @@ from irwkv.config import (
 )
 from irwkv.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from irwkv.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -2075,6 +2076,10 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason is None
+    assert (
+        output.validation_error
+        == "Invalid structured outputs: forced FSM compilation error"
+    )
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)
@@ -2082,6 +2087,27 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert [req.req_id for req in next_output.scheduled_new_reqs] == [
         healthy_request.request_id
     ]
+
+
+def test_engine_rejects_a_different_structured_output_backend():
+    manager = create_scheduler().structured_output_manager
+    manager.backend = Mock()
+    manager.backend_name = "xgrammar"
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(choice=["OK"]))
+    assert params.structured_outputs is not None
+    params.structured_outputs._backend = "guidance"
+    request = Request(
+        request_id="mixed-backend",
+        prompt_token_ids=[1, 2],
+        sampling_params=params,
+    )
+
+    with pytest.raises(
+        IRWKVValidationError, match="uses structured output backend 'xgrammar'"
+    ):
+        manager.grammar_init(request)
+
+    manager.backend.compile_grammar.assert_not_called()
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
@@ -2114,7 +2140,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
-    scheduler.grammar_compile_error_reqs = set()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.encoder_cache_mismatch_reqs = set()
     scheduler.irwkv_config = Mock()
     scheduler.return_sampling_mask = False

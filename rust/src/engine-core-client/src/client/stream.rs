@@ -173,6 +173,12 @@ impl Stream for EngineCoreOutputStream {
                         // come. Only the last output of a delivery can be terminal.
                         let output = delivery.last();
                         if output.finished() {
+                            self.state = State::Finished;
+                            if let Some(message) = output.validation_error.as_deref() {
+                                return Poll::Ready(Some(Err(Error::RequestValidation {
+                                    message: message.to_string(),
+                                })));
+                            }
                             if output.finish_reason == Some(EngineCoreFinishReason::Error) {
                                 error!(
                                     self.request_id,
@@ -180,7 +186,6 @@ impl Stream for EngineCoreOutputStream {
                                 );
                             }
                             debug!(self.request_id, "request completed via final output");
-                            self.state = State::Finished;
                         }
                     }
                     Err(error) => {

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -620,6 +621,26 @@ class OutputProcessor:
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
+                continue
+
+            if (
+                engine_core_output.validation_error is not None
+                and req_state.queue is not None
+            ):
+                if req_state.parent_req is not None:
+                    reqs_to_abort.extend(
+                        self.abort_requests(
+                            [req_state.parent_req.request_id], internal=True
+                        )
+                    )
+                else:
+                    self._finish_request(req_state)
+                req_state.queue.put(
+                    IRWKVValidationError(
+                        engine_core_output.validation_error,
+                        parameter="structured_outputs",
+                    )
+                )
                 continue
 
             # 1) Compute stats for this iteration.

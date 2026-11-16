@@ -130,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_grammar_from_engine_maps_to_bad_request() {
+        let error = irwkv_llm::Error::from(irwkv_engine_core_client::Error::RequestValidation {
+            message: "Invalid structured outputs: bad grammar".to_string(),
+        });
+        let error = text_submit_error("failed to collect", error.into());
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.to_error_response().error.message,
+            "Invalid structured outputs: bad grammar"
+        );
+    }
+
+    #[test]
     fn invalid_thinking_token_budget_maps_to_invalid_request() {
         let api_error = text_submit_error(
             "failed to submit completion request",
