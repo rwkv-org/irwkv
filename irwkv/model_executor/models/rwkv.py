@@ -348,7 +348,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if self._tmix_shift_pool is None:
             raise RuntimeError("RWKV state pool has not been bound")
         device = self._tmix_shift_pool.device
-        if isinstance(slot_ids, torch.Tensor):
+        if isinstance(slot_ids, torch.Tensor) and slot_ids.device.type != "cpu":
             return slot_ids.to(device=device, dtype=torch.int32).contiguous()
         return async_tensor_h2d(slot_ids, dtype=torch.int32, device=device)
 
@@ -359,10 +359,10 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         long_indices = indices.long()
         assert self._tmix_shift_pool is not None
         assert self._cmix_shift_pool is not None
+        assert self._wkv_state_pool is not None
         self._tmix_shift_pool.index_fill_(1, long_indices, 0)
         self._cmix_shift_pool.index_fill_(1, long_indices, 0)
-        for handle in self._wkv_handles:
-            handle.reset_slots_(indices)
+        self._wkv_state_pool.index_fill_(1, long_indices, 0)
 
     def copy_state_slots(
         self,
@@ -379,12 +379,13 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         destination_long = destination.long()
         assert self._tmix_shift_pool is not None
         assert self._cmix_shift_pool is not None
+        assert self._wkv_state_pool is not None
         tmix_values = self._tmix_shift_pool.index_select(1, source_long)
         cmix_values = self._cmix_shift_pool.index_select(1, source_long)
+        wkv_values = self._wkv_state_pool.index_select(1, source_long)
         self._tmix_shift_pool.index_copy_(1, destination_long, tmix_values)
         self._cmix_shift_pool.index_copy_(1, destination_long, cmix_values)
-        for handle in self._wkv_handles:
-            handle.copy_slots_(handle, source, destination)
+        self._wkv_state_pool.index_copy_(1, destination_long, wkv_values)
 
     def copy_state_block_pairs(self, block_copies: Sequence[tuple[int, int]]) -> None:
         if not block_copies:
