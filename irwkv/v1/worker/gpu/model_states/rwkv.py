@@ -13,7 +13,6 @@ import torch.nn as nn
 from irwkv.config import IrwkvConfig
 from irwkv.model_executor.models.rwkv import _load_flashrwkv2, _prepare_tuning
 from irwkv.sampling_params import SamplingParams
-from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.core.sched.output import NewRequestData
 from irwkv.v1.kv_cache_interface import KVCacheConfig
 from irwkv.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -272,12 +271,8 @@ class RwkvSampler(Sampler):
     def preempt_request(self, req_id: str) -> None:
         req_idx = self.req_states.req_id_to_index[req_id]
         self._preserved_requests[req_id] = (
-            self._rapid_sampling_states[req_idx].to(
-                device="cpu", copy=True, non_blocking=True
-            ),
-            self._rapid_penalties[req_idx].to(
-                device="cpu", copy=True, non_blocking=True
-            ),
+            self._rapid_sampling_states[req_idx].to(device="cpu", copy=True),
+            self._rapid_penalties[req_idx].to(device="cpu", copy=True),
         )
 
     def remove_request(self, req_id: str) -> None:
@@ -321,11 +316,8 @@ class RwkvSampler(Sampler):
                 self._rapid_penalties[req_idx].zero_()
             else:
                 request_state, penalties = preserved
-                # Snapshot and restore are ordered on the model execution stream.
-                self._rapid_sampling_states[req_idx].copy_(
-                    request_state, non_blocking=True
-                )
-                self._rapid_penalties[req_idx].copy_(penalties, non_blocking=True)
+                self._rapid_sampling_states[req_idx].copy_(request_state)
+                self._rapid_penalties[req_idx].copy_(penalties)
         self._new_requests.clear()
 
     def __call__(
@@ -536,31 +528,31 @@ class RwkvModelState(DefaultModelState):
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
         if reset_rows_np.size:
-            reset_coords = async_tensor_h2d(
-                np.stack((reset_rows_np, new_columns[reset_rows_np])),
-                dtype=torch.int64,
-                device=self.device,
+            reset_rows = torch.as_tensor(
+                reset_rows_np, dtype=torch.int64, device=self.device
             )
-            reset_indices = block_table[reset_coords[0], reset_coords[1]].contiguous()
+            reset_columns = torch.as_tensor(
+                new_columns[reset_rows_np], dtype=torch.int64, device=self.device
+            )
+            reset_indices = block_table[reset_rows, reset_columns].contiguous()
             self._state_layer.reset_state_slots(reset_indices)
         row_indices_np = np.flatnonzero(
             (old_columns >= 0) & (old_columns != new_columns)
         )
         if row_indices_np.size:
-            copy_coords = async_tensor_h2d(
-                np.stack(
-                    (
-                        row_indices_np,
-                        old_columns[row_indices_np],
-                        new_columns[row_indices_np],
-                    )
-                ),
-                dtype=torch.int64,
-                device=self.device,
+            row_indices = torch.as_tensor(
+                row_indices_np, dtype=torch.int64, device=self.device
             )
-            rows = copy_coords[0]
-            source_indices = block_table[rows, copy_coords[1]].contiguous()
-            destination_indices = block_table[rows, copy_coords[2]].contiguous()
+            source_columns = torch.as_tensor(
+                old_columns[row_indices_np], dtype=torch.int64, device=self.device
+            )
+            destination_columns = torch.as_tensor(
+                new_columns[row_indices_np], dtype=torch.int64, device=self.device
+            )
+            source_indices = block_table[row_indices, source_columns].contiguous()
+            destination_indices = block_table[
+                row_indices, destination_columns
+            ].contiguous()
             self._state_layer.copy_state_slots(source_indices, destination_indices)
         self._state_block_columns[req_indices] = new_columns
         self._state_num_computed_tokens[req_indices] = computed + query_lens
