@@ -702,6 +702,57 @@ async def test_rwkv_chat_fast_split_and_tool_call_prefix_consistency(stream):
         assert msg.content is None
         assert [tc.function.name for tc in msg.tool_calls] == ["probe"]
 
+    # Verify add_special_tokens=True and left/right prompt truncation.
+    bos_req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "你好"}],
+        add_special_tokens=True,
+    )
+    bos_conv, bos_inputs = await serving_chat.render_chat_request(bos_req)
+    bos_split = serving_chat._split_rwkv_generation_prompt(
+        bos_req, bos_conv, {}, bos_inputs[0]
+    )
+    assert bos_split == ("<think", len(bos_inputs[0]["prompt_token_ids"]) - 2)
+
+    plain_req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=messages,
+    )
+    plain_conv, plain_inputs = await serving_chat.render_chat_request(plain_req)
+    full_ids = list(plain_inputs[0]["prompt_token_ids"])
+    full_split = serving_chat._split_rwkv_generation_prompt(
+        plain_req, plain_conv, {}, plain_inputs[0]
+    )
+    assert full_split is not None
+    assert (
+        serving_chat._try_fast_split_rwkv_generation_prompt(
+            plain_req, plain_conv, {}, plain_inputs[0]
+        )
+        == full_split
+    )
+    trunc_req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=messages,
+        truncate_prompt_tokens=20,
+    )
+    right_input = {
+        "prompt": plain_inputs[0]["prompt"],
+        "prompt_token_ids": full_ids[:20],
+    }
+    assert (
+        serving_chat._split_rwkv_generation_prompt(
+            trunc_req, plain_conv, {}, right_input
+        )
+        is None
+    )
+    left_input = {
+        "prompt": plain_inputs[0]["prompt"],
+        "prompt_token_ids": full_ids[-20:],
+    }
+    assert serving_chat._split_rwkv_generation_prompt(
+        trunc_req, plain_conv, {}, left_input
+    ) == (full_split[0], full_split[1] - (len(full_ids) - 20))
+
 
 @pytest.mark.asyncio
 async def test_chat_streaming_metrics_ride_on_usage_chunk():

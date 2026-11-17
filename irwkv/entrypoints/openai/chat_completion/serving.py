@@ -268,7 +268,7 @@ class OpenAIServingChat(GenerateBaseServing):
         chat_template_kwargs: dict[str, Any],
     ) -> tuple[str, str, str] | None:
         has_tools = bool(
-            request.tools is not None
+            request.tools
             and not (
                 request.tool_choice == "none"
                 and self.exclude_tools_when_tool_choice_none
@@ -357,7 +357,11 @@ class OpenAIServingChat(GenerateBaseServing):
         chat_template_kwargs: dict[str, Any],
         engine_input: EngineInput,
     ) -> tuple[str, int] | None:
-        if not request.add_generation_prompt or request.continue_final_message:
+        if (
+            not request.add_generation_prompt
+            or request.continue_final_message
+            or request.truncate_prompt_tokens is not None
+        ):
             return None
         components = self._extract_prompt_components(engine_input)
         prompt_text, prompt_token_ids = components.text, components.token_ids
@@ -455,11 +459,25 @@ class OpenAIServingChat(GenerateBaseServing):
         generation_prompt = prompt_text[
             len(os.path.commonprefix([prompt_text, reply_text])) :
         ]
-        reply_token_ids = tokenizer.encode(reply_text, add_special_tokens=False)
-        num_prefix_tokens = len(
-            os.path.commonprefix([list(prompt_token_ids), reply_token_ids])
+        prompt_ids = list(prompt_token_ids)
+        reply_token_ids = tokenizer.encode(
+            reply_text, add_special_tokens=request.add_special_tokens
         )
-        if not generation_prompt or num_prefix_tokens >= len(prompt_token_ids):
+        if request.truncate_prompt_tokens is not None:
+            full_prompt_ids = tokenizer.encode(
+                prompt_text, add_special_tokens=request.add_special_tokens
+            )
+            if len(prompt_ids) < len(full_prompt_ids):
+                if full_prompt_ids[-len(prompt_ids) :] != prompt_ids:
+                    return None
+                dropped = len(full_prompt_ids) - len(prompt_ids)
+                reply_token_ids = reply_token_ids[dropped:]
+        num_prefix_tokens = len(os.path.commonprefix([prompt_ids, reply_token_ids]))
+        if (
+            not generation_prompt
+            or num_prefix_tokens <= 0
+            or num_prefix_tokens >= len(prompt_ids)
+        ):
             return None
         return generation_prompt, num_prefix_tokens
 

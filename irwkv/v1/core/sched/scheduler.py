@@ -465,7 +465,7 @@ class Scheduler(SchedulerInterface):
             and 0 < tail_boundary <= start
             and end >= prefill_end
             and end - start <= block_size
-            and not start < junction < end
+            and junction <= start
         )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary

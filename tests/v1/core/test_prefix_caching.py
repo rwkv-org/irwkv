@@ -257,6 +257,7 @@ def test_single_mamba_partial_prefix_hit_is_copied_before_continuation():
         (RwkvStateSpec, None, 0, 8, 129, 127, [96, 24, 8, 1], 120, 128),
         (RwkvStateSpec, 128, 0, 8, 129, 127, [96, 24, 8, 1], 120, 128),
         (RwkvStateSpec, 0, 128, 8, 129, 127, [96, 24, 8, 1], 120, 128),
+        (RwkvStateSpec, 0, 136, 8, 136, 125, [96, 24, 8, 8], 128, 128),
     ],
 )
 def test_mamba_align_keeps_state_at_prompt_cache_boundary(
