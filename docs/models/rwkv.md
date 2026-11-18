@@ -93,51 +93,10 @@ OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
 ## Kernel preparation
 
-FlashRWKV2 stores verified tuning profiles and native builds under
-`~/.cache/flashrwkv2`. Set `FLASHRWKV2_CACHE_DIR` before starting the process to
-choose another persistent root. The tuning root is independent of the virtual
-environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
-0.1.15 keeps its separate JIT cache at `~/.tilelang/cache`.
-
-`IRWKV_RWKV_TUNING_MODE` controls preparation before CUDA Graph capture:
-
-- `inspect` logs actual dispatch coverage and permits untuned defaults.
-- `require` loads verified selections and fails on the first missing profile,
-  with the operator, full key, and cache root in the diagnostic.
-- `tune` (default) calls FlashRWKV2 to verify and tune only missing keys, then
-  requires complete coverage before capture. Eager prefill shapes are prepared
-  on first use with their recurrent state restored before the request executes.
-
-Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Graph warmup
-and padded eager tuning use fully active representative metadata. Startup state
-slots are reset before capture. Unpadded eager tuning uses the request's packed
-sequence boundaries. Request execution passes the actual active counts to the
-TokenShift and WKV recurrent kernels, which skip padding. The report records
-each selected configuration, fingerprint, device class, profile path, and
-fixed/hit/missing/tuned status. Same-class GPUs and new worker processes reuse
-profiles through FlashRWKV2's locking and compatibility checks.
-
-To prepare the graph shapes before serving, run with the same model and serving
-arguments as the target service, including its sequence limit, token budget,
-and capture sizes:
-
-```bash
-FLASHRWKV2_CACHE_DIR=/path/to/persistent/flashrwkv2 \
-IRWKV_RWKV_TUNING_MODE=tune \
-timeout 7200s .venv/bin/irwkv serve <model> <serving-arguments>
-```
-
-After preparation, restart with `IRWKV_RWKV_TUNING_MODE=require` to verify loading
-and capture in a fresh process. Eager workloads can use FlashRWKV2's public
-`prepare_tuning` with representative forward calls and disposable state.
-
-On RTX 4090 and PRO 6000 GPUs, FlashRWKV2 uses deterministic configurations for
-supported BF16 projections and head-size-64 WKV with FP32 state. These dispatches
-report `fixed` and do not search or time configurations. Preparation still compiles
-their reachable kernel variants before capture. FP16 recurrent state and other
-unsupported layouts retain verified profiles and bounded tuning. After upgrading,
-run preparation again; compatible TileLang binaries remain reusable.
+FlashRWKV2 selects kernels from the offline configurations shipped with the
+provider. irwkv warms up the model and the head/sampling operations before
+CUDA Graph capture. During generation it passes the active token and sequence
+counts to the recurrent operators so that padding leaves request state intact.
 
 ## Decoding defaults
 
