@@ -1485,7 +1485,7 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
 @pytest.mark.parametrize("local_layers", [(31, 30), (32, 32)])
 @pytest.mark.parametrize(
     ("state_dtype", "private_bytes_per_head"),
-    [(torch.float16, 772), (torch.float16, 1284), (torch.float32, 0)],
+    [(torch.float16, 1540), (torch.float16, 1284), (torch.float32, 0)],
 )
 @pytest.mark.parametrize("blocks_per_rank", [(13, 17), (17, 13)])
 def test_rwkv_pp_state_uses_one_block_per_request(
@@ -1511,7 +1511,7 @@ def test_rwkv_pp_state_uses_one_block_per_request(
         config,
         workers,
         [
-            (spec.page_size_bytes + spec.external_bytes_per_page) * blocks
+            (spec.page_size_bytes + spec.external_bytes_per_page) * (blocks + 1) - 1
             for spec, blocks in zip(specs, blocks_per_rank)
         ],
     )

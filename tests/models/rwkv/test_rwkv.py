@@ -252,18 +252,21 @@ def test_bound_wkv_slots_budget_and_materialize_after_copy(heads, state_dtype) -
     ones = torch.ones((batch, heads, 64), dtype=torch.bfloat16, device="cuda")
     zeros = torch.zeros_like(ones)
     slot_values = (source + 1).to(torch.bfloat16).view(batch, 1, 1)
-    infer(
-        ones,
-        zeros,
-        ones,
-        ones * slot_values,
-        zeros,
-        zeros,
-        state=state,
-        cu_seqlens=cu,
-        state_indices=source,
-        max_seqlen=1,
-    )
+    # Unit decay preserves both distinguishable updates across the slot copy.
+    decay_logits = torch.full_like(ones, -100)
+    for values in (slot_values, 2 * slot_values):
+        infer(
+            ones,
+            decay_logits,
+            ones,
+            ones * values,
+            zeros,
+            zeros,
+            state=state,
+            cu_seqlens=cu,
+            state_indices=source,
+            max_seqlen=1,
+        )
     layer.copy_state_slots(source, destination)
     layer.reset_state_slots(source)
     layer.materialize_state_slots(torch.cat((source, destination)))
@@ -271,7 +274,7 @@ def test_bound_wkv_slots_budget_and_materialize_after_copy(heads, state_dtype) -
     wkv = raw.flatten().view(layer.state_dtype)[-2 * batch * heads * 64**2 :]
     source_state, copied_state = wkv.view(2 * batch, heads, 64, 64).chunk(2)
     assert torch.count_nonzero(source_state) == 0
-    assert torch.all(copied_state == slot_values.unsqueeze(-1))
+    assert torch.all(copied_state == (3 * slot_values).unsqueeze(-1))
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
