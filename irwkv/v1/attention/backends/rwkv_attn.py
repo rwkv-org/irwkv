@@ -24,6 +24,7 @@ class RwkvStateSpec(MambaSpec):
     """Scheduler-owned BF16 shifts and configurable recurrent state."""
 
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.RWKV
+    external_bytes_per_page: int = 0
 
     @property
     def requires_block_zeroing(self) -> bool:

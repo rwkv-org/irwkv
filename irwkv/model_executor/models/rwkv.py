@@ -196,10 +196,23 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
+    def _prepare_state(self, state: torch.Tensor) -> _FlashRWKVStateHandle:
+        flashrwkv2 = _load_flashrwkv2()
+        if self.state_dtype == torch.float16:
+            return flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state)
+        return flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
+
     def _build_spec(self, irwkv_config: IrwkvConfig) -> RwkvStateSpec:
         layer_count = self.num_local_layers
         block_size = irwkv_config.cache_config.mamba_block_size
         assert block_size is not None
+        # The provider's layout is per slot and independent of pool capacity.
+        probe = torch.empty(
+            (1, self.num_heads, self.head_size, self.head_size),
+            dtype=self.state_dtype,
+            device=irwkv_config.device_config.device,
+        )
+        layout = self._prepare_state(probe).memory_layout
         return RwkvStateSpec(
             block_size=block_size,
             shapes=(
@@ -208,6 +221,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
                 (layer_count, self.num_heads, self.head_size, self.head_size),
             ),
             dtypes=(torch.bfloat16, torch.bfloat16, self.state_dtype),
+            external_bytes_per_page=layer_count * layout["private_bytes_per_slot"],
             mamba_cache_mode=irwkv_config.cache_config.mamba_cache_mode,
             num_prefill_checkpoint_blocks=0,
         )
@@ -264,29 +278,17 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
-        flashrwkv2 = _load_flashrwkv2()
-        prepare_state = (
-            flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
-            if self.state_dtype == torch.float16
-            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
-        )
         self._wkv_handles = []
         for layer_idx in range(layer_count):
-            handle = prepare_state(wkv_state_pool[layer_idx])
-            expected_state_bytes = (
-                self.num_heads
-                * self.head_size
-                * self.head_size
-                * wkv_state_pool.element_size()
-            )
-            expected_fixed_bytes = 0
-            handle_layout = handle.memory_layout
+            handle = self._prepare_state(wkv_state_pool[layer_idx])
+            layout = handle.memory_layout
+            base = wkv_state_pool[layer_idx, 0].nbytes
+            private = layout["private_bytes_per_slot"]
             if (
-                handle_layout["bytes_per_slot"] != expected_state_bytes
-                or handle_layout["fixed_workspace_nbytes"] != expected_fixed_bytes
-                or handle_layout["total_nbytes"]
-                != slot_count * handle_layout["bytes_per_slot"]
-                + handle_layout["fixed_workspace_nbytes"]
+                private * layer_count != spec.external_bytes_per_page
+                or layout["bytes_per_slot"] != base + private
+                or layout["fixed_workspace_nbytes"] != 0
+                or layout["total_nbytes"] != slot_count * (base + private)
             ):
                 raise RuntimeError(
                     "FlashRWKV2 allocated a different recurrent state layout "

@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 import torch
 
 import irwkv.v1.worker.gpu.attn_utils as attn_utils
@@ -25,7 +26,8 @@ class _AllocationScope(AbstractContextManager):
         self.active = False
 
 
-def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
+@pytest.mark.parametrize("private_bytes", [0, 1284])
+def test_mrv2_kv_pool_covers_provider_cache_storage(monkeypatch, private_bytes) -> None:
     scope = _AllocationScope()
     kv_caches = {"layer": torch.empty(0)}
 
@@ -34,7 +36,7 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
         return kv_caches
 
     def bind(*args, **kwargs):
-        assert not scope.active
+        assert scope.active == bool(private_bytes)
 
     monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate)
     monkeypatch.setattr(attn_utils, "bind_kv_cache_to_layers", bind)
@@ -48,7 +50,16 @@ def test_mrv2_kv_pool_only_wraps_backing_allocation(monkeypatch) -> None:
     )
     result = attn_utils.init_kv_cache(
         {},
-        SimpleNamespace(kv_cache_groups=[]),
+        SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=SimpleNamespace(
+                        external_bytes_per_page=private_bytes,
+                        external_fixed_memory_bytes=0,
+                    )
+                )
+            ]
+        ),
         torch.device("cpu"),
         [],
         config,
