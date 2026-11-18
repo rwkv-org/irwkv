@@ -23,16 +23,17 @@ uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
 The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a19`. FlashRWKV2 exposes the public
-`prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
-recurrent-state provider.
+commits and `FlashRWKV2==0.2.0a1`.
 
 ## Serve a model
 
 RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
 WKV recurrent state, and head logits. Chunked prefill is required. Prefix
 caching is disabled by default, so each request updates one recurrent state.
-The default FP32 recurrence follows the training precision contract.
+The default FP32 recurrence follows the training precision contract. For RL
+rollouts, set `--mamba-ssm-cache-dtype float32` explicitly, or pass
+`mamba_ssm_cache_dtype="float32"` to `LLM`, to use the same WKV state
+precision when sampling and when recomputing training logprobs.
 
 ```bash
 irwkv serve <model> \

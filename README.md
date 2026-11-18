@@ -1,6 +1,6 @@
-<div align="center">
-  
 # infer-rwkv
+
+<div align="center">
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
@@ -75,7 +75,8 @@ for output in outputs:
 ## Serving
 
 Start an OpenAI-compatible server with BF16 activations and FP32 recurrent
-state:
+state. RL rollouts should set the state precision explicitly as shown below.
+For lower-memory serving, use `--mamba-ssm-cache-dtype float16`.
 
 ```bash
 irwkv serve /path/to/rwkv-checkpoint \

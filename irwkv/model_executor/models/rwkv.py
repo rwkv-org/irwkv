@@ -50,7 +50,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a19"
+_FLASHRWKV2_VERSION = "0.2.0a1"
 logger = init_logger(__name__)
 
 
@@ -71,7 +71,6 @@ class _FlashRWKVStateHandle(Protocol):
 
 
 _FLASHRWKV2_APIS = (
-    "get_tuning_cache_dir",
     "prepare_tuning",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",

@@ -89,8 +89,7 @@ class _FakeStateHandle:
 
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
-    module.__version__ = "0.1.0a19"
-    module.get_tuning_cache_dir = lambda: None
+    module.__version__ = "0.2.0a1"
     module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
@@ -1970,6 +1969,8 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
     )
     prompt_token_ids = list(range(1, 74))
     prompt = {"prompt_token_ids": prompt_token_ids}
+    sampling_only = params.clone()
+    sampling_only.logprobs = None
     reference = None
     for enforce_eager, token_budget in ((True, 128), (False, 32)):
         with irwkv_runner(
@@ -1999,6 +2000,9 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             expected_hit = max_hit // hit_unit * hit_unit if prefix_caching else 0
             assert hit.num_cached_tokens == expected_hit
             single, mixed = cold.outputs[0], hit.outputs[0]
+            # Without logprobs the graph run uses the separate head/sampling graphs.
+            sampled = runner.llm.generate([prompt], sampling_only)[0].outputs[0]
+            assert sampled.token_ids == single.token_ids
         assert len(single.token_ids) == 4
         assert mixed.token_ids == single.token_ids
         assert mixed.logprobs == single.logprobs
