@@ -52,10 +52,10 @@ the same per-token state rounding.
 
 For FP16 WKV state with head size 64 and 40 or 64 heads, FlashRWKV2 can
 defer writing the latest update to the bound tensor during batched decode.
-Its private log costs 1,284 bytes per head, per slot, per local layer.
-The scheduler includes these bytes when sizing the pool. The caller-backed
-tensor holds the BF16 shifts and the WKV base state. FP32 WKV state and
-other supported geometries have no private log.
+The scheduler queries the provider's `memory_layout` for one slot on the
+target device and budgets `private_bytes_per_slot` for each local layer.
+The caller-backed tensor holds the BF16 shifts and the WKV base state.
+FP32 WKV state and other supported geometries have no private log.
 
 Prefix-cache copies and resets use the state handles so pending updates follow
 the slot. Before reading or exporting the raw tensor, call

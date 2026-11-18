@@ -221,30 +221,26 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires FlashRWKV2 CUDA")
 @pytest.mark.parametrize(
-    ("heads", "state_dtype", "private_per_head"),
-    [
-        (40, "float16", 1284),
-        (64, "float16", 1284),
-        (12, "float16", 0),
-        (64, "float32", 0),
-    ],
+    ("heads", "state_dtype"),
+    [(40, "float16"), (64, "float16"), (12, "float16"), (64, "float32")],
 )
-def test_bound_wkv_slots_budget_and_materialize_after_copy(
-    heads, state_dtype, private_per_head
-) -> None:
+def test_bound_wkv_slots_budget_and_materialize_after_copy(heads, state_dtype) -> None:
     config = _state_irwkv_config(state_dtype)
     config.model_config.hf_config.num_attention_heads = heads
     config.model_config.hf_config.hidden_size = heads * 64
     config.device_config.device = torch.device("cuda")
-    layer = RwkvStateLayer(config, 1, "model.layers.0.rwkv_state")
+    layer = RwkvStateLayer(config, 2, "model.layers.0.rwkv_state")
     spec = layer.get_kv_cache_spec(config)
-    assert spec.external_bytes_per_page == heads * private_per_head
     assert spec.external_fixed_memory_bytes == 0
     batch = 16
     raw = torch.zeros(
         (2 * batch, spec.page_size_bytes), dtype=torch.uint8, device="cuda"
     )
     layer.bind_kv_cache(raw)
+    state = layer.get_layer_state(layer.num_local_layers - 1)[1]
+    private = state.memory_layout["private_bytes_per_slot"]
+    assert (private > 0) == (state_dtype == "float16" and heads in (40, 64))
+    assert spec.external_bytes_per_page == layer.num_local_layers * private
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
     source, destination = cu[:-1], cu[:-1] + batch
     flash = _load_flashrwkv2()
@@ -255,14 +251,15 @@ def test_bound_wkv_slots_budget_and_materialize_after_copy(
     )
     ones = torch.ones((batch, heads, 64), dtype=torch.bfloat16, device="cuda")
     zeros = torch.zeros_like(ones)
+    slot_values = (source + 1).to(torch.bfloat16).view(batch, 1, 1)
     infer(
         ones,
         zeros,
         ones,
-        ones,
+        ones * slot_values,
         zeros,
         zeros,
-        state=layer.get_layer_state(0)[1],
+        state=state,
         cu_seqlens=cu,
         state_indices=source,
         max_seqlen=1,
@@ -270,11 +267,11 @@ def test_bound_wkv_slots_budget_and_materialize_after_copy(
     layer.copy_state_slots(source, destination)
     layer.reset_state_slots(source)
     layer.materialize_state_slots(torch.cat((source, destination)))
-    # The first update from zero with unit k and v writes an all-ones matrix.
+    # The last layer's WKV base occupies the tail of the caller-backed allocation.
     wkv = raw.flatten().view(layer.state_dtype)[-2 * batch * heads * 64**2 :]
-    source_state, copied_state = wkv.chunk(2)
+    source_state, copied_state = wkv.view(2 * batch, heads, 64, 64).chunk(2)
     assert torch.count_nonzero(source_state) == 0
-    assert torch.all(copied_state == 1)
+    assert torch.all(copied_state == slot_values.unsqueeze(-1))
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
