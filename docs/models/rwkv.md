@@ -27,28 +27,22 @@ commits and `FlashRWKV2==0.2.0a1`.
 
 ## Serve a model
 
-RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
-WKV recurrent state, and head logits. Chunked prefill is required. Prefix
-caching is disabled by default, so each request updates one recurrent state.
-The default FP32 recurrence follows the training precision contract. For RL
-rollouts, set `--mamba-ssm-cache-dtype float32` explicitly, or pass
-`mamba_ssm_cache_dtype="float32"` to `LLM`, to use the same WKV state
-precision when sampling and when recomputing training logprobs.
+RWKV serving defaults to BF16 weights, activations and shift state, FP16 WKV
+state, and FP32 arithmetic and head logits. Prefill and decode round the WKV
+state to FP16 after each token. Chunked prefill is required. Prefix caching
+is disabled by default, so each request updates one recurrent state.
 
 ```bash
 irwkv serve <model> \
   --dtype bfloat16 \
-  --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching
 ```
 
-For optional lower-memory inference, explicitly pass
-`--mamba-ssm-cache-dtype float16`. This retains BF16 token inputs/outputs and
-shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
-after every token. It follows a different numerical trajectory from FP32
-training and can change logits and generated tokens. Prefill and decode use
-the same per-token state rounding.
+For RL rollouts, pass `--mamba-ssm-cache-dtype float32` or set
+`mamba_ssm_cache_dtype="float32"` in `LLM`. This matches the WKV state
+precision used to recompute training logprobs. FP16 recurrence can produce
+different logits and generated tokens.
 
 For FP16 WKV state with head size 64 and 40 or 64 heads, FlashRWKV2 can
 defer writing the latest update to the bound tensor during batched decode.

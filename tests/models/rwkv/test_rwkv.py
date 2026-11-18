@@ -721,12 +721,12 @@ def _config() -> SimpleNamespace:
     )
 
 
-def test_config_uses_bf16_shift_fp32_wkv_and_full_graph_defaults() -> None:
+def test_config_uses_bf16_shift_fp16_wkv_and_full_graph_defaults() -> None:
     irwkv_config = _config()
     RwkvForCausalLMConfig.verify_and_update_config(irwkv_config)
 
     assert irwkv_config.cache_config.mamba_cache_dtype == "bfloat16"
-    assert irwkv_config.cache_config.mamba_ssm_cache_dtype == "float32"
+    assert irwkv_config.cache_config.mamba_ssm_cache_dtype == "float16"
     assert not irwkv_config.cache_config.enable_prefix_caching
     assert irwkv_config.cache_config.mamba_cache_mode == "none"
     assert irwkv_config.cache_config.mamba_block_size == 1024
@@ -2044,7 +2044,11 @@ def test_real_model_batching_preserves_tokens_and_logprobs(
             gpu_memory_utilization=0.8,
             num_gpu_blocks_override=64,
             block_size=32,
-            mamba_ssm_cache_dtype=state_dtype,
+            mamba_ssm_cache_dtype=(
+                "auto"
+                if state_dtype == "float16" and not enforce_eager
+                else state_dtype
+            ),
             enable_chunked_prefill=True,
             enable_prefix_caching=prefix_caching,
             prefix_match_unit=prefix_match_unit,

@@ -74,15 +74,13 @@ for output in outputs:
 
 ## Serving
 
-Start an OpenAI-compatible server with BF16 activations and FP32 recurrent
-state. RL rollouts should set the state precision explicitly as shown below.
-For lower-memory serving, use `--mamba-ssm-cache-dtype float16`.
+Serving uses BF16 activations and FP16 WKV state by default. For RL rollouts,
+pass `--mamba-ssm-cache-dtype float32` to match training recurrence.
 
 ```bash
 irwkv serve /path/to/rwkv-checkpoint \
   --served-model-name rwkv7 \
   --dtype bfloat16 \
-  --mamba-ssm-cache-dtype float32 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching
 ```
