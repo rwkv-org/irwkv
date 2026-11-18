@@ -63,6 +63,7 @@ class _FakeStateHandle:
     def memory_layout(self) -> dict[str, int]:
         per_slot = self.state[0].numel() * self.state.element_size()
         return {
+            "private_bytes_per_slot": 0,
             "bytes_per_slot": per_slot,
             "fixed_workspace_nbytes": 0,
             "total_nbytes": self.state.numel() * self.state.element_size(),
@@ -70,6 +71,9 @@ class _FakeStateHandle:
 
     def reset_slots_(self, indices: torch.Tensor) -> None:
         self.state.index_fill_(0, indices.long(), 0)
+
+    def clone_slots(self, indices: torch.Tensor) -> "_FakeStateHandle":
+        return _FakeStateHandle(self.state.index_select(0, indices.long()))
 
     def copy_slots_(
         self,
@@ -213,6 +217,64 @@ def test_state_spec_and_caller_backed_slot_lifecycle(
         and torch.equal(layer_handle.materialized[0], source)
         for layer_handle in handles
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires FlashRWKV2 CUDA")
+@pytest.mark.parametrize(
+    ("heads", "state_dtype", "private_per_head"),
+    [
+        (40, "float16", 1284),
+        (64, "float16", 1284),
+        (12, "float16", 0),
+        (64, "float32", 0),
+    ],
+)
+def test_bound_wkv_slots_budget_and_materialize_after_copy(
+    heads, state_dtype, private_per_head
+) -> None:
+    config = _state_irwkv_config(state_dtype)
+    config.model_config.hf_config.num_attention_heads = heads
+    config.model_config.hf_config.hidden_size = heads * 64
+    config.device_config.device = torch.device("cuda")
+    layer = RwkvStateLayer(config, 1, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    assert spec.external_bytes_per_page == heads * private_per_head
+    assert spec.external_fixed_memory_bytes == 0
+    batch = 16
+    raw = torch.zeros(
+        (2 * batch, spec.page_size_bytes), dtype=torch.uint8, device="cuda"
+    )
+    layer.bind_kv_cache(raw)
+    cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    source, destination = cu[:-1], cu[:-1] + batch
+    flash = _load_flashrwkv2()
+    infer = (
+        flash.infer_tmix_wkv7_recurrent_fp16_forward_varlen
+        if state_dtype == "float16"
+        else flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    )
+    ones = torch.ones((batch, heads, 64), dtype=torch.bfloat16, device="cuda")
+    zeros = torch.zeros_like(ones)
+    infer(
+        ones,
+        zeros,
+        ones,
+        ones,
+        zeros,
+        zeros,
+        state=layer.get_layer_state(0)[1],
+        cu_seqlens=cu,
+        state_indices=source,
+        max_seqlen=1,
+    )
+    layer.copy_state_slots(source, destination)
+    layer.reset_state_slots(source)
+    layer.materialize_state_slots(torch.cat((source, destination)))
+    # The first update from zero with unit k and v writes an all-ones matrix.
+    wkv = raw.flatten().view(layer.state_dtype)[-2 * batch * heads * 64**2 :]
+    source_state, copied_state = wkv.chunk(2)
+    assert torch.count_nonzero(source_state) == 0
+    assert torch.all(copied_state == 1)
 
 
 def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
@@ -949,7 +1011,7 @@ def test_first_eager_shape_tunes_without_changing_request_state(
     state = SimpleNamespace(
         _tmix_shift_pool=pools[0],
         _cmix_shift_pool=pools[1],
-        _wkv_state_pool=pools[2],
+        _wkv_handles=[_FakeStateHandle(pools[2][0])],
         reset_state_slots=lambda slots: [pool.zero_() for pool in pools],
     )
     model = SimpleNamespace(

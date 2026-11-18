@@ -48,8 +48,20 @@ For optional lower-memory inference, explicitly pass
 shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
 after every token. It follows a different numerical trajectory from FP32
 training and can change logits and generated tokens. Prefill and decode use
-the same per-token state rounding. This option does not change training
-precision.
+the same per-token state rounding.
+
+For FP16 WKV state with head size 64 and 40 or 64 heads, FlashRWKV2 can
+defer writing the latest update to the bound tensor during batched decode.
+Its private log costs 1,284 bytes per head, per slot, per local layer.
+The scheduler includes these bytes when sizing the pool. The caller-backed
+tensor holds the BF16 shifts and the WKV base state. FP32 WKV state and
+other supported geometries have no private log.
+
+Prefix-cache copies and resets use the state handles so pending updates follow
+the slot. Before reading or exporting the raw tensor, call
+`RwkvStateLayer.materialize_state_slots(slot_ids)` for the slots being read.
+The provider accepts contiguous CUDA int32 slot indices. RWKV supports local
+prefix caching; KV connectors and KV offloading are disabled for this model.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use

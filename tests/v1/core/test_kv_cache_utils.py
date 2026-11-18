@@ -1499,6 +1499,9 @@ def test_rwkv_pp_state_uses_one_block_per_request(
             block_size=16,
             shapes=((layers, 4096), (layers, 4096), (layers, 64, 64, 64)),
             dtypes=(torch.bfloat16, torch.bfloat16, state_dtype),
+            external_bytes_per_page=layers * 64 * 1284
+            if state_dtype == torch.float16
+            else 0,
         )
         for layers in local_layers
     ]
@@ -1506,7 +1509,10 @@ def test_rwkv_pp_state_uses_one_block_per_request(
     configs = get_kv_cache_configs(
         config,
         workers,
-        [spec.page_size_bytes * blocks for spec, blocks in zip(specs, blocks_per_rank)],
+        [
+            (spec.page_size_bytes + spec.external_bytes_per_page) * blocks
+            for spec, blocks in zip(specs, blocks_per_rank)
+        ],
     )
     for worker, spec in zip(configs, specs):
         assert worker.num_blocks == 9
