@@ -22,8 +22,8 @@ uv pip install -r requirements/rwkv.txt --torch-backend=auto
 uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
-The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.2.0a1`.
+The requirements file pins Git revisions for `transformers-rwkv`,
+`tokenizers-rwkv`, and FlashRWKV2 0.2.0a1.
 
 ## Serve a model
 
@@ -39,7 +39,8 @@ irwkv serve <model> \
   --no-enable-prefix-caching
 ```
 
-For RL rollouts, pass `--mamba-ssm-cache-dtype float32` or set
+For RL rollouts, evaluation and sampling-parameter search, pass
+`--mamba-ssm-cache-dtype float32` or set
 `mamba_ssm_cache_dtype="float32"` in `LLM`. This matches the WKV state
 precision used to recompute training logprobs. FP16 recurrence can produce
 different logits and generated tokens.

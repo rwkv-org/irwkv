@@ -75,7 +75,8 @@ for output in outputs:
 ## Serving
 
 Serving uses BF16 activations and FP16 WKV state by default. For RL rollouts,
-pass `--mamba-ssm-cache-dtype float32` to match training recurrence.
+evaluation and sampling-parameter search, pass `--mamba-ssm-cache-dtype float32`
+to match training recurrence.
 
 ```bash
 irwkv serve /path/to/rwkv-checkpoint \
