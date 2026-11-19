@@ -22,33 +22,46 @@ uv pip install -r requirements/rwkv.txt --torch-backend=auto
 uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
-The requirements file fixes the `transformers-rwkv` and `tokenizers-rwkv`
-commits and `FlashRWKV2==0.1.0a19`. FlashRWKV2 exposes the public
-`prepare_tuning` and `get_tuning_cache_dir` APIs in addition to its
-recurrent-state provider.
+The requirements file pins Git revisions for `transformers-rwkv` and
+`tokenizers-rwkv`, and installs FlashRWKV2 0.2.0a1 from PyPI.
 
 ## Serve a model
 
 RWKV uses BF16 weights, activations, and shift state with FP32 accumulation,
 WKV recurrent state, and head logits. Chunked prefill is required. Prefix
 caching is disabled by default, so each request updates one recurrent state.
-The default FP32 recurrence follows the training precision contract.
+For ordinary serving, select FP16 WKV state as shown below. The default WKV
+state is FP32. For RL rollouts, evaluation and sampling-parameter search,
+set `--mamba-ssm-cache-dtype float32` explicitly, or pass
+`mamba_ssm_cache_dtype="float32"` to `LLM`, to use the same WKV state
+precision when sampling and when recomputing training logprobs.
 
 ```bash
 irwkv serve <model> \
   --dtype bfloat16 \
-  --mamba-ssm-cache-dtype float32 \
+  --mamba-ssm-cache-dtype float16 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching
 ```
 
-For optional lower-memory inference, explicitly pass
-`--mamba-ssm-cache-dtype float16`. This retains BF16 token inputs/outputs and
+FP16 inference retains BF16 token inputs/outputs and
 shift state, FP32 arithmetic and head logits, and rounds the WKV state to FP16
 after every token. It follows a different numerical trajectory from FP32
 training and can change logits and generated tokens. Prefill and decode use
-the same per-token state rounding. This option does not change training
-precision.
+the same per-token state rounding.
+
+For FP16 WKV state with head size 64 and 40 or 64 heads, FlashRWKV2 can
+defer writing the latest update to the bound tensor during batched decode.
+The scheduler queries the provider's `memory_layout` for one slot on the
+target device and budgets `private_bytes_per_slot` for each local layer.
+The caller-backed tensor holds the BF16 shifts and the WKV base state.
+FP32 WKV state and other supported geometries have no private log.
+
+Prefix-cache copies and resets use the state handles so pending updates follow
+the slot. Before reading or exporting the raw tensor, call
+`RwkvStateLayer.materialize_state_slots(slot_ids)` for the slots being read.
+The provider accepts contiguous CUDA int32 slot indices. RWKV supports local
+prefix caching; KV connectors and KV offloading are disabled for this model.
 
 RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
 TorchDynamo does not decompose the external fused operators. Use
@@ -92,51 +105,14 @@ OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 
 ## Kernel preparation
 
-FlashRWKV2 stores verified tuning profiles and native builds under
-`~/.cache/flashrwkv2`. Set `FLASHRWKV2_CACHE_DIR` before starting the process to
-choose another persistent root. The tuning root is independent of the virtual
-environment, release directory, `TORCH_HOME`, and `XDG_CACHE_HOME`. TileLang
-0.1.15 keeps its separate JIT cache at `~/.tilelang/cache`.
-
-`IRWKV_RWKV_TUNING_MODE` controls preparation before CUDA Graph capture:
-
-- `inspect` logs actual dispatch coverage and permits untuned defaults.
-- `require` loads verified selections and fails on the first missing profile,
-  with the operator, full key, and cache root in the diagnostic.
-- `tune` (default) calls FlashRWKV2 to verify and tune only missing keys, then
-  requires complete coverage before capture. Eager prefill shapes are prepared
-  on first use with their recurrent state restored before the request executes.
-
-Preparation uses the loaded model weights, configured state dtype, and each
-actual graph shape, including the separate head/sampling graphs. Graph warmup
-and padded eager tuning use fully active representative metadata. Startup state
-slots are reset before capture. Unpadded eager tuning uses the request's packed
-sequence boundaries. Request execution passes the actual active counts to the
-TokenShift and WKV recurrent kernels, which skip padding. The report records
-each selected configuration, fingerprint, device class, profile path, and
-fixed/hit/missing/tuned status. Same-class GPUs and new worker processes reuse
-profiles through FlashRWKV2's locking and compatibility checks.
-
-To prepare the graph shapes before serving, run with the same model and serving
-arguments as the target service, including its sequence limit, token budget,
-and capture sizes:
-
-```bash
-FLASHRWKV2_CACHE_DIR=/path/to/persistent/flashrwkv2 \
-IRWKV_RWKV_TUNING_MODE=tune \
-timeout 7200s .venv/bin/irwkv serve <model> <serving-arguments>
-```
-
-After preparation, restart with `IRWKV_RWKV_TUNING_MODE=require` to verify loading
-and capture in a fresh process. Eager workloads can use FlashRWKV2's public
-`prepare_tuning` with representative forward calls and disposable state.
-
-On RTX 4090 and PRO 6000 GPUs, FlashRWKV2 uses deterministic configurations for
-supported BF16 projections and head-size-64 WKV with FP32 state. These dispatches
-report `fixed` and do not search or time configurations. Preparation still compiles
-their reachable kernel variants before capture. FP16 recurrent state and other
-unsupported layouts retain verified profiles and bounded tuning. After upgrading,
-run preparation again; compatible TileLang binaries remain reusable.
+FlashRWKV2 selects kernels from the offline configurations shipped with the
+provider. irwkv warms up the model and the head/sampling operations before
+CUDA Graph capture. During generation it passes the active token and sequence
+counts to the recurrent operators so that padding leaves request state intact.
+Remove `IRWKV_RWKV_TUNING_MODE` and the standalone online tuning preflight from
+existing deployments. Launches using `--fail-on-environ-validation` reject the
+retired environment variable. `FLASHRWKV2_CACHE_DIR` still selects the native
+build cache.
 
 ## Decoding defaults
 

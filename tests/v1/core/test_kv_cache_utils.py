@@ -1483,10 +1483,13 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
 
 
 @pytest.mark.parametrize("local_layers", [(31, 30), (32, 32)])
-@pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("blocks_per_rank", [(9, 13), (13, 9)])
+@pytest.mark.parametrize(
+    ("state_dtype", "private_bytes_per_head"),
+    [(torch.float16, 1540), (torch.float16, 1284), (torch.float32, 0)],
+)
+@pytest.mark.parametrize("blocks_per_rank", [(13, 17), (17, 13)])
 def test_rwkv_pp_state_uses_one_block_per_request(
-    local_layers, state_dtype, blocks_per_rank
+    local_layers, state_dtype, private_bytes_per_head, blocks_per_rank
 ):
     from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
 
@@ -1499,6 +1502,7 @@ def test_rwkv_pp_state_uses_one_block_per_request(
             block_size=16,
             shapes=((layers, 4096), (layers, 4096), (layers, 64, 64, 64)),
             dtypes=(torch.bfloat16, torch.bfloat16, state_dtype),
+            external_bytes_per_page=layers * 64 * private_bytes_per_head,
         )
         for layers in local_layers
     ]
@@ -1506,24 +1510,28 @@ def test_rwkv_pp_state_uses_one_block_per_request(
     configs = get_kv_cache_configs(
         config,
         workers,
-        [spec.page_size_bytes * blocks for spec, blocks in zip(specs, blocks_per_rank)],
+        [
+            (spec.page_size_bytes + spec.external_bytes_per_page) * (blocks + 1) - 1
+            for spec, blocks in zip(specs, blocks_per_rank)
+        ],
     )
+    num_blocks = min(blocks_per_rank)
     for worker, spec in zip(configs, specs):
-        assert worker.num_blocks == 9
+        assert worker.num_blocks == num_blocks
         assert len(worker.kv_cache_groups) == 1
-        assert worker.kv_cache_tensors[0].size == 9 * spec.page_size_bytes
-        assert get_max_concurrency_for_kv_cache_config(config, worker) == 9
+        assert worker.kv_cache_tensors[0].size == num_blocks * spec.page_size_bytes
+        assert get_max_concurrency_for_kv_cache_config(config, worker) == num_blocks
 
     scheduler = generate_scheduler_kv_cache_config(configs)
     assert len(scheduler.kv_cache_groups) == 1
-    assert get_max_concurrency_for_kv_cache_config(config, scheduler) == 9
+    assert get_max_concurrency_for_kv_cache_config(config, scheduler) == num_blocks
     manager = KVCacheManager(
         kv_cache_config=scheduler,
         max_model_len=512,
         scheduler_block_size=16,
         hash_block_size=16,
     )
-    for index in range(8):
+    for index in range(num_blocks - 1):
         blocks = manager.allocate_slots(make_request(str(index), [1]), 1)
         assert blocks is not None
         assert len(blocks.get_block_ids()) == 1

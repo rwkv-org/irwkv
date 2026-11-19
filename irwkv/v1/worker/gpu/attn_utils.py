@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -379,30 +379,45 @@ def init_kv_cache(
     attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
-    with allocation_context:
+    with ExitStack() as pool:
+        pool.enter_context(allocation_context)
         kv_caches = allocate_kv_cache(
             kv_cache_config,
             device,
             irwkv_config.cache_config.get_resolved_kv_cache_layout(),
             kernel_block_sizes,
         )
-    for layer_name, target in get_shared_kv_cache_layers(irwkv_config).items():
-        kv_caches[layer_name] = kv_caches[target]
-    # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
-    # decoder layer, so a layer name carries two integers (layer + module index).
-    num_attn_module = (
-        2 if irwkv_config.model_config.hf_config.model_type == "longcat_flash" else 1
-    )
-    bindable_caches = map_kv_caches_to_kernel_blocks(
-        {name: cache for name, cache in kv_caches.items() if name in forward_context},
-        attn_groups,
-    )
-    bind_kv_cache_to_layers(
-        bindable_caches,
-        forward_context,
-        num_attn_module,
-        kv_cache_groups=kv_cache_config.kv_cache_groups,
-    )
+        # Provider-owned cache tensors allocated at bind time share the KV
+        # allocation's lifetime, including discard and wake-up.
+        if not any(
+            group.kv_cache_spec.external_bytes_per_page
+            or group.kv_cache_spec.external_fixed_memory_bytes
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            pool.close()
+        for layer_name, target in get_shared_kv_cache_layers(irwkv_config).items():
+            kv_caches[layer_name] = kv_caches[target]
+        # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
+        # decoder layer, so a layer name carries two integers (layer + module index).
+        num_attn_module = (
+            2
+            if irwkv_config.model_config.hf_config.model_type == "longcat_flash"
+            else 1
+        )
+        bindable_caches = map_kv_caches_to_kernel_blocks(
+            {
+                name: cache
+                for name, cache in kv_caches.items()
+                if name in forward_context
+            },
+            attn_groups,
+        )
+        bind_kv_cache_to_layers(
+            bindable_caches,
+            forward_context,
+            num_attn_module,
+            kv_cache_groups=kv_cache_config.kv_cache_groups,
+        )
     return kv_caches
 
 

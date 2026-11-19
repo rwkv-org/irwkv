@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native RWKV-7 inference backed exclusively by FlashRWKV2."""
 
-import json
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import replace
+from collections.abc import Iterable, Sequence
 from functools import cache
 from itertools import islice
 from typing import Any, Protocol
@@ -12,11 +10,8 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 
-from irwkv import envs
 from irwkv.config import IrwkvConfig
 from irwkv.distributed.parallel_state import get_pp_group
-from irwkv.forward_context import set_forward_context
-from irwkv.logger import init_logger
 from irwkv.model_executor.layers.attention_layer_base import AttentionLayerBase
 from irwkv.model_executor.layers.linear import ReplicatedLinear
 from irwkv.model_executor.layers.logits_processor import LogitsProcessor
@@ -32,7 +27,6 @@ from irwkv.model_executor.models.interfaces import (
     SupportsPP,
 )
 from irwkv.sequence import IntermediateTensors
-from irwkv.utils.math_utils import cdiv
 from irwkv.utils.torch_utils import async_tensor_h2d
 from irwkv.v1.attention.backends.rwkv_attn import (
     RwkvAttentionBackend,
@@ -50,8 +44,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.1.0a19"
-logger = init_logger(__name__)
+_FLASHRWKV2_VERSION = "0.2.0a1"
 
 
 class _FlashRWKVStateHandle(Protocol):
@@ -71,8 +64,6 @@ class _FlashRWKVStateHandle(Protocol):
 
 
 _FLASHRWKV2_APIS = (
-    "get_tuning_cache_dir",
-    "prepare_tuning",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_head_linear_all_forward_varlen",
@@ -111,19 +102,6 @@ def _load_flashrwkv2() -> Any:
             "FlashRWKV2 is missing required public APIs: " + ", ".join(missing)
         )
     return flashrwkv2
-
-
-def _prepare_tuning(call: Callable[[], Any], *, mode: str | None = None) -> Any:
-    mode = envs.IRWKV_RWKV_TUNING_MODE if mode is None else mode
-    result = None
-
-    def forward() -> None:
-        nonlocal result
-        result = call()
-
-    report = _load_flashrwkv2().prepare_tuning([forward], mode=mode)
-    logger.info("FlashRWKV2 dispatch coverage: %s", json.dumps(report))
-    return result
 
 
 def _validate_config(config: Any) -> None:
@@ -209,7 +187,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._num_slots = 0
         self._tmix_shift_pool: torch.Tensor | None = None
         self._cmix_shift_pool: torch.Tensor | None = None
-        self._wkv_state_pool: torch.Tensor | None = None
         self._wkv_handles: list[_FlashRWKVStateHandle] = []
         self._live_graph_tickets: list[object] = []
         self.kv_cache = torch.tensor([])
@@ -219,10 +196,23 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
+    def _prepare_state(self, state: torch.Tensor) -> _FlashRWKVStateHandle:
+        flashrwkv2 = _load_flashrwkv2()
+        if self.state_dtype == torch.float16:
+            return flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state)
+        return flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
+
     def _build_spec(self, irwkv_config: IrwkvConfig) -> RwkvStateSpec:
         layer_count = self.num_local_layers
         block_size = irwkv_config.cache_config.mamba_block_size
         assert block_size is not None
+        # The provider's layout is per slot and independent of pool capacity.
+        probe = torch.empty(
+            (1, self.num_heads, self.head_size, self.head_size),
+            dtype=self.state_dtype,
+            device=irwkv_config.device_config.device,
+        )
+        layout = self._prepare_state(probe).memory_layout
         return RwkvStateSpec(
             block_size=block_size,
             shapes=(
@@ -231,6 +221,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
                 (layer_count, self.num_heads, self.head_size, self.head_size),
             ),
             dtypes=(torch.bfloat16, torch.bfloat16, self.state_dtype),
+            external_bytes_per_page=layer_count * layout["private_bytes_per_slot"],
             mamba_cache_mode=irwkv_config.cache_config.mamba_cache_mode,
             num_prefill_checkpoint_blocks=0,
         )
@@ -278,7 +269,7 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
             (layer_count, slot_count, self.hidden_size),
             torch.bfloat16,
         )
-        self._wkv_state_pool, offset = self._typed_view(
+        wkv_state_pool, offset = self._typed_view(
             raw,
             offset,
             (layer_count, slot_count, self.num_heads, self.head_size, self.head_size),
@@ -287,29 +278,17 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if offset != total_bytes:
             raise ValueError("RWKV state pool layout does not fill its allocation")
 
-        flashrwkv2 = _load_flashrwkv2()
-        prepare_state = (
-            flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
-            if self.state_dtype == torch.float16
-            else flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
-        )
         self._wkv_handles = []
         for layer_idx in range(layer_count):
-            handle = prepare_state(self._wkv_state_pool[layer_idx])
-            expected_state_bytes = (
-                self.num_heads
-                * self.head_size
-                * self.head_size
-                * self._wkv_state_pool.element_size()
-            )
-            expected_fixed_bytes = 0
-            handle_layout = handle.memory_layout
+            handle = self._prepare_state(wkv_state_pool[layer_idx])
+            layout = handle.memory_layout
+            base = wkv_state_pool[layer_idx, 0].nbytes
+            private = layout["private_bytes_per_slot"]
             if (
-                handle_layout["bytes_per_slot"] != expected_state_bytes
-                or handle_layout["fixed_workspace_nbytes"] != expected_fixed_bytes
-                or handle_layout["total_nbytes"]
-                != slot_count * handle_layout["bytes_per_slot"]
-                + handle_layout["fixed_workspace_nbytes"]
+                private * layer_count != spec.external_bytes_per_page
+                or layout["bytes_per_slot"] != base + private
+                or layout["fixed_workspace_nbytes"] != 0
+                or layout["total_nbytes"] != slot_count * (base + private)
             ):
                 raise RuntimeError(
                     "FlashRWKV2 allocated a different recurrent state layout "
@@ -322,7 +301,6 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         self._wkv_handles.clear()
         self._tmix_shift_pool = None
         self._cmix_shift_pool = None
-        self._wkv_state_pool = None
         self._num_slots = 0
         self._live_graph_tickets.clear()
         self.kv_cache = torch.tensor([])
@@ -976,7 +954,6 @@ class RwkvForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        self._prepared_tuning_shapes: set[tuple[int, int, int, int]] = set()
         self._reload_names: set[str] = set()
         self._weights_processed = False
 
@@ -1001,113 +978,6 @@ class RwkvForCausalLM(
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         del positions, kwargs
-        metadata = get_rwkv_metadata()
-        if metadata is not None and not torch.cuda.is_current_stream_capturing():
-            mode = envs.IRWKV_RWKV_TUNING_MODE
-            if mode != "tune":
-                if metadata.retain_ticket:
-                    return _prepare_tuning(
-                        lambda: self.model(
-                            input_ids, intermediate_tensors, inputs_embeds
-                        ),
-                        mode=mode,
-                    )
-                return self.model(input_ids, intermediate_tensors, inputs_embeds)
-            shape = (
-                metadata.token_capacity,
-                metadata.sequence_capacity,
-                metadata.batch_size,
-                metadata.max_seqlen,
-            )
-            if metadata.retain_ticket or shape not in self._prepared_tuning_shapes:
-                state = self.get_rwkv_state_layer()
-                batch = metadata.sequence_capacity
-                tokens = metadata.token_capacity
-                slots = torch.arange(
-                    batch,
-                    dtype=torch.int32,
-                    device=metadata.state_indices.device,
-                )
-                active_metadata = replace(
-                    metadata,
-                    state_indices=slots,
-                    validated_metadata=None,
-                    retain_ticket=False,
-                )
-                if metadata.retain_ticket or metadata.has_padding:
-                    # FlashRWKV2 requires fully active metadata for WKV tuning.
-                    assert metadata.num_active_tokens is not None
-                    assert metadata.num_active_sequences is not None
-                    active_metadata.cu_seqlens = (
-                        torch.arange(batch + 1, dtype=torch.int32, device=slots.device)
-                        * tokens
-                        // batch
-                    )
-                    active_metadata.num_active_tokens = torch.full_like(
-                        metadata.num_active_tokens, tokens
-                    )
-                    active_metadata.num_active_sequences = torch.full_like(
-                        metadata.num_active_sequences, batch
-                    )
-                    max_seqlen = max(metadata.max_seqlen, cdiv(tokens, batch))
-                    active_metadata.batch_size = batch
-                    active_metadata.max_seqlen = max_seqlen
-                    active_metadata.max_seqlen_capacity = max_seqlen
-                    active_metadata.has_padding = False
-                tuning_intermediates = intermediate_tensors
-                tuning_embeds = inputs_embeds
-                if metadata.has_padding and not metadata.retain_ticket:
-                    # Padding rows can contain undefined activations.
-                    if intermediate_tensors is not None:
-                        tuning_intermediates = IntermediateTensors(
-                            {
-                                key: torch.zeros_like(value)
-                                for key, value in intermediate_tensors.items()
-                            }
-                        )
-                    if inputs_embeds is not None:
-                        tuning_embeds = torch.zeros_like(inputs_embeds)
-                saved_state = None
-                if not metadata.retain_ticket:
-                    indices = slots.long()
-                    assert state._tmix_shift_pool is not None
-                    assert state._cmix_shift_pool is not None
-                    assert state._wkv_state_pool is not None
-                    saved_state = (
-                        state._tmix_shift_pool.index_select(1, indices),
-                        state._cmix_shift_pool.index_select(1, indices),
-                        state._wkv_state_pool.index_select(1, indices),
-                    )
-                state.reset_state_slots(slots)
-                try:
-                    with set_forward_context(active_metadata, self.irwkv_config):
-                        _prepare_tuning(
-                            lambda: self.model(
-                                torch.zeros_like(input_ids)
-                                if input_ids is not None
-                                else None,
-                                tuning_intermediates,
-                                tuning_embeds,
-                            )
-                        )
-                finally:
-                    if saved_state is None:
-                        state.reset_state_slots(slots)
-                    else:
-                        assert state._tmix_shift_pool is not None
-                        assert state._cmix_shift_pool is not None
-                        assert state._wkv_state_pool is not None
-                        state._tmix_shift_pool.index_copy_(1, indices, saved_state[0])
-                        state._cmix_shift_pool.index_copy_(1, indices, saved_state[1])
-                        state._wkv_state_pool.index_copy_(1, indices, saved_state[2])
-                mode = "require"
-            if metadata.retain_ticket or shape not in self._prepared_tuning_shapes:
-                result = _prepare_tuning(
-                    lambda: self.model(input_ids, intermediate_tensors, inputs_embeds),
-                    mode=mode,
-                )
-                self._prepared_tuning_shapes.add(shape)
-                return result
         return self.model(input_ids, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

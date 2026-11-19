@@ -1,6 +1,6 @@
-<div align="center">
-  
 # infer-rwkv
+
+<div align="center">
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
@@ -53,9 +53,6 @@ safetensors weights, tokenizer, chat template, and generation configs. See the
 [checkpoint references](docs/models/rwkv.md#references-and-weights).
 
 The examples below use `/path/to/rwkv-checkpoint` as the checkpoint directory.
-On first startup, FlashRWKV2 prepares missing kernel tuning profiles and reuses
-its persistent cache on subsequent runs. See
-[kernel preparation](docs/models/rwkv.md#kernel-preparation) for details.
 
 ## Offline inference
 
@@ -74,14 +71,15 @@ for output in outputs:
 
 ## Serving
 
-Start an OpenAI-compatible server with BF16 activations and FP32 recurrent
-state:
+For ordinary serving, select FP16 WKV state with BF16 activations. For RL
+rollouts, evaluation and sampling-parameter search, pass
+`--mamba-ssm-cache-dtype float32` to match training recurrence.
 
 ```bash
 irwkv serve /path/to/rwkv-checkpoint \
   --served-model-name rwkv7 \
   --dtype bfloat16 \
-  --mamba-ssm-cache-dtype float32 \
+  --mamba-ssm-cache-dtype float16 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching
 ```
@@ -108,7 +106,7 @@ frontend. Explore the serving benchmark with `irwkv bench serve --help`.
 | Guide | Topics |
 | --- | --- |
 | [RWKV-7 model guide](docs/models/rwkv.md) | Artifact format, precision, and serving configuration |
-| [Kernel preparation](docs/models/rwkv.md#kernel-preparation) | Tuning profiles, persistent caches, and startup preparation |
+| [Kernel preparation](docs/models/rwkv.md#kernel-preparation) | Operator dispatch and graph warmup |
 | [Decoding defaults](docs/models/rwkv.md#decoding-defaults) | Generation profiles and sampling controls |
 | [Pipeline parallelism](docs/models/rwkv.md#pipeline-parallelism) | Two-GPU deployment |
 | [Tool calling](docs/models/rwkv.md#tool-calling) | Chat templates and the RWKV tool parser |
