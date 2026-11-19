@@ -19,7 +19,10 @@ from xgrammar.openai_tool_call_schema import (
 )
 from xgrammar.structural_tag import (
     AnyTextFormat,
+    ConstStringFormat,
     JSONSchemaFormat,
+    OptionalFormat,
+    OrFormat,
     SequenceFormat,
     TagFormat,
     TagsWithSeparatorFormat,
@@ -338,6 +341,7 @@ def get_function_parameters(function) -> dict[str, Any] | bool:
 
 
 _RWKV_TOOL_CALL_TRIGGER = "**Tool Call:**"
+_RWKV_TURN_STOPS = ("✿", "\nUser:", "\n### User")
 
 
 def _rwkv_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
@@ -379,12 +383,19 @@ def get_rwkv_structural_tag(
     else:
         output = SequenceFormat(
             elements=[
-                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER]),
+                AnyTextFormat(excludes=[_RWKV_TOOL_CALL_TRIGGER, *_RWKV_TURN_STOPS]),
                 TagsWithSeparatorFormat(
                     tags=tags,
                     separator="\n",
                     at_least_one=True,
                     stop_after_first=tool_choice == "forced",
+                ),
+                OptionalFormat(
+                    content=OrFormat(
+                        elements=[
+                            ConstStringFormat(value=stop) for stop in _RWKV_TURN_STOPS
+                        ]
+                    )
                 ),
             ]
         )
