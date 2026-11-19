@@ -95,6 +95,13 @@ continuation, so divergent suffixes do not modify each other. Only checkpoints
 actually saved by the scheduler can be reused; the match unit controls hashing
 granularity, not how often states are stored.
 
+State transfers stage CPU indices and block coordinates asynchronously. For
+layouts with zero provider-private bytes, copying snapshots one WKV layer at
+a time to preserve overlapping slot copies and bound temporary memory.
+Layouts with private bytes use the provider's handles for copy and reset so
+pending FP16 updates follow the destination slot. Sampler preemption stages
+its state in pinned host memory and restores it on the execution stream.
+
 Continuous batching, asynchronous scheduling, structured outputs, and the
 OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
 

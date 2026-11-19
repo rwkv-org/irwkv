@@ -594,6 +594,58 @@ def test_align_state_advance_resets_new_request_destination() -> None:
     assert np.array_equal(model_state._state_num_computed_tokens, np.array([32]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires FlashRWKV2 CUDA")
+def test_align_state_transfer_bounds_workspace_with_overlapping_slots() -> None:
+    slots, layers, heads, dim = 16, 8, 2, 64
+    device = torch.device("cuda")
+    config = _state_irwkv_config()
+    config.device_config.device = device
+    layer = RwkvStateLayer(config, layers, "model.layers.0.rwkv_state")
+    spec = layer.get_kv_cache_spec(config)
+    raw = torch.zeros((slots, spec.page_size_bytes), dtype=torch.uint8, device=device)
+    layer.bind_kv_cache(raw)
+    wkv_bytes = layers * slots * heads * dim**2 * torch.float32.itemsize
+    state = (
+        raw.flatten()[-wkv_bytes:]
+        .view(torch.float32)
+        .view(layers, slots, heads, dim, dim)
+    )
+    markers = torch.arange(1, slots + 1, dtype=torch.float32, device=device)
+    state.copy_(markers.view(1, slots, 1, 1, 1))
+
+    model_state = object.__new__(RwkvModelState)
+    model_state.device = device
+    model_state._align_mode = True
+    model_state._block_size = 16
+    model_state._state_block_columns = np.zeros(slots, dtype=np.int32)
+    model_state._state_num_computed_tokens = np.full(slots, 16, dtype=np.int64)
+    model_state._state_layer = layer
+    model_state._rwkv_group_id = 0
+    input_batch = SimpleNamespace(
+        num_reqs=slots,
+        idx_mapping_np=np.arange(slots),
+        num_scheduled_tokens=np.ones(slots, dtype=np.int32),
+    )
+    source = torch.arange(slots, dtype=torch.int32, device=device)
+    block_table = torch.stack((source, source.roll(-1)), dim=-1)
+
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+    prior_sync_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        model_state.preprocess_state(
+            input_batch,
+            (block_table,),
+            SimpleNamespace(kv_cache_groups=[]),
+            torch.empty(0),
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(prior_sync_mode)
+    assert torch.cuda.max_memory_allocated() - baseline < 2 * wkv_bytes // layers
+    assert torch.equal(state[:, :, 0, 0, 0], markers.roll(1).expand(layers, -1))
+
+
 def _block_hashed_request(request_id: str, token_ids: list[int]) -> Request:
     params = SamplingParams(max_tokens=64)
     params.update_from_generation_config({}, eos_token_id=0)
