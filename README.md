@@ -53,9 +53,6 @@ safetensors weights, tokenizer, chat template, and generation configs. See the
 [checkpoint references](docs/models/rwkv.md#references-and-weights).
 
 The examples below use `/path/to/rwkv-checkpoint` as the checkpoint directory.
-On first startup, FlashRWKV2 prepares missing kernel tuning profiles and reuses
-its persistent cache on subsequent runs. See
-[kernel preparation](docs/models/rwkv.md#kernel-preparation) for details.
 
 ## Offline inference
 
@@ -109,7 +106,7 @@ frontend. Explore the serving benchmark with `irwkv bench serve --help`.
 | Guide | Topics |
 | --- | --- |
 | [RWKV-7 model guide](docs/models/rwkv.md) | Artifact format, precision, and serving configuration |
-| [Kernel preparation](docs/models/rwkv.md#kernel-preparation) | Tuning profiles, persistent caches, and startup preparation |
+| [Kernel preparation](docs/models/rwkv.md#kernel-preparation) | Operator dispatch and graph warmup |
 | [Decoding defaults](docs/models/rwkv.md#decoding-defaults) | Generation profiles and sampling controls |
 | [Pipeline parallelism](docs/models/rwkv.md#pipeline-parallelism) | Two-GPU deployment |
 | [Tool calling](docs/models/rwkv.md#tool-calling) | Chat templates and the RWKV tool parser |

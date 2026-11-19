@@ -5,7 +5,6 @@ import asyncio
 import json
 import os
 import sys
-from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -72,9 +71,6 @@ class _FakeStateHandle:
     def reset_slots_(self, indices: torch.Tensor) -> None:
         self.state.index_fill_(0, indices.long(), 0)
 
-    def clone_slots(self, indices: torch.Tensor) -> "_FakeStateHandle":
-        return _FakeStateHandle(self.state.index_select(0, indices.long()))
-
     def copy_slots_(
         self,
         source: "_FakeStateHandle",
@@ -94,7 +90,6 @@ class _FakeStateHandle:
 def _fake_flashrwkv2() -> ModuleType:
     module: Any = ModuleType("flashrwkv2")
     module.__version__ = "0.2.0a1"
-    module.prepare_tuning = lambda calls, *, mode: [call() for call in calls]
 
     module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor = _FakeStateHandle
     module.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor = _FakeStateHandle
@@ -366,7 +361,6 @@ def test_live_metadata_reuses_tensors_per_graph_descriptor() -> None:
     assert first.max_seqlen == metadata.max_query_len
     assert runtime.max_seqlen == runtime_metadata.max_query_len
     assert runtime.validated_metadata is None
-    assert runtime.has_padding
 
     eager_query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
     eager_metadata = SimpleNamespace(
@@ -801,235 +795,6 @@ def test_head_preserves_provider_fp32_logits_and_trims_padding(monkeypatch) -> N
     assert result.dtype == torch.float32
     assert torch.equal(result, logits[:, :2])
     assert result[0, 1] > result[0, 0]
-
-
-@pytest.mark.parametrize("capturing", [False, True])
-def test_graph_warmup_checks_coverage_without_repeating_state_updates(
-    monkeypatch, capturing
-) -> None:
-    """Coverage executes the existing warmup once and stays outside capture."""
-    module: Any = _fake_flashrwkv2()
-    modes = []
-    updates = []
-    output = torch.ones(2, 4)
-
-    def prepare(calls, *, mode):
-        modes.append(mode)
-        for call in calls:
-            call()
-        return {"complete": True}
-
-    def forward(*args):
-        updates.append(args)
-        return output
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("IRWKV_RWKV_TUNING_MODE", "require")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.get_rwkv_metadata",
-        lambda: SimpleNamespace(retain_ticket=True),
-    )
-    result = RwkvForCausalLM.forward(
-        SimpleNamespace(model=forward), torch.tensor([1, 2]), torch.arange(2)
-    )
-    assert result is output
-    assert len(updates) == 1
-    assert modes == ([] if capturing else ["require"])
-
-
-def test_graph_warmup_propagates_missing_profile_diagnostic(monkeypatch) -> None:
-    module: Any = _fake_flashrwkv2()
-
-    def prepare(calls, *, mode):
-        assert mode == "require"
-        raise RuntimeError("missing verified tuning profile: tmix/wkv7")
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("IRWKV_RWKV_TUNING_MODE", "require")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.get_rwkv_metadata",
-        lambda: SimpleNamespace(retain_ticket=True),
-    )
-    with pytest.raises(
-        RuntimeError, match="missing verified tuning profile: tmix/wkv7"
-    ):
-        RwkvForCausalLM.forward(
-            SimpleNamespace(model=lambda *args: None),
-            torch.tensor([1]),
-            torch.tensor([0]),
-        )
-
-
-@pytest.mark.parametrize("fails", [False, True])
-def test_tuning_restores_startup_slots_after_active_preparation(monkeypatch, fails):
-    module: Any = _fake_flashrwkv2()
-    metadata = RwkvAttentionMetadata(
-        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
-        state_indices=torch.zeros(2, dtype=torch.int32),
-        batch_size=2,
-        max_seqlen=4,
-        token_capacity=4,
-        sequence_capacity=2,
-        max_seqlen_capacity=4,
-        num_active_tokens=torch.zeros(1, dtype=torch.int32),
-        num_active_sequences=torch.zeros(1, dtype=torch.int32),
-        retain_ticket=True,
-    )
-    pool = torch.zeros(2, dtype=torch.float32)
-    modes = []
-    context = metadata
-
-    @contextmanager
-    def forward_context(active, config):
-        nonlocal context
-        context = active
-        yield
-        context = metadata
-
-    def forward(*args):
-        if context is not metadata:
-            assert context.num_active_tokens.item() == 4
-            assert context.num_active_sequences.item() == 2
-            assert context.state_indices.tolist() == [0, 1]
-            assert context.cu_seqlens.tolist() == [0, 2, 4]
-            assert not context.retain_ticket
-            pool.index_fill_(0, context.state_indices.long(), 1)
-        return torch.ones(4, 2)
-
-    def prepare(calls, *, mode):
-        modes.append(mode)
-        for call in calls:
-            call()
-        if fails:
-            raise RuntimeError("verification failed")
-        return {"complete": True}
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.setenv("IRWKV_RWKV_TUNING_MODE", "tune")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.get_rwkv_metadata", lambda: metadata
-    )
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.set_forward_context", forward_context
-    )
-    state = SimpleNamespace(
-        reset_state_slots=lambda slots: pool.index_fill_(0, slots.long(), 0)
-    )
-    model = SimpleNamespace(
-        model=forward,
-        get_rwkv_state_layer=lambda: state,
-        irwkv_config=None,
-        _prepared_tuning_shapes=set(),
-    )
-    if fails:
-        with pytest.raises(RuntimeError, match="verification failed"):
-            RwkvForCausalLM.forward(model, torch.arange(4), torch.arange(4))
-    else:
-        assert RwkvForCausalLM.forward(
-            model, torch.arange(4), torch.arange(4)
-        ).shape == (4, 2)
-    assert modes == (["tune"] if fails else ["tune", "require"])
-    assert torch.equal(pool, torch.zeros_like(pool))
-    assert metadata.num_active_tokens.item() == 0
-    assert metadata.state_indices.tolist() == [0, 0]
-
-
-@pytest.mark.parametrize("live_metadata", [False, True])
-def test_first_eager_shape_tunes_without_changing_request_state(
-    monkeypatch, live_metadata
-):
-    module: Any = _fake_flashrwkv2()
-    request_offsets = [0, 4, 11, 11] if live_metadata else [0, 4, 11]
-    token_capacity = 12 if live_metadata else 11
-    sequence_capacity = len(request_offsets) - 1
-    metadata = RwkvAttentionMetadata(
-        cu_seqlens=torch.tensor(request_offsets, dtype=torch.int32),
-        state_indices=torch.arange(sequence_capacity, dtype=torch.int32),
-        batch_size=2,
-        max_seqlen=7,
-        token_capacity=token_capacity,
-        sequence_capacity=sequence_capacity,
-        max_seqlen_capacity=7,
-        num_active_tokens=(
-            torch.tensor([11], dtype=torch.int32) if live_metadata else None
-        ),
-        num_active_sequences=(
-            torch.tensor([2], dtype=torch.int32) if live_metadata else None
-        ),
-        has_padding=live_metadata,
-    )
-    pools = [torch.full((1, sequence_capacity, 1), 3.0) for _ in range(2)]
-    pools.append(torch.full((1, sequence_capacity, 1, 1, 1), 3.0))
-    calls = []
-    modes = []
-    context = metadata
-
-    @contextmanager
-    def forward_context(active, config):
-        nonlocal context
-        context = active
-        yield
-        context = metadata
-
-    def forward(input_ids, *args):
-        calls.append((input_ids.clone(), pools[0][0, 0, 0].item()))
-        tuning = context is not metadata
-        assert context.cu_seqlens.tolist() == (
-            [0, 4, 8, 12] if tuning and live_metadata else request_offsets
-        )
-        assert context.max_seqlen == 7
-        if live_metadata:
-            assert context.num_active_tokens.item() == (12 if tuning else 11)
-            assert context.num_active_sequences.item() == (3 if tuning else 2)
-        value = 9 if tuning else 5
-        for pool in pools:
-            pool.fill_(value)
-        return input_ids
-
-    def prepare(calls, *, mode):
-        modes.append(mode)
-        for call in calls:
-            call()
-        return {"complete": True}
-
-    module.prepare_tuning = prepare
-    monkeypatch.setitem(sys.modules, "flashrwkv2", module)
-    monkeypatch.delenv("IRWKV_RWKV_TUNING_MODE", raising=False)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.get_rwkv_metadata", lambda: metadata
-    )
-    monkeypatch.setattr(
-        "irwkv.model_executor.models.rwkv.set_forward_context", forward_context
-    )
-    state = SimpleNamespace(
-        _tmix_shift_pool=pools[0],
-        _cmix_shift_pool=pools[1],
-        _wkv_handles=[_FakeStateHandle(pools[2][0])],
-        reset_state_slots=lambda slots: [pool.zero_() for pool in pools],
-    )
-    model = SimpleNamespace(
-        model=forward,
-        get_rwkv_state_layer=lambda: state,
-        irwkv_config=None,
-        _prepared_tuning_shapes=set(),
-    )
-    positions = torch.arange(token_capacity)
-    input_ids = positions + 1
-    RwkvForCausalLM.forward(model, input_ids, positions)
-    RwkvForCausalLM.forward(model, input_ids, positions)
-
-    assert modes == ["tune", "require"]
-    assert [value for _, value in calls] == [0, 3, 5]
-    assert torch.equal(calls[0][0], torch.zeros_like(input_ids))
-    assert all(torch.equal(ids, input_ids) for ids, _ in calls[1:])
-    assert all(torch.equal(pool, torch.full_like(pool, 5)) for pool in pools)
 
 
 _LORA = {
@@ -1891,10 +1656,7 @@ async def test_real_model_lora_tenant_isolation(
     with RemoteOpenAIServer(
         model_path,
         args,
-        env_dict={
-            "IRWKV_ALLOW_RUNTIME_LORA_UPDATING": "1",
-            "IRWKV_RWKV_TUNING_MODE": "inspect",
-        },
+        env_dict={"IRWKV_ALLOW_RUNTIME_LORA_UPDATING": "1"},
         override_hf_configs=overrides,
         max_wait_seconds=300,
     ) as server:

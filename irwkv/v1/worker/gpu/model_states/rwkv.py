@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from irwkv.config import IrwkvConfig
-from irwkv.model_executor.models.rwkv import _load_flashrwkv2, _prepare_tuning
+from irwkv.model_executor.models.rwkv import _load_flashrwkv2
 from irwkv.sampling_params import SamplingParams
 from irwkv.v1.core.sched.output import NewRequestData
 from irwkv.v1.kv_cache_interface import KVCacheConfig
@@ -74,16 +74,11 @@ class _RwkvSamplingGraph:
                 num_active_samples=self.num_active,
             )
 
-        def forward() -> tuple[torch.Tensor, torch.Tensor]:
-            logits = compute_logits()
-            return logits, sample_logits(logits)
-
         capture_stream = torch.cuda.Stream(device=device)
         capture_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(capture_stream):
-            self.logits, self.sampled = _prepare_tuning(forward)
             for _ in range(2):
-                self.logits, self.sampled = forward()
+                sample_logits(compute_logits())
         torch.cuda.current_stream(device).wait_stream(capture_stream)
         # Two graphs leave a gap for the grammar bitmask between logits and
         # sampling, so structured output keeps the graphed path.
