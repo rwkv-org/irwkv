@@ -629,8 +629,8 @@ def test_align_state_transfer_bounds_workspace_with_overlapping_slots() -> None:
     source = torch.arange(slots, dtype=torch.int32, device=device)
     block_table = torch.stack((source, source.roll(-1)), dim=-1)
 
-    torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
+    baseline = torch.accelerator.memory_allocated()
     prior_sync_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -642,7 +642,7 @@ def test_align_state_transfer_bounds_workspace_with_overlapping_slots() -> None:
         )
     finally:
         torch.cuda.set_sync_debug_mode(prior_sync_mode)
-    assert torch.cuda.max_memory_allocated() - baseline < 2 * wkv_bytes // layers
+    assert torch.accelerator.max_memory_allocated() - baseline < 2 * wkv_bytes // layers
     assert torch.equal(state[:, :, 0, 0, 0], markers.roll(1).expand(layers, -1))
 
 
