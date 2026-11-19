@@ -24,7 +24,7 @@ use crate::parser::unified::{
     HfTemplateError, HfUnifiedParser, ResponseTemplate, UnifiedParserFactory, names,
 };
 use crate::parser::{ParserSelection, ToolStrictLevel};
-use crate::request::{ChatRequest, ChatTool};
+use crate::request::{ChatRequest, ChatTool, ChatToolChoice};
 use crate::{Error, Result as ChatResult};
 
 /// Default request-scoped output processor used by Hugging Face style chat
@@ -129,6 +129,16 @@ impl DefaultChatOutputProcessor {
         if parser.preserve_special_tokens() {
             request.decode_options.skip_special_tokens = false;
         }
+
+        let tool_strict_level = if tool_name == Some(crate::parser::tool::names::RWKV)
+            && matches!(request.tool_choice(), ChatToolChoice::Auto)
+            && !request.parallel_tool_calls()
+            && request.sampling_params.structured_outputs.is_none()
+        {
+            tool_strict_level.max(ToolStrictLevel::Function)
+        } else {
+            tool_strict_level
+        };
 
         Ok(Self {
             parser,
@@ -282,6 +292,7 @@ impl ChatOutputProcessor for DefaultChatOutputProcessor {
 mod tests {
     use std::sync::Arc;
 
+    use irwkv_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
     use irwkv_tokenizer::test_utils::TestTokenizer;
     use thiserror_ext::AsReport as _;
 
@@ -341,12 +352,16 @@ mod tests {
 
     #[test]
     fn rwkv_auto_grammar_uses_the_tool_call_trigger() {
-        for parallel in [false, true] {
+        for (parallel, strict, structured) in [
+            (false, None, false),
+            (false, None, true),
+            (true, Some(true), false),
+        ] {
             let tools = vec![ChatTool {
                 name: "lookup".to_string(),
                 description: None,
                 parameters: serde_json::json!({"type": "object"}),
-                strict: Some(true),
+                strict,
                 defer_loading: None,
             }];
             let mut request = ChatRequest {
@@ -359,6 +374,11 @@ mod tests {
                 .unwrap(),
                 ..ChatRequest::for_test()
             };
+            if structured {
+                request.sampling_params.structured_outputs = Some(StructuredOutputsParams::json(
+                    serde_json::json!({"type": "object"}),
+                ));
+            }
             let mut processor = DefaultChatOutputProcessor::new(
                 &mut request,
                 "other-model",
@@ -369,7 +389,12 @@ mod tests {
             )
             .unwrap();
             processor.initialize(&[]).unwrap();
-            let built = processor.build_output_grammar().unwrap().unwrap();
+            let built = processor.build_output_grammar().unwrap();
+            if structured {
+                assert!(built.is_none());
+                continue;
+            }
+            let built = built.unwrap();
             let tag =
                 serde_json::to_value(xgrammar_structural_tag::StructuralTag::new(built.format))
                     .unwrap();
@@ -377,6 +402,10 @@ mod tests {
             assert_eq!(
                 tag["format"]["triggers"],
                 serde_json::json!(["**Tool Call:**"])
+            );
+            assert_eq!(
+                tag["format"]["stop_after_first"].as_bool().unwrap_or(false),
+                !parallel
             );
         }
     }

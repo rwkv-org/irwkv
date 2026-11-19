@@ -218,6 +218,7 @@ pub trait ToolParser: Send {
 }
 
 const RWKV_TOOL_MARKER: &str = "**Tool Call:**";
+const RWKV_TURN_STOPS: &[&str] = &["✿", "\nUser:", "\n### User"];
 
 struct RwkvStructuralTagBuilder;
 
@@ -226,7 +227,9 @@ impl StructuralTagBuilder for RwkvStructuralTagBuilder {
         &self,
         ctx: xgrammar_structural_tag::builders::StructuralTagContext<'_>,
     ) -> xgrammar_structural_tag::Result<xgrammar_structural_tag::format::StructuralTag> {
-        use xgrammar_structural_tag::format::{JsonSchemaFormat, StructuralTag, TagFormat};
+        use xgrammar_structural_tag::format::{
+            JsonSchemaFormat, StructuralTag, TagFormat, TriggeredTagsFormat,
+        };
         use xgrammar_structural_tag::tool::{BuilderToolChoice, function_parameters};
 
         let tags = ctx
@@ -245,11 +248,26 @@ impl StructuralTagBuilder for RwkvStructuralTagBuilder {
             .collect::<Vec<_>>();
         let format = match ctx.tool_choice {
             BuilderToolChoice::Auto if tags.is_empty() => Format::any_text(),
-            BuilderToolChoice::Auto => Format::triggered_tags(&[RWKV_TOOL_MARKER], tags),
-            choice => Format::sequence(vec![
-                Format::any_text_excluding(&[RWKV_TOOL_MARKER]),
-                Format::tags_with_separator(tags, "\n", true, choice == BuilderToolChoice::Forced),
-            ]),
+            BuilderToolChoice::Auto => Format::TriggeredTags(
+                TriggeredTagsFormat::new(&[RWKV_TOOL_MARKER], tags)
+                    .with_stop_after_first(!ctx.options.parallel_tool_calls),
+            ),
+            choice => {
+                let mut excluded = vec![RWKV_TOOL_MARKER];
+                excluded.extend_from_slice(RWKV_TURN_STOPS);
+                Format::sequence(vec![
+                    Format::any_text_excluding(&excluded),
+                    Format::tags_with_separator(
+                        tags,
+                        "\n",
+                        true,
+                        choice == BuilderToolChoice::Forced || !ctx.options.parallel_tool_calls,
+                    ),
+                    Format::optional(Format::or(
+                        RWKV_TURN_STOPS.iter().copied().map(Format::const_string).collect(),
+                    )),
+                ])
+            }
         };
         Ok(StructuralTag::new(format))
     }
