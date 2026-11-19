@@ -48,6 +48,8 @@ class RwkvToolParser(ToolParser):
     ) -> None:
         super().__init__(tokenizer, tools)
         self._buffer = ""
+        self._tool_prefix: str | None = None
+        self._payload_parts: list[str] = []
         self._saw_tool_marker = False
         self._tool_parsing_blocked = False
         self._finished = False
@@ -169,9 +171,19 @@ class RwkvToolParser(ToolParser):
 
     def _block_further_tool_calls(self, content_parts: list[str]) -> None:
         self._tool_parsing_blocked = True
-        if not self.prev_tool_call_arr and self._buffer:
-            content_parts.append(self._buffer)
+        if content := self._flush_pending_tool_text():
+            content_parts.append(content)
+
+    def _flush_pending_tool_text(self) -> str:
+        content = ""
+        if not self.prev_tool_call_arr:
+            content = "".join(
+                (self._tool_prefix or "", *self._payload_parts, self._buffer)
+            )
+        self._tool_prefix = None
+        self._payload_parts.clear()
         self._buffer = ""
+        return content
 
     def extract_tool_calls_streaming(
         self,
@@ -200,44 +212,53 @@ class RwkvToolParser(ToolParser):
         tool_deltas: list[DeltaToolCall] = []
 
         while self._buffer:
-            marker_start = self._buffer.find(_TOOL_CALL_MARKER)
-            if marker_start == -1:
-                sendable_end = len(self._buffer) - partial_tag_overlap(
-                    self._buffer,
-                    _TOOL_CALL_MARKER,
-                )
-                if sendable_end > 0:
-                    if not self._saw_tool_marker:
-                        content_parts.append(self._buffer[:sendable_end])
-                    self._buffer = self._buffer[sendable_end:]
-                break
-
-            if marker_start > 0:
-                if not self._saw_tool_marker:
-                    content_parts.append(self._buffer[:marker_start])
-                self._buffer = self._buffer[marker_start:]
-
-            self._saw_tool_marker = True
-            rest = self._buffer[len(_TOOL_CALL_MARKER) :]
-            stripped = rest.lstrip()
-            if not stripped:
-                break
-            if not stripped.startswith(_JSON_FENCE_START):
-                if _JSON_FENCE_START.startswith(stripped):
+            if self._tool_prefix is None:
+                marker_start = self._buffer.find(_TOOL_CALL_MARKER)
+                if marker_start == -1:
+                    sendable_end = len(self._buffer) - partial_tag_overlap(
+                        self._buffer,
+                        _TOOL_CALL_MARKER,
+                    )
+                    if sendable_end > 0:
+                        if not self._saw_tool_marker:
+                            content_parts.append(self._buffer[:sendable_end])
+                        self._buffer = self._buffer[sendable_end:]
                     break
-                self._block_further_tool_calls(content_parts)
-                break
 
-            fence_offset = len(rest) - len(stripped)
-            payload_start = (
-                len(_TOOL_CALL_MARKER) + fence_offset + len(_JSON_FENCE_START)
-            )
-            fence_end = self._buffer.find(_JSON_FENCE_END, payload_start)
+                if marker_start > 0:
+                    if not self._saw_tool_marker:
+                        content_parts.append(self._buffer[:marker_start])
+                    self._buffer = self._buffer[marker_start:]
+
+                self._saw_tool_marker = True
+                rest = self._buffer[len(_TOOL_CALL_MARKER) :]
+                stripped = rest.lstrip()
+                if not stripped:
+                    break
+                if not stripped.startswith(_JSON_FENCE_START):
+                    if _JSON_FENCE_START.startswith(stripped):
+                        break
+                    self._block_further_tool_calls(content_parts)
+                    break
+
+                payload_start = (
+                    len(self._buffer) - len(stripped) + len(_JSON_FENCE_START)
+                )
+                self._tool_prefix = self._buffer[:payload_start]
+                self._buffer = self._buffer[payload_start:]
+
+            fence_end = self._buffer.find(_JSON_FENCE_END)
             if fence_end == -1:
+                payload_end = len(self._buffer) - partial_tag_overlap(
+                    self._buffer, _JSON_FENCE_END
+                )
+                if payload_end:
+                    self._payload_parts.append(self._buffer[:payload_end])
+                    self._buffer = self._buffer[payload_end:]
                 break
 
             payload = self._parse_payload(
-                self._buffer[payload_start:fence_end].strip(),
+                "".join((*self._payload_parts, self._buffer[:fence_end])).strip(),
                 request,
             )
             if payload is None:
@@ -261,6 +282,8 @@ class RwkvToolParser(ToolParser):
                     ),
                 )
             )
+            self._tool_prefix = None
+            self._payload_parts.clear()
             self._buffer = self._buffer[fence_end + len(_JSON_FENCE_END) :]
             if request.parallel_tool_calls is False:
                 self._tool_parsing_blocked = True
@@ -276,9 +299,6 @@ class RwkvToolParser(ToolParser):
         if self._finished:
             return None
         self._finished = True
-        if not self.prev_tool_call_arr and self._buffer:
-            content = self._buffer
-            self._buffer = ""
+        if content := self._flush_pending_tool_text():
             return DeltaMessage(content=content)
-        self._buffer = ""
         return None
