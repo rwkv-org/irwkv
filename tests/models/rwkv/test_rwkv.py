@@ -1288,24 +1288,43 @@ def test_sampling_params_verify_rejects_unsupported_rwkv_controls() -> None:
             raise AssertionError(f"{message} must be rejected")
 
 
-def test_rapid_sampler_preserves_preempted_request_state() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_rapid_sampler_preserves_preempted_request_state(device) -> None:
     sampler = object.__new__(RwkvSampler)
     sampler.req_states = SimpleNamespace(req_id_to_index={"request": 1})
-    sampler._rapid_sampling_states = torch.arange(8, dtype=torch.int8).view(2, 4)
-    sampler._rapid_penalties = torch.arange(12, dtype=torch.float32).view(2, 6)
+    sampler._rapid_sampling_states = torch.arange(
+        8, dtype=torch.int8, device=device
+    ).view(2, 4)
+    sampler._rapid_penalties = torch.arange(
+        12, dtype=torch.float32, device=device
+    ).view(2, 6)
     sampler._preserved_requests = {}
     sampler._new_requests = []
 
-    sampler.preempt_request("request")
-    state, penalties = sampler._preserved_requests["request"]
-    sampler._rapid_sampling_states[1].zero_()
-    sampler._rapid_penalties[1].zero_()
-
-    assert torch.equal(state, torch.tensor([4, 5, 6, 7], dtype=torch.int8))
-    assert torch.equal(
-        penalties,
-        torch.tensor([6, 7, 8, 9, 10, 11], dtype=torch.float32),
-    )
+    if device == "cuda":
+        prior_sync_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        sampler.preempt_request("request")
+        state, penalties = sampler._preserved_requests["request"]
+        sampler._rapid_sampling_states[1].zero_()
+        sampler._rapid_penalties[1].zero_()
+    finally:
+        if device == "cuda":
+            torch.cuda.set_sync_debug_mode(prior_sync_mode)
+    if device == "cuda":
+        assert state.is_pinned() and penalties.is_pinned()
     sampler.remove_request("request")
     assert "request" in sampler._preserved_requests
 
@@ -1358,9 +1377,20 @@ def test_rapid_sampler_preserves_preempted_request_state() -> None:
         "_penalty_decay",
     ):
         setattr(sampler, name, writes)
-    sampler.apply_staged_writes()
-    assert torch.equal(sampler._rapid_sampling_states[0], state)
-    assert torch.equal(sampler._rapid_penalties[0], penalties)
+    if device == "cuda":
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        sampler.apply_staged_writes()
+    finally:
+        if device == "cuda":
+            torch.cuda.set_sync_debug_mode(prior_sync_mode)
+    restored_state = sampler._rapid_sampling_states[0].cpu()
+    restored_penalties = sampler._rapid_penalties[0].cpu()
+    assert torch.equal(restored_state, torch.tensor([4, 5, 6, 7], dtype=torch.int8))
+    assert torch.equal(
+        restored_penalties,
+        torch.tensor([6, 7, 8, 9, 10, 11], dtype=torch.float32),
+    )
     assert not sampler._rapid_sampling_states[1].any()
     assert not sampler._rapid_penalties[1].any()
 

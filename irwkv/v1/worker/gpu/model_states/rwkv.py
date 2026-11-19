@@ -514,6 +514,12 @@ class RwkvModelState(DefaultModelState):
             self._rwkv_group_id = group_ids[0]
         return self._rwkv_group_id
 
+    def _stage_state_coordinates(self, *coords: np.ndarray) -> torch.Tensor:
+        coordinates = np.stack(coords)
+        if self.device.type == "cpu":
+            return torch.as_tensor(coordinates, dtype=torch.int64)
+        return async_tensor_h2d(coordinates, dtype=torch.int64, device=self.device)
+
     def preprocess_state(
         self,
         input_batch: InputBatch,
@@ -533,10 +539,8 @@ class RwkvModelState(DefaultModelState):
         block_table = block_tables[self._get_rwkv_group_id(kv_cache_config)]
         reset_rows_np = np.flatnonzero(old_columns < 0)
         if reset_rows_np.size:
-            reset_coords = async_tensor_h2d(
-                np.stack((reset_rows_np, new_columns[reset_rows_np])),
-                dtype=torch.int64,
-                device=self.device,
+            reset_coords = self._stage_state_coordinates(
+                reset_rows_np, new_columns[reset_rows_np]
             )
             reset_indices = block_table[reset_coords[0], reset_coords[1]].contiguous()
             self._state_layer.reset_state_slots(reset_indices)
@@ -544,16 +548,10 @@ class RwkvModelState(DefaultModelState):
             (old_columns >= 0) & (old_columns != new_columns)
         )
         if row_indices_np.size:
-            copy_coords = async_tensor_h2d(
-                np.stack(
-                    (
-                        row_indices_np,
-                        old_columns[row_indices_np],
-                        new_columns[row_indices_np],
-                    )
-                ),
-                dtype=torch.int64,
-                device=self.device,
+            copy_coords = self._stage_state_coordinates(
+                row_indices_np,
+                old_columns[row_indices_np],
+                new_columns[row_indices_np],
             )
             rows = copy_coords[0]
             source_indices = block_table[rows, copy_coords[1]].contiguous()

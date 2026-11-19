@@ -331,6 +331,10 @@ class RwkvStateLayer(nn.Module, AttentionLayerBase):
         if self._tmix_shift_pool is None:
             raise RuntimeError("RWKV state pool has not been bound")
         device = self._tmix_shift_pool.device
+        if device.type == "cpu":
+            return torch.as_tensor(
+                slot_ids, dtype=torch.int32, device=device
+            ).contiguous()
         if isinstance(slot_ids, torch.Tensor) and not slot_ids.is_cpu:
             return slot_ids.to(
                 device=device, dtype=torch.int32, non_blocking=True
