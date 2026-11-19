@@ -110,7 +110,9 @@ provider. irwkv warms up the model and the head/sampling operations before
 CUDA Graph capture. During generation it passes the active token and sequence
 counts to the recurrent operators so that padding leaves request state intact.
 Remove `IRWKV_RWKV_TUNING_MODE` and the standalone online tuning preflight from
-existing deployments. `FLASHRWKV2_CACHE_DIR` still selects the native build cache.
+existing deployments. Launches using `--fail-on-environ-validation` reject the
+retired environment variable. `FLASHRWKV2_CACHE_DIR` still selects the native
+build cache.
 
 ## Decoding defaults
 
