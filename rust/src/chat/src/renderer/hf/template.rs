@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::error::Error as _;
+use std::ffi::OsStr;
 use std::fs;
 use std::iter;
 use std::path::Path;
@@ -29,10 +30,20 @@ use crate::renderer::hf::{TemplateMessage, TemplateTool};
 
 type Result<T> = std::result::Result<T, TemplateError>;
 
-/// Default fuel budget for template rendering. Prevents unbounded loops and
-/// string operations from exhausting CPU. Each template instruction consumes
-/// one unit of fuel; when depleted, rendering aborts with an error.
+/// Default fuel budget for rendering request-supplied templates.
 const DEFAULT_TEMPLATE_FUEL: u64 = 500_000;
+
+/// Fuel budget for request-supplied templates. A value of zero removes the limit.
+pub(super) fn request_template_fuel(value: Option<&OsStr>) -> Result<Option<u64>> {
+    let fuel = match value {
+        None => DEFAULT_TEMPLATE_FUEL,
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| TemplateError::InvalidFuel(value.to_owned()))?,
+    };
+    Ok((fuel > 0).then_some(fuel))
+}
 
 /// Build a pre-configured environment with the given template string.
 fn build_environment(template: String) -> Result<Environment<'static>> {
@@ -40,8 +51,6 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
 
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
-
-    env.set_fuel(Some(DEFAULT_TEMPLATE_FUEL));
 
     env.add_template_owned("chat".to_owned(), template)?;
 
@@ -166,11 +175,20 @@ impl CompiledChatTemplate {
         })
     }
 
+    /// Limit the instructions available to each render.
+    pub fn with_fuel(mut self, fuel: Option<u64>) -> Self {
+        self.env.set_fuel(fuel);
+        self
+    }
+
     /// Apply the compiled template to the given context and return the rendered
     /// prompt.
     pub fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
-        tmpl.render(ctx).map_err(TemplateError::from)
+        tmpl.render(ctx).map_err(|error| match error.kind() {
+            ErrorKind::OutOfFuel => TemplateError::OutOfFuel(error),
+            _ => TemplateError::Jinja(error),
+        })
     }
 
     pub fn content_format(&self) -> ChatTemplateContentFormat {

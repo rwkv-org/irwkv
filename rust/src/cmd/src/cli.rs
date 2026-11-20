@@ -148,6 +148,9 @@ pub struct RenderArgs {
     /// Default JSON keyword arguments merged into every chat-template render.
     #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
     default_chat_template_kwargs: Option<HashMap<String, Value>>,
+    /// Allow requests to override the HF chat template.
+    #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+    trust_request_chat_template: bool,
     /// How message content is exposed to the chat template.
     #[arg(long, default_value_t)]
     chat_template_content_format: ChatTemplateContentFormatOption,
@@ -180,6 +183,7 @@ impl RenderArgs {
             renderer: self.renderer,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs.unwrap_or_default(),
+            trust_request_chat_template: self.trust_request_chat_template,
             chat_template_content_format: self.chat_template_content_format,
             max_model_len: self.max_model_len,
             max_logprobs: self.max_logprobs,
@@ -305,6 +309,11 @@ pub struct SharedRuntimeArgs {
     #[arg(long, value_parser = parse_json::<HashMap<String, Value>>, value_name = "JSON")]
     #[serde(default)]
     pub default_chat_template_kwargs: Option<HashMap<String, Value>>,
+
+    /// Allow requests to override the HF chat template.
+    #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+    #[serde(default)]
+    pub trust_request_chat_template: bool,
 
     /// The maximum number of input items allowed per prompt for each
     /// modality, as a JSON object (e.g. `{"image": 16, "video": 2}`).
@@ -546,6 +555,7 @@ impl SharedRuntimeArgs {
             language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
+            trust_request_chat_template: self.trust_request_chat_template,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
@@ -608,6 +618,7 @@ impl SharedRuntimeArgs {
             language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
+            trust_request_chat_template: self.trust_request_chat_template,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,

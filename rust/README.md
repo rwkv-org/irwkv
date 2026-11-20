@@ -118,6 +118,12 @@ It exposes `/v1/chat/completions/render` and `/v1/completions/render`. Only
 tokenizer and model configuration files are loaded; model weights, PyTorch,
 and irwkv kernels are not required.
 
+For the Hugging Face renderer, Rust `serve` and `render` accept a request's
+`chat_template` only when started with `--trust-request-chat-template`.
+`IRWKV_CHAT_TEMPLATE_FUEL` sets the MiniJinja instruction budget for those
+overrides (default 500,000, or 0 for unlimited). The server's model or
+`--chat-template` template has no instruction budget.
+
 To serve HTTPS, pass `--ssl-certfile`. If the certificate and private key are
 in separate files, pass `--ssl-keyfile` for the key; otherwise the key is read from
 the certificate file. For mTLS, pass `--ssl-ca-certs` with a CA
