@@ -17,6 +17,8 @@ pub enum Error {
     MissingChatTemplate,
     #[error("chat template error: {0}")]
     ChatTemplate(String),
+    #[error("chat template error: {0}")]
+    InvalidRequestChatTemplate(String),
     #[error("{message}")]
     ChatTemplateThrown { message: String },
     #[error("{0}")]
@@ -25,6 +27,11 @@ pub enum Error {
     InvalidReasoningControl { message: String },
     #[error("chat role `{role}` is not supported by this chat renderer")]
     UnsupportedChatRole { role: String },
+    #[error(
+        "Chat template is passed with request, but --trust-request-chat-template is not set. \
+         Refused request with untrusted chat template."
+    )]
+    UntrustedRequestChatTemplate,
     #[error("multimodal input is not supported by this chat renderer")]
     UnsupportedMultimodalRenderer,
     #[error("unsupported multimodal content: {0}")]
@@ -103,12 +110,14 @@ impl Error {
         match self {
             Self::PromptTooLong { .. }
             | Self::ChatTemplateThrown { .. }
+            | Self::InvalidRequestChatTemplate(_)
             | Self::InvalidReasoningEffort(_)
             | Self::InvalidReasoningControl { .. }
             | Self::DuplicateToolName { .. }
             | Self::ToolChoiceRequiresTools
             | Self::ToolChoiceFunctionNotFound { .. }
-            | Self::UnsupportedChatRole { .. } => true,
+            | Self::UnsupportedChatRole { .. }
+            | Self::UntrustedRequestChatTemplate => true,
             Self::Text(error) => error.is_request_validation_error(),
             Self::UnsupportedMultimodalRenderer
             | Self::UnsupportedMultimodalContent(_)

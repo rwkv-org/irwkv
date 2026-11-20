@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     CUDA_VISIBLE_DEVICES: str | None = None
     IRWKV_ENGINE_READY_TIMEOUT_S: int = 600
     IRWKV_CHAT_TEMPLATE_RENDER_TIMEOUT: float = 30.0
+    IRWKV_CHAT_TEMPLATE_FUEL: str = "500000"
     IRWKV_API_KEY: str | None = None
     IRWKV_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
@@ -730,6 +731,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "IRWKV_CHAT_TEMPLATE_RENDER_TIMEOUT": lambda: float(
         os.environ.get("IRWKV_CHAT_TEMPLATE_RENDER_TIMEOUT", "30")
     ),
+    # The Rust frontend validates its MiniJinja fuel setting.
+    "IRWKV_CHAT_TEMPLATE_FUEL": lambda: os.getenv("IRWKV_CHAT_TEMPLATE_FUEL", "500000"),
     # API key for irwkv API server
     "IRWKV_API_KEY": lambda: os.environ.get("IRWKV_API_KEY", None),
     # Whether to log responses from API Server for debugging
@@ -1982,6 +1985,7 @@ def compile_factors() -> dict[str, object]:
         "IRWKV_RANDOMIZE_DP_DUMMY_INPUTS",
         "IRWKV_MODEL_REDIRECT_PATH",
         "IRWKV_HOST_IP",
+        "IRWKV_CHAT_TEMPLATE_FUEL",
         "IRWKV_FORCE_AOT_LOAD",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
