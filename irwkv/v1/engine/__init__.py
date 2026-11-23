@@ -13,6 +13,7 @@ import torch
 from irwkv.config.kv_events import KVEventsConfig
 from irwkv.lora.request import LoRARequest
 from irwkv.multimodal.inputs import MultiModalFeatureSpec
+from irwkv.outputs import RequestError
 from irwkv.sampling_params import SamplingParams
 from irwkv.v1.kv_hints import KvHintsEnvelope
 from irwkv.v1.metrics.stats import (
@@ -214,7 +215,7 @@ class EngineCoreOutput(
 
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
-    validation_error: str | None = None
+    error: RequestError | None = None
 
     @property
     def finished(self) -> bool:

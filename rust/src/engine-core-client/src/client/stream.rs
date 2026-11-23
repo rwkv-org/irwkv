@@ -174,9 +174,11 @@ impl Stream for EngineCoreOutputStream {
                         let output = delivery.last();
                         if output.finished() {
                             self.state = State::Finished;
-                            if let Some(message) = output.validation_error.as_deref() {
+                            if let Some(error) =
+                                output.error.as_deref().filter(|error| error.is_validation_error())
+                            {
                                 return Poll::Ready(Some(Err(Error::RequestValidation {
-                                    message: message.to_string(),
+                                    message: error.message.clone(),
                                 })));
                             }
                             if output.finish_reason == Some(EngineCoreFinishReason::Error) {

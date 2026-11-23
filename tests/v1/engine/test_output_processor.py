@@ -13,6 +13,7 @@ from irwkv.exceptions import IRWKVValidationError
 from irwkv.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from irwkv.outputs import (
     CompletionOutput,
+    RequestError,
     RequestOutput,
     SamplingMask,
 )
@@ -1207,7 +1208,7 @@ def test_validation_error_reaches_request_consumer():
                 "grammar",
                 [],
                 finish_reason=FinishReason.ERROR,
-                validation_error="bad grammar",
+                error=RequestError(code="validation_error", message="bad grammar"),
             )
         ]
     )

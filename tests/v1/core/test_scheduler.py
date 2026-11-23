@@ -19,6 +19,7 @@ from irwkv.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from irwkv.outputs import RequestError
 from irwkv.sampling_params import SamplingParams, StructuredOutputsParams
 from irwkv.utils.hashing import sha256
 from irwkv.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -2086,12 +2087,12 @@ def test_grammar_compile_error_finishes_only_request(
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason is None
     if isinstance(error, IRWKVValidationError):
-        assert (
-            output.validation_error
-            == "Invalid structured outputs: invalid grammar syntax"
+        assert output.error == RequestError(
+            code="validation_error",
+            message="Invalid structured outputs: invalid grammar syntax",
         )
     else:
-        assert output.validation_error is None
+        assert output.error is None
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)

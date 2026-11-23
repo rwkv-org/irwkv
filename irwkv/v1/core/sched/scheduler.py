@@ -30,6 +30,7 @@ from irwkv.logger import init_logger
 from irwkv.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from irwkv.multimodal.encoder_budget import MultiModalBudget
 from irwkv.multimodal.utils import get_mm_features_in_window
+from irwkv.outputs import RequestError
 from irwkv.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
 )
@@ -1925,7 +1926,15 @@ class Scheduler(SchedulerInterface):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
-                        validation_error=grammar_errors.get(request.request_id),
+                        error=(
+                            RequestError(
+                                code="validation_error",
+                                message=message,
+                            )
+                            if (message := grammar_errors.get(request.request_id))
+                            is not None
+                            else None
+                        ),
                     )
                 )
 

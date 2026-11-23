@@ -33,6 +33,7 @@ from irwkv.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
 )
+from irwkv.outputs import RequestError
 from irwkv.tasks import SupportedTask
 from irwkv.tracing import instrument, maybe_init_worker_tracer
 from irwkv.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -1711,7 +1712,9 @@ class EngineCoreProc(EngineCore):
                                 [req.request_id],
                                 req.client_index,
                                 FinishReason.ERROR,
-                                validation_error=str(error),
+                                error=RequestError(
+                                    code="validation_error", message=str(error)
+                                ),
                             )
                             continue
                         except Exception:
@@ -1917,14 +1920,14 @@ class EngineCoreProc(EngineCore):
         client_index: int,
         finish_reason: FinishReason,
         *,
-        validation_error: str | None = None,
+        error: RequestError | None = None,
     ) -> None:
         outputs = [
             EngineCoreOutput(
                 req_id,
                 [],
                 finish_reason=finish_reason,
-                validation_error=validation_error,
+                error=error,
             )
             for req_id in req_ids
         ]
