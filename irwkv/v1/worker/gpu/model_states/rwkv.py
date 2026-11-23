@@ -3,7 +3,7 @@
 """MRV2 request state for RWKV recurrent-state lifecycle management."""
 
 import copy
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -81,8 +81,7 @@ class _RwkvSamplingGraph:
             for _ in range(2):
                 sample_logits(compute_logits())
         torch.cuda.current_stream(device).wait_stream(capture_stream)
-        # Two graphs leave a gap for the grammar bitmask between logits and
-        # sampling, so structured output keeps the graphed path.
+        # Separate graphs let grammar and min-p mask logits before sampling.
         self.logits_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.logits_graph, stream=capture_stream):
             self.logits = compute_logits()
@@ -91,12 +90,6 @@ class _RwkvSamplingGraph:
             self.sample_graph, pool=self.logits_graph.pool(), stream=capture_stream
         ):
             self.sampled = sample_logits(self.logits)
-
-    def replay(self, apply_grammar_bitmask: Callable[[torch.Tensor], None] | None):
-        self.logits_graph.replay()
-        if apply_grammar_bitmask is not None:
-            apply_grammar_bitmask(self.logits)
-        self.sample_graph.replay()
 
 
 class RwkvSampler(Sampler):
@@ -242,7 +235,16 @@ class RwkvSampler(Sampler):
             self.sampling_states.top_p.gpu[active_slots_i64]
         )
         sampling_graph.num_active.fill_(num_active)
-        sampling_graph.replay(apply_grammar_bitmask)
+        sampling_graph.logits_graph.replay()
+        if apply_grammar_bitmask is not None:
+            apply_grammar_bitmask(sampling_graph.logits)
+        if np.any(self.sampling_states.min_p.np[active_slots_np]):
+            self._apply_min_p(
+                sampling_graph.logits[:num_active],
+                active_slots_i64,
+                sampling_graph.temperature[:num_active],
+            )
+        sampling_graph.sample_graph.replay()
 
         sampled = torch.zeros(num_reqs, dtype=torch.int64, device=hidden_states.device)
         sampled[active_rows] = sampling_graph.sampled[:num_active].to(torch.int64)
@@ -361,6 +363,23 @@ class RwkvSampler(Sampler):
         self.thinking_budget_state.apply(logits, ctx)
         return logits
 
+    def _apply_min_p(
+        self,
+        logits: torch.Tensor,
+        slots: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        # Compute the cutoff in unscaled logit space using Rapid-Sampling's
+        # current penalties and effective temperature. The provider still
+        # applies both controls and updates the persistent state.
+        logits.nan_to_num_(nan=0.0, posinf=torch.inf, neginf=-torch.inf)
+        scores = self._rapid_penalties.index_select(0, slots)
+        torch.sub(logits, scores, out=scores)
+        min_p = self.sampling_states.min_p.gpu[slots]
+        cutoff = temperature.clamp(0.001, 1000.0) * min_p.log()
+        threshold = scores.amax(dim=-1) + cutoff
+        logits.masked_fill_(scores < threshold[:, None], -torch.inf)
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -407,6 +426,11 @@ class RwkvSampler(Sampler):
             expanded_local_pos[active_rows],
             seq_lens_upper_bound_np[active_rows_np],
         )
+        temperature = self.sampling_states.temperature.gpu[active_slots_i64]
+        if np.any(self.sampling_states.min_p.np[active_slots_np]):
+            if active_logits is logits:
+                active_logits = active_logits.clone()
+            self._apply_min_p(active_logits, active_slots_i64, temperature)
         sampled_active = self._sample(
             active_logits,
             self._rapid_penalties,
@@ -415,7 +439,7 @@ class RwkvSampler(Sampler):
             presence_penalty=self._presence_penalty.gpu[active_slots_i64],
             frequency_penalty=self._frequency_penalty.gpu[active_slots_i64],
             penalty_decay=self._penalty_decay.gpu[active_slots_i64],
-            temperature=self.sampling_states.temperature.gpu[active_slots_i64],
+            temperature=temperature,
             top_k=self.sampling_states.top_k.gpu[active_slots_i64],
             top_p=self.sampling_states.top_p.gpu[active_slots_i64],
         )
