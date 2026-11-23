@@ -1271,7 +1271,6 @@ def test_config_rejects_unsupported_rapid_sampling_modes() -> None:
 def test_sampling_params_verify_rejects_unsupported_rwkv_controls() -> None:
     for model_type, sampling_params, message in (
         ("rwkv", SamplingParams(repetition_penalty=1.1), "repetition_penalty"),
-        ("rwkv", SamplingParams(min_p=0.1), "min_p"),
         ("qwen2", SamplingParams(penalty_decay=0.9), "penalty_decay"),
     ):
         model_config = SimpleNamespace(
@@ -1446,6 +1445,7 @@ def _graph_sampler(monkeypatch, calls: list[str]) -> tuple[RwkvSampler, Any]:
     sampler._frequency_penalty = SimpleNamespace(gpu=torch.arange(4).float() + 4)
     sampler._penalty_decay = SimpleNamespace(gpu=torch.arange(4).float() + 8)
     sampler.sampling_states = SimpleNamespace(
+        min_p=SimpleNamespace(np=np.zeros(4)),
         temperature=SimpleNamespace(gpu=torch.arange(4).float() + 12),
         top_k=SimpleNamespace(gpu=torch.arange(4, dtype=torch.int32) + 16),
         top_p=SimpleNamespace(gpu=torch.arange(4).float() + 20),
@@ -1577,7 +1577,10 @@ def test_rapid_sampler_processing_preserves_raw_logits(mixed_prefill) -> None:
     sampler._presence_penalty = sampler._frequency_penalty = values
     sampler._penalty_decay = values
     sampler.sampling_states = SimpleNamespace(
-        temperature=values, top_k=values, top_p=values
+        temperature=values,
+        top_k=values,
+        top_p=values,
+        min_p=SimpleNamespace(np=np.zeros(2)),
     )
     sampler.needs_logits_processing = np.ones(2, dtype=bool)
     sampler._logit_bias_state = SimpleNamespace(
@@ -1616,6 +1619,58 @@ def test_config_accepts_async_scheduling() -> None:
     irwkv_config.scheduler_config.async_scheduling = True
     RwkvForCausalLMConfig.verify_and_update_config(irwkv_config)
     assert irwkv_config.scheduler_config.async_scheduling
+
+
+@pytest.mark.skipif(
+    not os.environ.get("IRWKV_RWKV_TEST_MODEL"),
+    reason="IRWKV_RWKV_TEST_MODEL must point to a local RWKV checkpoint",
+)
+def test_real_model_completions_with_min_p() -> None:
+    import httpx
+
+    from tests.utils import RemoteOpenAIServer
+
+    args = [
+        "--served-model-name",
+        "rwkv",
+        "--max-model-len",
+        "4096",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.6",
+        "--compilation-config",
+        '{"cudagraph_capture_sizes":[1,2,4]}',
+    ]
+    with (
+        RemoteOpenAIServer(
+            os.environ["IRWKV_RWKV_TEST_MODEL"], args, max_wait_seconds=300
+        ) as server,
+        httpx.Client(base_url=server.url_root, timeout=120) as client,
+    ):
+        request = {
+            "model": "rwkv",
+            "prompt": "The capital of France is",
+            "temperature": 0.1,
+            "top_p": 1.0,
+            "top_k": 50,
+            "max_tokens": 8,
+            "return_token_ids": True,
+            "ignore_eos": True,
+            "seed": 42,
+        }
+
+        def complete(**overrides):
+            response = client.post("/v1/completions", json=request | overrides)
+            assert response.status_code == 200, response.text
+            return response.json()["choices"][0]["token_ids"]
+
+        assert len(complete(min_p=0)) == 8
+        assert len(complete(min_p=0.01)) == 8
+        greedy = complete(temperature=0, min_p=0)
+        assert len(greedy) == 8
+        assert complete(min_p=1) == greedy
+        assert complete(min_p=1, logprobs=1) == greedy
 
 
 @pytest.mark.skipif(

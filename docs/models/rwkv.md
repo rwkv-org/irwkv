@@ -156,6 +156,10 @@ All six controls are executed by
 `infer_sampling_six_parameter_forward_varlen`; `frequency_penalty` is the
 Rapid-Sampling additive increment and `penalty_decay` decays its per-request
 token state. `--generation-config irwkv` explicitly disables artifact profiles.
+`min_p` defaults to `0` (disabled). A positive value filters tokens with
+probability below `min_p` times the highest token probability, after applying
+the current penalties and temperature and before Rapid-Sampling applies
+top-k and top-p.
 
 ## Pipeline parallelism
 
