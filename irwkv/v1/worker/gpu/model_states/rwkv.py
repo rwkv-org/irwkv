@@ -372,6 +372,7 @@ class RwkvSampler(Sampler):
         # Compute the cutoff in unscaled logit space using Rapid-Sampling's
         # current penalties and effective temperature. The provider still
         # applies both controls and updates the persistent state.
+        logits.nan_to_num_(nan=0.0, posinf=torch.inf, neginf=-torch.inf)
         scores = self._rapid_penalties.index_select(0, slots)
         torch.sub(logits, scores, out=scores)
         min_p = self.sampling_states.min_p.gpu[slots]
