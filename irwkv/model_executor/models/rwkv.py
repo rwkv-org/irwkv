@@ -44,7 +44,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_FLASHRWKV2_VERSION = "0.2.0a1"
+_FLASHRWKV2_VERSION = "0.2.0a4"
 
 
 class _FlashRWKVStateHandle(Protocol):

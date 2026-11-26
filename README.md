@@ -7,7 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.13.0-EE4C2C?logo=pytorch&logoColor=white)](requirements/rwkv.txt)
-[![FlashRWKV2](https://img.shields.io/badge/FlashRWKV2-0.2.0a1-00A8E8)](requirements/rwkv.txt)
+[![FlashRWKV2](https://img.shields.io/badge/FlashRWKV2-0.2.0a4-00A8E8)](requirements/rwkv.txt)
 [![CUDA](https://img.shields.io/badge/Backend-CUDA-76B900)](docs/models/rwkv.md)
 
 English | [简体中文](README_CN.md)
@@ -26,16 +26,16 @@ All RWKV-7 model operators stay in FlashRWKV2 and canonical checkpoints come fro
 
 Serving RWKV-7 at scale requires continuous batching, recurrent state pools, OpenAI-compatible APIs, and exact numerical alignment for evaluation and RL rollouts. Here is how `irwkv` fits in the ecosystem:
 
-| Capability | **irwkv (Ours)** | **Albatross** | **transformers-rwkv** | **Standard vLLM (Transformer)** |
-| --- | --- | --- | --- | --- |
-| **Per-Sequence Memory** | **$O(1)$ fixed recurrent state** (no KV cache growth) | $O(1)$ fixed recurrent state | $O(1)$ recurrent state | $O(L)$ KV cache grows with context length |
-| **Batching & Prefill** | **Continuous batching** + chunked prefill + async scheduling | Fixed-batch inference | Static batching | Continuous batching + chunked prefill |
-| **State Precision & Parity** | **FP16 state** (default, with DeltaLog budgeting) & **FP32 state** (matches training recurrence) | FP16 state only (differs from FP32 training) | FP32 / BF16 reference | KV cache (BF16 / FP8) |
-| **CUDA Graph & Sampling** | **Full CUDA Graph** + split-graph **6-param Rapid-Sampling** (keeps graphs for structured outputs) | Fixed-batch CUDA kernels | Eager / `torch.compile` | Full / piecewise CUDA Graph |
-| **Prefix Caching & Multi-Turn** | **Block-aligned COW**, sub-block `--prefix-match-unit`, latest-checkpoint state continuation | No | Manual state passing | PagedAttention block prefix cache |
-| **PEFT & RL Integration** | **Versioned unmerged LoRA / NoRA** + online weight sync (`nccl` / `ipc`) | No | PEFT training / inference | LoRA + online weight sync |
-| **Multi-GPU Scaling** | **PP2** (two-stage pipeline) + **DP** (data parallel) + **DP + PP2** | Single GPU | Single GPU / FSDP | TP / PP / DP / EP |
-| **Serving Interfaces** | OpenAI HTTP (**Completions, Chat, Responses**), reasoning & tool parsers, optional **Rust frontend (`irwkv-rs`) + gRPC** | Custom API | Python API only | OpenAI HTTP & gRPC |
+| Capability | **irwkv (Ours)** | **rwkv_lightning_cuda** | **Albatross** | **transformers-rwkv** | **Standard vLLM (Transformer)** |
+| --- | --- | --- | --- | --- | --- |
+| **Per-Sequence Memory** | **$O(1)$ fixed recurrent state** (no KV cache growth) | $O(1)$ recurrent state (legacy `.pth` / custom `.rwkvq` only) | $O(1)$ fixed recurrent state | $O(1)$ recurrent state | $O(L)$ KV cache grows with context length |
+| **Batching & Prefill** | **Continuous batching** + chunked prefill + async scheduling | Basic C++ chunked loop (fixed `--decode-batch-size` cap, historically prone to admission stalls) | Fixed-batch inference | Static batching | Continuous batching + chunked prefill |
+| **State Precision & Parity** | **FP16 state** (default, with DeltaLog budgeting) & **FP32 state** (exact training-recurrence parity) | **FP16 / quantized inference only** — no BF16/FP32 train–infer parity (diverges from BF16 training backbone) | FP16 state only (differs from FP32 training) | FP32 / BF16 reference | KV cache (BF16 / FP8) |
+| **CUDA Graph & Structured Outputs** | **Full CUDA Graph** + split-graph **6-param Rapid-Sampling** + `min_p` (keeps graphs for `xgrammar`/`llguidance`/`outlines`) | **No structured output / grammar engine**, no full-graph split Rapid-Sampling, no canonical 3-profile decoding | Fixed-batch CUDA kernels; no grammar engine | Eager / `torch.compile` | Full / piecewise CUDA Graph + structured outputs |
+| **Prefix Caching & Multi-Turn** | **Block-aligned COW**, sub-block `--prefix-match-unit`, latest-checkpoint state continuation | Custom L1/L2/SQLite session cache (non-standard, tied to manual session IDs) | No | Manual state passing | PagedAttention block prefix cache |
+| **PEFT & External RL Sync** | **Standard HF PEFT LoRA / NoRA** (versioned, multi-tenant) + **`nccl` / `ipc` online weight sync** for Python RL trainers | **Incompatible with HF PEFT LoRA** (custom MiSS / fixed `alpha/rank=1` NoRA only); siloed C++ binaries cannot sync with external RL frameworks | No | PEFT training / inference | LoRA + online weight sync |
+| **Multi-GPU Scaling** | Native **PP2** (13.3B on 2× 24 GB) + **DP** + **DP + PP2** | **No native PP2** for large models; requires external Go reverse-proxy router | Single GPU | Single GPU / FSDP | TP / PP / DP / EP |
+| **API, Ecosystem & Deployment** | Canonical **`transformers-rwkv` safetensors**, OpenAI **Completions / Chat / Responses**, native `--reasoning-parser` & `--tool-call-parser`, optional **Rust frontend (`irwkv-rs`) + gRPC**, simple `uv` install | Legacy `.pth` + `rwkv_vocab` txt, **no Responses API**, **no native reasoning/tool-call parser ecosystem**, **no gRPC**, heavyweight C++/Drogon build chain (`libpq`, `libmariadb`, `libhiredis`, etc.) | Custom API | Python API only | OpenAI HTTP & gRPC |
 
 ### Key Highlights
 
@@ -73,7 +73,7 @@ flowchart LR
 
 ### Install from Source
 
-Create a dedicated project `.venv` and install the pinned build and RWKV runtime dependencies (`torch==2.13.0`, `FlashRWKV2==0.2.0a1`, and pinned `transformers-rwkv` / `tokenizers-rwkv` commits):
+Create a dedicated project `.venv` and install the pinned build and RWKV runtime dependencies (`torch==2.13.0`, `FlashRWKV2==0.2.0a4`, and pinned `transformers-rwkv` / `tokenizers-rwkv` commits):
 
 ```bash
 git clone https://github.com/rwkv-org/irwkv.git

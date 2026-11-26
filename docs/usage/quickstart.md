@@ -19,7 +19,7 @@ uv pip install -r requirements/rwkv.txt --torch-backend=auto
 uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
-`requirements/rwkv.txt` pins `torch==2.13.0`, `FlashRWKV2==0.2.0a1` from PyPI, and the verified `transformers-rwkv` and `tokenizers-rwkv` Git revisions.
+`requirements/rwkv.txt` pins `torch==2.13.0`, `FlashRWKV2==0.2.0a4` from PyPI, and the verified `transformers-rwkv` and `tokenizers-rwkv` Git revisions.
 
 > **CUDA required**: RWKV-7 execution in `irwkv` uses FlashRWKV2 fused CUDA/TileLang operators exclusively; there is no CPU, Triton, or PyTorch fallback.
 
