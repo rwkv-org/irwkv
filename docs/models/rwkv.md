@@ -1,289 +1,157 @@
-# RWKV-7
+# RWKV-7 Architecture, Decoding Contract & Reference
 
-irwkv serves RWKV-7 artifacts with the native `RwkvForCausalLM`
-implementation. The artifact must use the canonical `model_type="rwkv"`
-configuration, safetensors weight names, tokenizer, and chat template from
-[`transformers-rwkv`](https://github.com/rwkv-rs/transformers-rwkv).
+`irwkv` serves RWKV-7 checkpoints natively via `RwkvForCausalLM`, backed exclusively by the fused CUDA/TileLang operators and recurrent-state provider in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2). There is no CUDA, Triton, or PyTorch operator fallback inside `irwkv`.
 
-RWKV execution requires CUDA and the public fused operators and recurrent-state
-provider in FlashRWKV2. The irwkv implementation does not include a CUDA, Triton,
-or PyTorch fallback.
+For step-by-step tutorials and operational recipes, see:
 
-## Install dependencies
+- [Quickstart & Usage Recipes](../usage/quickstart.md) — installation, offline `LLM`, OpenAI APIs, reasoning, structured outputs, and benchmarks.
+- [Serving, State & Multi-GPU Guide](../usage/serving.md) — FP32 vs FP16 state, CUDA Graph capture, tuning caches, prefix caching & continuation, PP2/DP, and the Rust frontend.
+- [LoRA, NoRA & Online RL Sync](../usage/rl_and_lora.md) — unmerged FP32 adapters, versioned runtime LoRA serving, and online weight updates.
 
-Create the project `.venv` and install the build and RWKV dependencies before
-installing irwkv:
+---
 
-```bash
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install -r requirements/build/cuda.txt --torch-backend=auto
-uv pip install -r requirements/rwkv.txt --torch-backend=auto
-uv pip install -e . --no-build-isolation --torch-backend=auto
-```
+## Model Artifact & Operator Contract
 
-The requirements file pins Git revisions for `transformers-rwkv` and
-`tokenizers-rwkv`, and installs FlashRWKV2 0.2.0a1 from PyPI.
+Checkpoints must use the canonical `model_type="rwkv"` configuration, safetensors weight names, tokenizer, and chat template produced by [`transformers-rwkv`](https://github.com/rwkv-rs/transformers-rwkv).
+
+### Startup Config Validation (`RwkvForCausalLM`)
+
+| Config Field | Required Value |
+| --- | --- |
+| `model_type` | `"rwkv"` |
+| `architecture_version` | `"rwkv7"` |
+| `head_size` | `64` |
+| `hidden_size` | Divisible by `head_size` (`64`) |
+| `num_attention_heads` | `hidden_size // head_size` |
+| `intermediate_size` | `4 * hidden_size` |
+| `tie_word_embeddings` | `false` (untied embedding and LM head) |
+| `head_dtype` | `None` or `"float32"` (enforced as `"float32"`) |
+
+### FlashRWKV2 Dependency Contract
+
+`requirements/rwkv.txt` pins Git revisions for `transformers-rwkv` and `tokenizers-rwkv` and installs `FlashRWKV2==0.2.0a1` from PyPI. At model load time, `RwkvForCausalLM` verifies the exact FlashRWKV2 version and public API surface:
+
+- **State & metadata**: `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor`, `prepare_tmix_wkv7_recurrent_fp16_state_from_tensor`, `prepare_tmix_wkv7_recurrent_metadata`
+- **Fused layer islands**: `infer_embedding_ln0_forward_varlen`, `infer_tmix_postnorm_tokenshift_forward_varlen`, `infer_tmix_wkv_prepare_forward_varlen`, `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen`, `infer_tmix_wkv7_recurrent_fp16_forward_varlen`, `infer_tmix_readout_forward_varlen`, `infer_cmix_forward_varlen`, `infer_post_norm_output_forward_varlen`, `infer_head_linear_all_forward_varlen`
+- **Rapid-Sampling**: `setup_sampling_states`, `infer_sampling_six_parameter_forward_varlen`
+
+---
 
 ## Serve a model
 
-RWKV serving defaults to BF16 weights, activations and shift state, FP16 WKV
-state, and FP32 arithmetic and head logits. Prefill and decode round the WKV
-state to FP16 after each token. Chunked prefill is required. Prefix caching
-is disabled by default, so each request updates one recurrent state.
+RWKV serving defaults to BF16 weights, token activations, and shift states, **FP16 WKV state**, and FP32 internal arithmetic and LM-head logits. Chunked prefill is required.
 
-```bash
-irwkv serve <model> \
-  --dtype bfloat16 \
-  --enable-chunked-prefill \
-  --no-enable-prefix-caching
-```
+| Tensor / Stage | Precision | Notes |
+| --- | --- | --- |
+| Weights, token activations, TMix/CMix shift state | **BF16** | Required (`--dtype bfloat16`, `mamba_cache_dtype="bfloat16"`) |
+| Internal recurrence math & LM head logits | **FP32** | Always FP32 regardless of WKV state dtype |
+| WKV recurrent state (`--mamba-ssm-cache-dtype float16`, default) | **FP16** | Rounds WKV state to FP16 after every token across prefill and decode; budgets provider `private_bytes_per_slot` (DeltaLog) for `head_size=64` with 40 or 64 heads |
+| WKV recurrent state (`--mamba-ssm-cache-dtype float32`) | **FP32** | Matches the FP32 training recurrence precision; use for RL rollouts, evaluation, and sampling-parameter search (`mamba_ssm_cache_dtype="float32"` in `LLM`) |
 
-For RL rollouts, evaluation and sampling-parameter search, pass
-`--mamba-ssm-cache-dtype float32` or set
-`mamba_ssm_cache_dtype="float32"` in `LLM`. This matches the WKV state
-precision used to recompute training logprobs. FP16 recurrence can produce
-different logits and generated tokens.
+See [Serving, State & Multi-GPU Guide](../usage/serving.md#2-choosing-recurrent-state-precision-float16-vs-float32) for full serving commands, DeltaLog materialization (`RwkvStateLayer.materialize_state_slots`), bounded state transfers, and prefix-caching details.
 
-For FP16 WKV state with head size 64 and 40 or 64 heads, FlashRWKV2 can
-defer writing the latest update to the bound tensor during batched decode.
-The scheduler queries the provider's `memory_layout` for one slot on the
-target device and budgets `private_bytes_per_slot` for each local layer.
-The caller-backed tensor holds the BF16 shifts and the WKV base state.
-FP32 WKV state and other supported geometries have no private log.
-
-Prefix-cache copies and resets use the state handles so pending updates follow
-the slot. Before reading or exporting the raw tensor, call
-`RwkvStateLayer.materialize_state_slots(slot_ids)` for the slots being read.
-The provider accepts contiguous CUDA int32 slot indices. RWKV supports local
-prefix caching; KV connectors and KV offloading are disabled for this model.
-
-RWKV defaults to `CompilationMode.NONE` and full CUDA Graph capture so that
-TorchDynamo does not decompose the external fused operators. Use
-`--enforce-eager` only for diagnostics.
-
-To opt into prefix sharing and copy-on-write, pass `--enable-prefix-caching`.
-This uses irwkv's state-aligned cache blocks and copies recurrent state at block
-boundaries.
-
-With prefix caching, each request also keeps its latest committed block-aligned
-state after it finishes, is aborted, or is preempted. A newer boundary of the same
-request replaces it. A multi-turn client that resends the complete history
-resumes from that state and processes only the remaining tokens. Reuse requires
-an exact token-prefix match, so it applies to clients that resend the exact
-token history, such as the Completions API. Chat follow-ups re-render the
-history without the previous generation prompt, so they diverge before this
-state. If a re-rendered history differs, for example because reasoning was
-dropped, a tool call was re-serialized, or the chat template or
-`fake_cot_mode` changed, the hit falls back to the last matching retained
-boundary. The final sampled token of a turn is never consumed, so it
-and any unaligned tail are recomputed. Retained states are evictable blocks in
-the same state pool and are recomputed on a miss.
-
-For finer prefix reuse, set `--prefix-match-unit` to a divisor of the state
-block size. For example:
-
-```bash
-irwkv serve <model> \
-  --enable-prefix-caching \
-  --block-size 32 --mamba-block-size 32 --prefix-match-unit 8
-```
-
-With a 73-token prompt, a repeated request can resume from token 72 instead of
-token 64. The shared checkpoint is copied into private state before
-continuation, so divergent suffixes do not modify each other. Only checkpoints
-actually saved by the scheduler can be reused; the match unit controls hashing
-granularity, not how often states are stored.
-
-State transfers stage CPU indices and block coordinates asynchronously. For
-layouts with zero provider-private bytes, copying snapshots one WKV layer at
-a time to preserve overlapping slot copies and bound temporary memory.
-Layouts with private bytes use the provider's handles for copy and reset so
-pending FP16 updates follow the destination slot. Sampler preemption stages
-its state in pinned host memory and restores it on the execution stream.
-
-Continuous batching, asynchronous scheduling, structured outputs, and the
-OpenAI-compatible Chat and Responses APIs use the standard irwkv paths.
+---
 
 ## Kernel preparation
 
-FlashRWKV2 selects kernels from the offline configurations shipped with the
-provider. irwkv warms up the model and the head/sampling operations before
-CUDA Graph capture. During generation it passes the active token and sequence
-counts to the recurrent operators so that padding leaves request state intact.
-Remove `IRWKV_RWKV_TUNING_MODE` and the standalone online tuning preflight from
-existing deployments. Launches using `--fail-on-environ-validation` reject the
-retired environment variable. `FLASHRWKV2_CACHE_DIR` still selects the native
-build cache.
+FlashRWKV2 selects kernels directly from the offline configurations shipped with the provider. `irwkv` warms up the model and head/sampling operations before CUDA Graph capture and passes active token and sequence counts to the recurrent operators so padding leaves request state intact.
+
+- Remove `IRWKV_RWKV_TUNING_MODE` and standalone online tuning preflight steps from existing deployments (`--fail-on-environ-validation` rejects the retired variable).
+- `FLASHRWKV2_CACHE_DIR` continues to select the native build cache (defaults to `~/.cache/flashrwkv2`).
+
+See [CUDA Graph Capture and Kernel Preparation](../usage/serving.md#3-cuda-graph-capture-and-kernel-preparation) for details.
+
+---
 
 ## Decoding defaults
 
-RWKV samples through FlashRWKV2 Rapid-Sampling. The model artifact must publish
-three standalone generation configs. These are the G1l and G1l-preview defaults:
+RWKV samples through FlashRWKV2 Rapid-Sampling (`infer_sampling_six_parameter_forward_varlen`), where `frequency_penalty` is the additive increment and `penalty_decay` decays each request's per-token penalty state.
 
-| Request mode | Config file | temperature | top_p | top_k | presence | frequency | decay |
+Unless `--generation-config irwkv` is passed to disable artifact profiles, every RWKV-7 artifact must ship **three standalone `GenerationConfig` files** containing all six Rapid-Sampling fields (`temperature`, `top_p`, `top_k`, `presence_penalty`, `frequency_penalty`, `penalty_decay`). Omit `_from_model_config` or set it to `false` so Transformers does not rebuild from `config.json` and drop RWKV-specific fields.
+
+Reference defaults for **G1l** and **G1l-preview** artifacts (`top_k=-1` disables top-k filtering; earlier checkpoints may publish different values, and `irwkv` always reads the active artifact's files):
+
+| Request Mode | Config File | `temperature` | `top_p` | `top_k` | `presence_penalty` | `frequency_penalty` | `penalty_decay` |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Open Think | `generation_config.json` | 0.96 | 0.90 | -1 | 1.0 | 0.09 | 0.994 |
-| Fake Think | `fake_think_generation_config.json` | 1.0 | 0.28 | 32 | 0.0 | 0.0 | 0.996 |
-| Tools | `tools_generation_config.json` | 0.96 | 0.76 | 32 | 0.0 | 0.0 | 0.996 |
+| **Open Think** (default) | `generation_config.json` | `0.96` | `0.90` | `-1` | `1.0` | `0.09` | `0.994` |
+| **Fake Think** | `fake_think_generation_config.json` | `1.0` | `0.28` | `32` | `0.0` | `0.0` | `0.996` |
+| **Tools** | `tools_generation_config.json` | `0.96` | `0.76` | `32` | `0.0` | `0.0` | `0.996` |
 
-Earlier checkpoints may specify different values; irwkv uses the selected
-model artifact’s configuration. `top_k=-1` disables top-k filtering.
+### Profile Selection Precedence
 
-These must be standalone `GenerationConfig` documents. Omit
-`_from_model_config` or set it to `false`; otherwise Transformers rebuilds the
-configuration from the model config and drops the RWKV-only penalty fields.
+1. **Tools active**: If `tools` are supplied in the request, `tools_generation_config.json` is always selected regardless of `fake_cot_mode`.
+2. **Fake Think**: If `chat_template_kwargs.fake_cot_mode` is `true` (default `false`), `fake_think_generation_config.json` is selected and the [canonical `transformers-rwkv` chat template](https://github.com/rwkv-rs/transformers-rwkv/blob/83447dd9935ccce8cbec2693853e76a1c9c2212f/temp/rwkv_chat_template.jinja) ends the generation prompt with `<think></think`.
+3. **Open Think**: Default when neither condition above applies (`generation_config.json`).
 
-The default template mode selects Open Think. Setting
-`chat_template_kwargs.fake_cot_mode` to `true` selects Fake Think
-and ends the generation prompt with `<think></think`:
+Explicit request sampling fields override the selected profile. Offline `LLM.chat()` and `LLM.enqueue_chat()` apply the exact same profile selection when `sampling_params` is omitted. `min_p` defaults to `0` (disabled); a positive value filters tokens with probability below `min_p` times the highest token probability after applying current penalties and temperature and before Rapid-Sampling applies `top_k` and `top_p`.
 
-```json
-"chat_template_kwargs": {
-  "fake_cot_mode": true
-}
-```
-
-`fake_cot_mode` defaults to `false`, which selects Open Think. Model artifacts
-use the [`transformers-rwkv` chat template](https://github.com/rwkv-rs/transformers-rwkv/blob/83447dd9935ccce8cbec2693853e76a1c9c2212f/temp/rwkv_chat_template.jinja).
-Supplying tools always selects the Tools profile, regardless of the
-thinking mode. Explicit request sampling fields override the selected profile.
-The same profile selection applies to `LLM.chat()` and `LLM.enqueue_chat()`
-when `sampling_params` is omitted; explicitly supplied `sampling_params` are
-used as provided.
-
-All six controls are executed by
-`infer_sampling_six_parameter_forward_varlen`; `frequency_penalty` is the
-Rapid-Sampling additive increment and `penalty_decay` decays its per-request
-token state. `--generation-config irwkv` explicitly disables artifact profiles.
-`min_p` defaults to `0` (disabled). A positive value filters tokens with
-probability below `min_p` times the highest token probability, after applying
-the current penalties and temperature and before Rapid-Sampling applies
-top-k and top-p.
+---
 
 ## Pipeline parallelism
 
-Single GPU and two-stage pipeline parallelism are supported.
+Single GPU (`--pipeline-parallel-size 1`) and two-stage pipeline parallelism (`--pipeline-parallel-size 2`) are supported, and both can be combined with `--data-parallel-size`. Stage 0 owns embedding and LN0; stage 1 owns the final norm and LM head; `hidden_states`, `residual`, and `v_first` pass between stages. See [Multi-GPU Deployment](../usage/serving.md#5-multi-gpu-deployment-pp2-and-dp) for launch commands.
 
-For PP2, run one stage per GPU:
-
-```bash
-irwkv serve <model> \
-  --dtype bfloat16 \
-  --pipeline-parallel-size 2 \
-  --enable-chunked-prefill
-```
-
-The first stage owns embedding and LN0. The second stage owns the final norm and
-LM head. `hidden_states`, `residual`, and `v_first` are transferred between the
-stages.
+---
 
 ## Tool calling
 
-The canonical artifact chat template emits `**Tool Call:**` followed by fenced
-JSON. Load that template directly from the artifact and select the RWKV parser:
+The canonical artifact chat template emits `**Tool Call:**` followed by a fenced JSON block (` ```json ... ``` `). Serve with `--enable-auto-tool-choice --tool-call-parser rwkv` (and optionally `--reasoning-parser rwkv` for `<think>...</think>` extraction). Do not pass a copied chat template. See [Quickstart: Tool Calling](../usage/quickstart.md#6-tool-calling).
 
-```bash
-irwkv serve <model> \
-  --dtype bfloat16 \
-  --enable-chunked-prefill \
-  --enable-auto-tool-choice \
-  --tool-call-parser rwkv
-```
+---
 
-The parser supports streaming and non-streaming requests with automatic,
-required, or named tool choice. Do not pass a copied chat template.
+## Runtime Constraints
 
-## Unmerged LoRA and NoRA adapters
+`RwkvForCausalLMConfig.verify_and_update_config` enforces the following constraints at startup:
 
-RL trainers that keep one PEFT LoRA or NoRA adapter unmerged can serve it
-directly. Enable it with the `rwkv_lora` config attribute:
+| Feature / Setting | Supported Values / Behavior |
+| --- | --- |
+| `--dtype` | `bfloat16` only |
+| `--enable-chunked-prefill` | **Required** (`true`) |
+| `--tensor-parallel-size` | `1` only (TP is not supported) |
+| `--pipeline-parallel-size` | `1` or `2` (combinable with `--data-parallel-size`) |
+| Decode / prefill context parallelism | `1` only (DCP/PCP not supported) |
+| `--mamba-cache-dtype` | `bfloat16` (or `auto` → `bfloat16`) |
+| `--mamba-ssm-cache-dtype` | `float16` (default / `auto`) or `float32` |
+| `--mamba-cache-mode` | `none` (prefix caching off) or `align` (prefix caching on); `all` is unsupported |
+| Compilation & CUDA Graph defaults | `CompilationMode.NONE`, `CUDAGraphMode.FULL` (or `NONE` with `--enforce-eager`) |
+| KV offloading / KV connectors / stochastic rounding | Not supported |
+| Rapid-Sampling restrictions | Raw logprobs only (no `processed_logits` / `processed_logprobs`), no custom logits processors, no sampling masks, no trace replay, no expanded logits |
 
-```bash
-irwkv serve <model> \
-  --dtype bfloat16 \
-  --enable-chunked-prefill \
-  --hf-overrides '{"rwkv_lora": {"r": 256, "lora_alpha": 256, "use_nora": true, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "lm_head"]}}'
-```
+---
 
-`r`, `lora_alpha`, `use_nora`, and `target_modules` are all required. The scale
-is `lora_alpha / r`. `target_modules` is a subset of `r_proj`, `k_proj`,
-`v_proj`, `o_proj`, `mlp.key`, `mlp.value`, and `lm_head`, with PEFT suffix
-matching. Each targeted projection gets zero-initialized FP32 parameters in
-PEFT layout, `lora_A.weight` `[r, in_features]` and `lora_B.weight`
-`[out_features, r]`, named after the base weight, for example
-`model.layers.3.linear_attn.r_proj.lora_A.weight`,
-`model.layers.3.mlp.value.lora_B.weight`, and `lm_head.lora_A.weight`.
-`mlp.value` keeps the checkpoint layout, `[r, intermediate_size]` and
-`[hidden_size, r]`, although its base weight is transposed after loading.
-Pipeline stages create adapters only for the projections they own.
+## Environment Variables Reference
 
-`load_weights` copies adapter tensors into the existing FP32 storage, so
-captured CUDA Graphs stay valid across updates. The raw adapters, scale, and
-NoRA flag are passed to the FlashRWKV2 projection operators, which apply NoRA
-normalization from the raw A matrix. These are the operators and arguments of
-the `transformers-rwkv` forward with an active unmerged PEFT adapter. Without
-`rwkv_lora`, the model has no adapter parameters and passes no adapter
-arguments.
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FLASHRWKV2_CACHE_DIR` | `~/.cache/flashrwkv2` | Persistent cache root for FlashRWKV2 native builds |
+| `IRWKV_USE_RUST_FRONTEND` | `0` | Set to `1` to run the Rust `irwkv-rs` HTTP/gRPC frontend with `irwkv serve` |
+| `IRWKV_USE_RUST_BENCH` | `0` | Set to `1` to delegate `irwkv bench serve` to the native `irwkv-rs` benchmark binary |
+| `IRWKV_RUST_FRONTEND_PATH` | Bundled binary | Override path to the `irwkv-rs` executable |
+| `IRWKV_CHAT_TEMPLATE_FUEL` | `500000` | MiniJinja template execution fuel limit validated by the Rust frontend |
+| `IRWKV_ALLOW_RUNTIME_LORA_UPDATING` | `0` | Set to `1` to expose `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` (requires `--api-server-count 1`) |
+| `IRWKV_RELOAD_MODE` | `layerwise` | Online weight reload strategy: `layerwise` (default) or `direct` |
+| `IRWKV_SERVER_DEV_MODE` | `0` | Enables internal/RL dev endpoints; **never enable in public production** (see [Security Guide](../usage/security.md)) |
 
-To serve multiple adapters, enable runtime LoRA updates and reserve the adapter
-parameters with `rwkv_lora`:
-
-```bash
-IRWKV_ALLOW_RUNTIME_LORA_UPDATING=1 irwkv serve <base-model> \
-  --served-model-name base --dtype bfloat16 --enable-chunked-prefill \
-  --api-server-count 1 --max-cpu-loras 8 \
-  --hf-overrides '{"rwkv_lora": {"r": 32, "lora_alpha": 32, "use_nora": false, "target_modules": ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"]}}'
-```
-
-Load a PEFT adapter directory containing `adapter_config.json` and
-`adapter_model.safetensors` (or `adapter_model.bin`/`.pt`):
-
-```bash
-curl -X POST localhost:8000/v1/load_lora_adapter \
-  -H 'Content-Type: application/json' \
-  -d '{"lora_name":"tenant-a","lora_path":"/path/to/adapter"}'
-```
-
-Use `tenant-a` as the request's `model`. To replace it, load the new path with
-`"load_inplace": true`; to remove it, POST `{"lora_name":"tenant-a"}` to
-`/v1/unload_lora_adapter`. Each load gets a distinct cache identity. Requests
-already using an adapter retain their version until they finish. The base model
-and different adapter versions run in separate batches. All adapters must match
-the configured rank, scale, and NoRA setting, and target only configured layers.
-The runtime endpoints accept local paths accessible to the server. Dynamic
-updates require a single Python API server. `--max-cpu-loras` sets the
-per-worker adapter capacity. A replacement can use one extra slot while the
-old version is being retired. The old version stays resident until requests
-using it finish.
-
-## Online weight updates
-
-RWKV-7 accepts checkpoint-format updates through the native `nccl` and `ipc`
-weight-transfer backends. Pause generation during the update and reset the
-prefix cache before reusing cached states. The `IRWKV_RELOAD_MODE` environment
-variable selects upstream-style `layerwise` (the default) or `direct` reload.
-
-When embedding normalization is folded, an update that changes its weight or
-bias must include the original `model.embed_tokens.weight` in the same update.
-If an update fails after changing weights, send a complete checkpoint update
-before resuming generation.
-
-## Runtime constraints
-
-RWKV runs with one tensor-parallel rank and supports pipeline parallel sizes
-of one or two. Recurrent state uses Mamba cache mode `none` or `align`.
-Rapid-Sampling supports raw logprobs and additive frequency/presence penalties;
-its configuration validation checks sampling options before generation starts.
+---
 
 ## References and weights
 
-Authoritative implementations and references:
+Authoritative implementations and mathematical references:
 
-- [RWKV-7 NumPy implementation](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py) and [RWKV-7 Qwen 3.5 reference](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/run_rwkv7_qwen35.py).
-- [Albatross](https://github.com/BlinkDL/Albatross), the CUDA inference reference for PRO 6000 GPUs.
-- [RWKV-7 pretraining implementation](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp) for H100.
-- [DPLR mathematics](https://zhiyuan1i.github.io/posts/dplr-mathematics), describing parallel computation of transition matrices.
-- [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv), the Transformers adaptation and Rust tokenizer.
+- [RWKV-7 NumPy reference](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py) and [RWKV-7 Qwen 3.5 reference](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/run_rwkv7_qwen35.py)
+- [Albatross](https://github.com/BlinkDL/Albatross), the CUDA inference reference for PRO 6000 GPUs
+- [RWKV-7 pretraining implementation](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp) for H100
+- [DPLR mathematics](https://zhiyuan1i.github.io/posts/dplr-mathematics), describing parallel computation of transition matrices
+- [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv) and [tokenizers-rwkv](https://github.com/rwkv-rs/tokenizers-rwkv), the Transformers checkpoint format, chat template, and Rust tokenizer
 
-Official checkpoints are published in [rwkv7-g1](https://huggingface.co/BlinkDL/rwkv7-g1/tree/main), [temporary training models](https://huggingface.co/BlinkDL/temp-latest-training-models/tree/main), and [rwkv7-g1-st](https://huggingface.co/rwkv-rs/rwkv7-g1-st). Official `.pth` names use `{architecture}-{data}-{size}-{date}-{context}.pth`, for example `rwkv7-g1h-7.2b-20260710-ctx10240.pth`. Architecture variants include `rwkv7`, `rwkv7a` (DeepEmbed), and `rwkv7b` (DeepEmbedAttn); data versions advance from `g1a` toward later letters, and model sizes include 0.1B, 0.4B, 1.5B, 2.9B, 7.2B, and 13.3B. The 1.5B model is often used for RL and 7.2B for inference testing.
+Official checkpoint repositories:
+
+- [BlinkDL/rwkv7-g1](https://huggingface.co/BlinkDL/rwkv7-g1/tree/main)
+- [BlinkDL/temp-latest-training-models](https://huggingface.co/BlinkDL/temp-latest-training-models/tree/main)
+- [rwkv-rs/rwkv7-g1-st](https://huggingface.co/rwkv-rs/rwkv7-g1-st) (Transformers safetensors format)
+
+Official `.pth` checkpoint names follow `{architecture}-{data}-{size}-{date}-{context}.pth` (for example, `rwkv7-g1h-7.2b-20260710-ctx10240.pth`):
+
+- **Architecture variants**: `rwkv7`, `rwkv7a` (DeepEmbed), `rwkv7b` (DeepEmbedAttn)
+- **Data versions**: progress alphabetically from `g1a` onward (`g1h`, `g1k`, `g1l`, ...)
+- **Model sizes**: `0.1B`, `0.4B`, `1.5B`, `2.9B`, `7.2B`, and `13.3B` (`1.5B` is commonly used for RL experiments and `7.2B` for inference benchmarking)
