@@ -7,7 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.13.0-EE4C2C?logo=pytorch&logoColor=white)](requirements/rwkv.txt)
-[![FlashRWKV2](https://img.shields.io/badge/FlashRWKV2-0.2.0a1-00A8E8)](requirements/rwkv.txt)
+[![FlashRWKV2](https://img.shields.io/badge/FlashRWKV2-0.2.0a4-00A8E8)](requirements/rwkv.txt)
 [![CUDA](https://img.shields.io/badge/Backend-CUDA-76B900)](docs/models/rwkv.md)
 
 [English](README.md) | 简体中文
@@ -26,16 +26,16 @@
 
 线上大规模部署 RWKV-7 需要同时兼顾连续批处理、循环状态池管理、OpenAI 生态协议，以及评测与 RL Rollout 对数值一致性的严格要求。下表对比 `irwkv` 与常见方案的定位差异：
 
-| 维度 | **irwkv（本项目）** | **Albatross** | **transformers-rwkv** | **标准 vLLM（Transformer）** |
-| --- | --- | --- | --- | --- |
-| **单请求状态显存** | **$O(1)$ 固定循环状态**（无 KV Cache 随长度膨胀） | $O(1)$ 固定循环状态 | $O(1)$ 循环状态 | $O(L)$ KV Cache 随上下文线性增长 |
-| **批处理与预填充** | **连续批处理** + Chunked Prefill + 异步调度 | 固定 batch 推理 | 静态批处理 | 连续批处理 + Chunked Prefill |
-| **状态精度与训推一致** | 默认 **FP16 状态**（含 DeltaLog 显存预算），可选 **FP32 状态**（对齐训练递推精度） | 仅 FP16 状态（与 FP32 训练存在轨迹差异） | FP32 / BF16 参考实现 | KV Cache（BF16 / FP8） |
-| **CUDA Graph 与采样** | **全图 CUDA Graph** + 双段图 **六参数 Rapid-Sampling**（结构化输出仍走 Graph） | 固定 batch CUDA 内核 | Eager / `torch.compile` | Full / Piecewise CUDA Graph |
-| **前缀缓存与多轮续推** | **块对齐 COW**、细粒度 `--prefix-match-unit`、最新状态检查点续推 | 不支持 | 手动传递 state | PagedAttention 块级前缀缓存 |
-| **PEFT 与 RL 集成** | **多版本未合并 LoRA / NoRA** + 在线权重热更新（`nccl` / `ipc`） | 不支持 | PEFT 训练 / 推理 | LoRA + 在线权重同步 |
-| **多卡并行能力** | **PP2**（两阶段流水线）+ **DP**（数据并行）+ **DP + PP2** | 单卡 | 单卡 / FSDP | TP / PP / DP / EP |
-| **服务接口与前端** | OpenAI HTTP（**Completions / Chat / Responses**）、思考与工具解析器、可选 **Rust 前端（`irwkv-rs`）+ gRPC** | 自定义接口 | 仅 Python API | OpenAI HTTP & gRPC |
+| 维度 | **irwkv（本项目）** | **rwkv_lightning_cuda** | **Albatross** | **transformers-rwkv** | **标准 vLLM（Transformer）** |
+| --- | --- | --- | --- | --- | --- |
+| **单请求状态显存** | **$O(1)$ 固定循环状态**（无 KV Cache 随长度膨胀） | $O(1)$ 循环状态（仅支持旧式 `.pth` / 自定义 `.rwkvq`） | $O(1)$ 固定循环状态 | $O(1)$ 循环状态 | $O(L)$ KV Cache 随上下文线性增长 |
+| **批处理与预填充** | **连续批处理** + Chunked Prefill + 异步调度 | 简易 C++ 分块调度（固定 `--decode-batch-size` 上限，历史上多次出现准入挂起与同步拷贝瓶颈） | 固定 batch 推理 | 静态批处理 | 连续批处理 + Chunked Prefill |
+| **状态精度与训推一致** | 默认 **FP16 状态**（含 DeltaLog 显存预算），可选 **FP32 状态**（严格对齐训练递推精度） | **仅 FP16 / 量化推理** —— 无 BF16/FP32 训推一致路径，推理与 BF16 训练骨干存在数值偏移 | 仅 FP16 状态（与 FP32 训练存在轨迹差异） | FP32 / BF16 参考实现 | KV Cache（BF16 / FP8） |
+| **CUDA Graph 与结构化输出** | **全图 CUDA Graph** + 双段图 **六参数 Rapid-Sampling** + `min_p`（`xgrammar`/`llguidance`/`outlines` 仍走 Graph） | **无结构化输出 / 语法约束引擎**，无全图双段 Rapid-Sampling，无标准三模式解码配置 | 固定 batch CUDA 内核，无语法约束引擎 | Eager / `torch.compile` | Full / Piecewise CUDA Graph + 结构化输出 |
+| **前缀缓存与多轮续推** | **块对齐 COW**、细粒度 `--prefix-match-unit`、最新状态检查点续推 | 非标准 L1/L2/SQLite 会话缓存（依赖手动会话管理） | 不支持 | 手动传递 state | PagedAttention 块级前缀缓存 |
+| **PEFT 与外部 RL 集成** | **标准 HF PEFT LoRA / NoRA**（多版本热加载）+ **`nccl` / `ipc` 在线权重同步**，无缝对接主流 Python RL 框架 | **不兼容标准 HF PEFT LoRA**（仅自定义 MiSS 或写死 `alpha/rank=1` 的 NoRA）；封闭 C++ 单体二进制，无法与外部 RL 训练框架对接权重同步 | 不支持 | PEFT 训练 / 推理 | LoRA + 在线权重同步 |
+| **多卡并行能力** | 原生 **PP2**（双 24 GB 卡部署 13.3B）+ **DP** + **DP + PP2** | **无原生 PP2** 难以切分大模型；需外挂 Go 反向代理凑多实例 | 单卡 | 单卡 / FSDP | TP / PP / DP / EP |
+| **生态协议与部署成本** | 标准 **`transformers-rwkv` safetensors**、OpenAI **Completions / Chat / Responses**、原生思考与工具解析器、可选 **Rust 前端（`irwkv-rs`）+ gRPC**、`uv` 一键安装 | 旧式 `.pth` + `rwkv_vocab` 文本词表、**无 Responses API**、**无完整思考/工具解析生态**、**无 gRPC**，编译需手装 Drogon 及十余个系统 C++ 库（`libpq` / `libmariadb` / `libhiredis` 等） | 自定义接口 | 仅 Python API | OpenAI HTTP & gRPC |
 
 ### 核心亮点
 
@@ -73,7 +73,7 @@ flowchart LR
 
 ### 源码安装
 
-创建独立的项目虚拟环境 `.venv` 并安装锁定的构建依赖与 RWKV 运行时依赖（含 `torch==2.13.0`、`FlashRWKV2==0.2.0a1` 及锁定提交的 `transformers-rwkv` / `tokenizers-rwkv`）：
+创建独立的项目虚拟环境 `.venv` 并安装锁定的构建依赖与 RWKV 运行时依赖（含 `torch==2.13.0`、`FlashRWKV2==0.2.0a4` 及锁定提交的 `transformers-rwkv` / `tokenizers-rwkv`）：
 
 ```bash
 git clone https://github.com/rwkv-org/irwkv.git

@@ -74,7 +74,7 @@ In addition, `RwkvSampler` captures paired `(logits_graph, sample_graph)` CUDA G
 
 ### Offline Kernel Dispatch & Native Build Cache
 
-Starting with `FlashRWKV2 0.2.0a1`, FlashRWKV2 selects kernels directly from the **offline configurations** shipped with the provider — there is no online tuning phase:
+Starting with `FlashRWKV2 0.2`, FlashRWKV2 selects kernels directly from the **offline configurations** shipped with the provider — there is no online tuning phase:
 
 - `irwkv` warms up the model and the head/sampling operations before CUDA Graph capture and passes active token/sequence counts during generation so padding leaves request state intact.
 - `FLASHRWKV2_CACHE_DIR` continues to select the persistent cache root for FlashRWKV2 native builds (defaults to `~/.cache/flashrwkv2`). TileLang keeps its separate JIT cache at `~/.tilelang/cache`.

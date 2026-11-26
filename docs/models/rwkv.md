@@ -29,7 +29,7 @@ Checkpoints must use the canonical `model_type="rwkv"` configuration, safetensor
 
 ### FlashRWKV2 Dependency Contract
 
-`requirements/rwkv.txt` pins Git revisions for `transformers-rwkv` and `tokenizers-rwkv` and installs `FlashRWKV2==0.2.0a1` from PyPI. At model load time, `RwkvForCausalLM` verifies the exact FlashRWKV2 version and public API surface:
+`requirements/rwkv.txt` pins Git revisions for `transformers-rwkv` and `tokenizers-rwkv` and installs `FlashRWKV2==0.2.0a4` from PyPI. At model load time, `RwkvForCausalLM` verifies the exact FlashRWKV2 version and public API surface:
 
 - **State & metadata**: `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor`, `prepare_tmix_wkv7_recurrent_fp16_state_from_tensor`, `prepare_tmix_wkv7_recurrent_metadata`
 - **Fused layer islands**: `infer_embedding_ln0_forward_varlen`, `infer_tmix_postnorm_tokenshift_forward_varlen`, `infer_tmix_wkv_prepare_forward_varlen`, `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen`, `infer_tmix_wkv7_recurrent_fp16_forward_varlen`, `infer_tmix_readout_forward_varlen`, `infer_cmix_forward_varlen`, `infer_post_norm_output_forward_varlen`, `infer_head_linear_all_forward_varlen`
