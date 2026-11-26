@@ -1,37 +1,79 @@
-# infer-rwkv
+<h1 align="center">irwkv</h1>
 
 <div align="center">
 
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
-[![CUDA](https://img.shields.io/badge/backend-CUDA-76B900)](docs/models/rwkv.md)
+<p><strong>High-Throughput CUDA Inference &amp; Serving Engine for RWKV-7 — Continuous Batching, Recurrent State Management &amp; RL-Ready Serving</strong></p>
 
-[Quick start](#quick-start) · [Offline inference](#offline-inference) · [Serving](#serving) · [Documentation](#documentation)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.13.0-EE4C2C?logo=pytorch&logoColor=white)](requirements/rwkv.txt)
+[![FlashRWKV2](https://img.shields.io/badge/FlashRWKV2-0.2.0a1-00A8E8)](requirements/rwkv.txt)
+[![CUDA](https://img.shields.io/badge/Backend-CUDA-76B900)](docs/models/rwkv.md)
+
+English | [简体中文](README_CN.md)
 
 </div>
 
-irwkv is a CUDA inference and serving framework built for RWKV-7. It brings
-continuous batching, recurrent-state management, and OpenAI-compatible APIs to
-the fused operators in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2).
+---
 
-## Highlights
+**irwkv** is an RWKV-7 inference and serving engine derived from [vLLM](https://github.com/vllm-project/vllm) and backed exclusively by the fused CUDA/TileLang operators in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2). It combines vLLM's continuous batching, chunked prefill, asynchronous scheduling/detokenization, and OpenAI-compatible serving stack with $O(1)$ recurrent-state memory management tailored to RWKV-7.
 
-- **Native RWKV-7 execution** — recurrent inference with per-request state
-  management and chunked prefill.
-- **GPU execution** — FlashRWKV2 fused operators, CUDA Graph capture, and
-  asynchronous scheduling and detokenization.
-- **Familiar APIs** — Python inference, streaming Completions, Chat Completions,
-  and Responses, with structured outputs and tool calling.
-- **Deployment options** — single-GPU inference, two-stage pipeline parallelism,
-  and an optional Rust frontend.
+All RWKV-7 model operators stay in FlashRWKV2 and canonical checkpoints come from [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv), keeping `irwkv` focused on high-throughput scheduling, CUDA Graph execution, multi-GPU deployment, PEFT serving, and online RL integration.
 
-## Quick start
+---
 
-### 1. Install from source
+## Why irwkv?
 
-Use a CUDA-capable NVIDIA GPU with a CUDA toolkit and Rust toolchain installed.
-The commands below create a dedicated Python 3.12 environment and install the
-pinned build and runtime dependencies.
+Serving RWKV-7 at scale requires continuous batching, recurrent state pools, OpenAI-compatible APIs, and exact numerical alignment for evaluation and RL rollouts. Here is how `irwkv` fits in the ecosystem:
+
+| Capability | **irwkv (Ours)** | **Albatross** | **transformers-rwkv** | **Standard vLLM (Transformer)** |
+| --- | --- | --- | --- | --- |
+| **Per-Sequence Memory** | **$O(1)$ fixed recurrent state** (no KV cache growth) | $O(1)$ fixed recurrent state | $O(1)$ recurrent state | $O(L)$ KV cache grows with context length |
+| **Batching & Prefill** | **Continuous batching** + chunked prefill + async scheduling | Fixed-batch inference | Static batching | Continuous batching + chunked prefill |
+| **State Precision & Parity** | **FP16 state** (default, with DeltaLog budgeting) & **FP32 state** (matches training recurrence) | FP16 state only (differs from FP32 training) | FP32 / BF16 reference | KV cache (BF16 / FP8) |
+| **CUDA Graph & Sampling** | **Full CUDA Graph** + split-graph **6-param Rapid-Sampling** (keeps graphs for structured outputs) | Fixed-batch CUDA kernels | Eager / `torch.compile` | Full / piecewise CUDA Graph |
+| **Prefix Caching & Multi-Turn** | **Block-aligned COW**, sub-block `--prefix-match-unit`, latest-checkpoint state continuation | No | Manual state passing | PagedAttention block prefix cache |
+| **PEFT & RL Integration** | **Versioned unmerged LoRA / NoRA** + online weight sync (`nccl` / `ipc`) | No | PEFT training / inference | LoRA + online weight sync |
+| **Multi-GPU Scaling** | **PP2** (two-stage pipeline) + **DP** (data parallel) + **DP + PP2** | Single GPU | Single GPU / FSDP | TP / PP / DP / EP |
+| **Serving Interfaces** | OpenAI HTTP (**Completions, Chat, Responses**), reasoning & tool parsers, optional **Rust frontend (`irwkv-rs`) + gRPC** | Custom API | Python API only | OpenAI HTTP & gRPC |
+
+### Key Highlights
+
+- **Constant-Memory Recurrent State Pool**: Replaces growing KV caches with static per-slot TMix/CMix BF16 shift states and WKV recurrent states managed by the scheduler, with optional block-aligned copy-on-write prefix caching, sub-block `--prefix-match-unit` hashing, and multi-turn state continuation.
+- **FP16 Serving Default & FP32 Train–Infer Parity**: Defaults to BF16 weights/activations/shift states, FP32 accumulation and LM-head logits, and **FP16 WKV state** (`--mamba-ssm-cache-dtype float16`) with FlashRWKV2 DeltaLog memory budgeting for high-concurrency serving. For RL rollouts, evaluation, and sampling-parameter search, pass `--mamba-ssm-cache-dtype float32` to match FP32 training recurrence.
+- **Full CUDA Graph + Structured Output Fast Path**: Runs `RwkvForCausalLM` with `CompilationMode.NONE` and full live-metadata CUDA Graph capture, paired with split-graph FlashRWKV2 Rapid-Sampling (`logits_graph` → optional grammar bitmask → `sample_graph`) so JSON Schema / grammar structured outputs stay on the graphed path.
+- **Native RWKV Decoding, Reasoning & Tool Calling**: Auto-selects the artifact's standalone Open Think, Fake Think (`fake_cot_mode`), and Tools 6-parameter Rapid-Sampling profiles, alongside native `--reasoning-parser rwkv` and `--tool-call-parser rwkv`.
+- **RL & Multi-Tenant Ready**: Serves unmerged FP32 PEFT **LoRA / NoRA** adapters inside captured CUDA Graphs (including versioned runtime load/unload via `/v1/load_lora_adapter`), and supports online checkpoint weight updates over `nccl` or `ipc`.
+- **Optional Rust Frontend (`irwkv-rs`)**: Set `IRWKV_USE_RUST_FRONTEND=1` to run an Axum-based HTTP + optional gRPC (`--grpc-port`) frontend and incremental Rust detokenizer over ZMQ, or `IRWKV_USE_RUST_BENCH=1` for the native Rust benchmark client.
+
+---
+
+## Architecture at a Glance
+
+```mermaid
+flowchart LR
+    Client["OpenAI HTTP / gRPC Client"] --> FE["Frontend<br/>(Python FastAPI or Rust irwkv-rs)"]
+    FE --> Sched["Scheduler & State Manager<br/>(Continuous Batching, Chunked Prefill,<br/>COW Prefix Cache & Continuation)"]
+    Sched --> Runner["GPU Model Runner (MRV2)<br/>(RwkvForCausalLM + Full CUDA Graph)"]
+    Runner --> Kernels["FlashRWKV2 Fused Operators<br/>(Embedding LN0, TMix, WKV-7, CMix)"]
+    Kernels --> Logits["Split Graph 1: LM Head<br/>(FP32 Logits + Optional LoRA/NoRA)"]
+    Logits --> Grammar["Optional Grammar Bitmask<br/>(xgrammar / llguidance / outlines)"]
+    Grammar --> Sample["Split Graph 2: Rapid-Sampling<br/>(6-Param Sampling & Per-Req Penalty State)"]
+```
+
+---
+
+## Requirements & Installation
+
+### Requirements
+
+- **Linux** with a CUDA-capable NVIDIA GPU
+- **Python 3.11–3.14** (Python 3.12 recommended), managed with [`uv`](https://docs.astral.sh/uv/)
+- System **CUDA Toolkit** matching PyTorch `2.13.0`, **CMake >= 3.26.1**, **Ninja**, and a **Rust toolchain** (required for building the optional `irwkv-rs` frontend and `tokenizers-rwkv`)
+
+### Install from Source
+
+Create a dedicated project `.venv` and install the pinned build and RWKV runtime dependencies (`torch==2.13.0`, `FlashRWKV2==0.2.0a1`, and pinned `transformers-rwkv` / `tokenizers-rwkv` commits):
 
 ```bash
 git clone https://github.com/rwkv-org/irwkv.git
@@ -44,46 +86,50 @@ uv pip install -r requirements/rwkv.txt --torch-backend=auto
 uv pip install -e . --no-build-isolation --torch-backend=auto
 ```
 
-### 2. Prepare a checkpoint
+> Use a local RWKV-7 checkpoint in the canonical `transformers-rwkv` format (`model_type="rwkv"`, safetensors weights, tokenizer, chat template, and standalone generation configs). FlashRWKV2 uses offline kernel dispatch (no online tuning step required) and caches native builds under `~/.cache/flashrwkv2` (or `$FLASHRWKV2_CACHE_DIR`). See [Quickstart & Checkpoint Preparation](docs/usage/quickstart.md).
 
-Use a local RWKV-7 Transformers-format checkpoint produced by
-[transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv), including its
-safetensors weights, tokenizer, chat template, and generation configs. See the
-[model guide](docs/models/rwkv.md) for the artifact format and
-[checkpoint references](docs/models/rwkv.md#references-and-weights).
+---
 
-The examples below use `/path/to/rwkv-checkpoint` as the checkpoint directory.
+## Quickstart
 
-## Offline inference
+### 1. Offline Inference (Python)
 
 ```python
 from irwkv import LLM, SamplingParams
 
 llm = LLM(model="/path/to/rwkv-checkpoint", dtype="bfloat16")
+
+# Text completion
 outputs = llm.generate(
     ["Write a short sentence about a quiet river."],
     SamplingParams(max_tokens=64),
 )
+print(outputs[0].outputs[0].text)
 
-for output in outputs:
-    print(output.outputs[0].text)
+# Chat completion (auto-selects Open Think / Fake Think / Tools profile when sampling_params is omitted)
+chat_outputs = llm.chat(
+    [{"role": "user", "content": "Write a short sentence about a quiet river."}],
+    chat_template_kwargs={"fake_cot_mode": True},
+)
+print(chat_outputs[0].outputs[0].text)
 ```
 
-## Serving
+### 2. OpenAI-Compatible Serving
 
-Serving uses BF16 activations and FP16 WKV state by default. For RL rollouts,
-evaluation and sampling-parameter search, pass `--mamba-ssm-cache-dtype float32`
-to match training recurrence.
+Start a server with BF16 activations and FP16 recurrent state (default), reasoning parsing, and RWKV tool calling. Add `--mamba-ssm-cache-dtype float32` for RL rollouts, evaluation, or sampling-parameter search:
 
 ```bash
 irwkv serve /path/to/rwkv-checkpoint \
   --served-model-name rwkv7 \
   --dtype bfloat16 \
   --enable-chunked-prefill \
-  --no-enable-prefix-caching
+  --no-enable-prefix-caching \
+  --reasoning-parser rwkv \
+  --enable-auto-tool-choice \
+  --tool-call-parser rwkv
 ```
 
-Send a chat request:
+Send a chat completion request:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -97,24 +143,66 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-Set `IRWKV_USE_RUST_FRONTEND=1` before starting the server to use the Rust
-frontend. Explore the serving benchmark with `irwkv bench serve --help`.
+Enable the Rust frontend (with optional gRPC) by setting `IRWKV_USE_RUST_FRONTEND=1`:
+
+```bash
+IRWKV_USE_RUST_FRONTEND=1 irwkv serve /path/to/rwkv-checkpoint \
+  --served-model-name rwkv7 \
+  --dtype bfloat16 \
+  --enable-chunked-prefill \
+  --grpc-port 50051
+```
+
+### 3. Benchmarking Serving Throughput
+
+```bash
+irwkv bench serve \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --model rwkv7 \
+  --dataset-name random \
+  --input-len 512 \
+  --output-len 256 \
+  --max-concurrency 64 \
+  --num-prompts 256
+```
+
+Set `IRWKV_USE_RUST_BENCH=1` to delegate `irwkv bench serve` to the native `irwkv-rs` benchmark client. Explore all subcommands (`serve`, `throughput`, `latency`, `startup`, `sweep`) with `irwkv bench --help`.
+
+---
+
+## Precision & Deployment Cheat Sheet
+
+| Workload | Recommended Configuration | Why |
+| --- | --- | --- |
+| **High-Concurrency Online Serving (Default)** | `--dtype bfloat16` (`--mamba-ssm-cache-dtype float16` default) | Halves WKV state memory and bandwidth with DeltaLog budgeting (per-token FP16 rounding differs from FP32 training) |
+| **RL Rollout, Eval & Sampling Search** | `--dtype bfloat16 --mamba-ssm-cache-dtype float32` | Follows the FP32 training recurrence contract and avoids FP16 state drift |
+| **Shared System Prompts / Multi-Turn** | `--enable-prefix-caching --block-size 32 --mamba-block-size 32 --prefix-match-unit 8` | Enables block-aligned COW reuse, finer prefix hashing, and latest-checkpoint continuation |
+| **13.3B Multi-GPU (PP2)** | `--pipeline-parallel-size 2` (optionally with `--data-parallel-size N`) | Splits layers across 2 GPUs; combine with DP for multi-replica scaling |
+| **RL Unmerged Adapter / Multi-Tenant LoRA** | `--hf-overrides '{"rwkv_lora": ...}'` (+ `IRWKV_ALLOW_RUNTIME_LORA_UPDATING=1` for dynamic loading) | Keeps captured CUDA Graphs valid while serving versioned FP32 LoRA/NoRA adapters |
+| **Low-Overhead HTTP / gRPC Frontend** | `IRWKV_USE_RUST_FRONTEND=1` (+ `--grpc-port 50051`) | Moves HTTP/gRPC serving, chat rendering, and incremental detokenization to Rust |
+
+---
 
 ## Documentation
 
-| Guide | Topics |
-| --- | --- |
-| [RWKV-7 model guide](docs/models/rwkv.md) | Artifact format, precision, and serving configuration |
-| [Kernel preparation](docs/models/rwkv.md#kernel-preparation) | Operator dispatch and graph warmup |
-| [Decoding defaults](docs/models/rwkv.md#decoding-defaults) | Generation profiles and sampling controls |
-| [Pipeline parallelism](docs/models/rwkv.md#pipeline-parallelism) | Two-GPU deployment |
-| [Tool calling](docs/models/rwkv.md#tool-calling) | Chat templates and the RWKV tool parser |
+| Guide | Audience | Topics |
+| --- | --- | --- |
+| [Quickstart & Usage Recipes](docs/usage/quickstart.md) | Users | Source install, checkpoint format, offline `LLM`, OpenAI APIs, reasoning, tool calling, structured outputs, benchmarking |
+| [Serving, State & Multi-GPU Guide](docs/usage/serving.md) | Serving Engineers | FP16 default vs FP32 parity state, DeltaLog budgeting, offline dispatch & CUDA Graphs, prefix caching & continuation, PP2/DP, Rust frontend |
+| [LoRA, NoRA & Online RL Sync](docs/usage/rl_and_lora.md) | RL & PEFT Engineers | Unmerged FP32 LoRA/NoRA adapters, versioned runtime `/v1/load_lora_adapter`, `nccl`/`ipc` online weight reload |
+| [RWKV-7 Architecture & Reference](docs/models/rwkv.md) | Integrators | Artifact validation contract, 6-parameter Rapid-Sampling decoding defaults, runtime constraints, env vars, official weights |
+| [Rust Frontend (`irwkv-rs`)](rust/README.md) | Serving Engineers | Crate layout, HTTP/gRPC server, external engine mode, engine-free `render` endpoint |
+| [Security Guide](docs/usage/security.md) | Operators | Network isolation, API authentication, media limits, dev-mode endpoint restrictions |
+| [Contributing & Dev Setup](docs/contributing/README.md) | Contributors | Development setup, incremental CUDA/Rust builds, RWKV tests, pre-commit hooks, PR review |
 
-## License and acknowledgments
+---
 
-irwkv is distributed under the [Apache 2.0 license](LICENSE). The framework
-derives from [vLLM](https://github.com/vllm-project/vllm), with original
-copyright notices retained. RWKV operators are provided by
-[FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2), and the Transformers artifact
-format and tokenizer come from
-[transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv).
+## License & Acknowledgments
+
+irwkv is distributed under the [Apache 2.0 License](LICENSE).
+
+- Framework foundation: [vLLM](https://github.com/vllm-project/vllm) (original copyright notices retained)
+- Fused RWKV-7 operators & Rapid-Sampling: [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2)
+- Transformers artifact format, chat template & Rust tokenizer: [transformers-rwkv](https://github.com/rwkv-rs/transformers-rwkv) & [tokenizers-rwkv](https://github.com/rwkv-rs/tokenizers-rwkv)
+- Reference RWKV-7 implementations: [BlinkDL/RWKV-LM](https://github.com/BlinkDL/RWKV-LM) & [BlinkDL/Albatross](https://github.com/BlinkDL/Albatross)
