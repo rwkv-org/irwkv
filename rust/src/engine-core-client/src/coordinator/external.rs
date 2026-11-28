@@ -32,6 +32,29 @@ struct CoordinatorWakeupMessage {
     wave: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::handle::CoordinatorStateSnapshot;
+    use zeromq::Socket;
+
+    #[tokio::test]
+    async fn dense_counts_leave_engines_running() {
+        let state = Arc::new(CoordinatorState::new(CoordinatorStateSnapshot {
+            current_wave: 0,
+            engines_running: false,
+        }));
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut service = ExternalCoordinatorService::new(state.clone(), rx, XSubSocket::new());
+        let counts = serde_json::json!([[0, 0, 0], [1, 2, 0.5]]);
+        service
+            .handle_publish(ZmqMessage::from(encode_msgpack(&counts).unwrap()))
+            .await
+            .unwrap();
+        assert!(state.lock().engines_running);
+    }
+}
+
 /// Coordinator-to-frontend state publish received on the front-side coordinator
 /// socket.
 ///
@@ -58,9 +81,8 @@ struct CoordinatorStateUpdate {
 ///
 /// This owns the command receiver and one frontend-facing XSUB socket. It
 /// mirrors the subset of Python's coordinator protocol needed by the Rust
-/// bootstrapped frontend: receive `(counts, wave, running)` publishes, ignore
-/// `counts`, and send `(exclude_engine_index, wave)` wakeup messages when the
-/// first request arrives while engines are paused.
+/// bootstrapped frontend. Dense irwkv ranks publish request counts. The wave
+/// protocol also reports whether the engines need a wakeup on the next request.
 pub(crate) struct ExternalCoordinatorService {
     state: Arc<CoordinatorState>,
     command_rx: mpsc::UnboundedReceiver<CoordinatorCommand>,
@@ -119,18 +141,26 @@ impl ExternalCoordinatorService {
             );
         }
 
-        let update: CoordinatorStateUpdate = decode_msgpack(&frames[0])?;
-
         let mut state = self.state.lock();
         let previous_wave = state.current_wave;
         let previous_engines_running = state.engines_running;
-        state.current_wave = update.wave;
-        state.engines_running = update.engines_running;
+        match decode_msgpack::<CoordinatorStateUpdate>(&frames[0]) {
+            Ok(update) => {
+                state.current_wave = update.wave;
+                state.engines_running = update.engines_running;
+            }
+            Err(_) => {
+                // irwkv's dense replicas run independently and publish only
+                // (waiting, running, KV usage) for each rank.
+                let _: Vec<(u32, u32, f64)> = decode_msgpack(&frames[0])?;
+                state.engines_running = true;
+            }
+        }
         debug!(
             previous_wave,
-            wave = update.wave,
+            wave = state.current_wave,
             previous_engines_running,
-            engines_running = update.engines_running,
+            engines_running = state.engines_running,
             "applied external coordinator state update"
         );
         Ok(())

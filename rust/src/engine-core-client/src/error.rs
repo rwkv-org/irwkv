@@ -77,6 +77,8 @@ pub enum Error {
         rank: u32,
         connected_ranks: Vec<u32>,
     },
+    #[error("{message}")]
+    RequestValidation { message: String },
     #[error("engine-core output dispatcher closed: {message}")]
     DispatcherClosed { message: String },
     #[error("engine-core client is closed: {message}")]

@@ -13,11 +13,13 @@ from irwkv.config import (
 )
 from irwkv.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from irwkv.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from irwkv.outputs import RequestError
 from irwkv.sampling_params import SamplingParams, StructuredOutputsParams
 from irwkv.utils.hashing import sha256
 from irwkv.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -2030,13 +2032,22 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 
 
 @pytest.mark.parametrize("async_grammar", [True, False])
-def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
+@pytest.mark.parametrize(
+    "error",
+    [
+        IRWKVValidationError("invalid grammar syntax"),
+        RuntimeError("compiler execution failed"),
+        MemoryError("grammar compiler allocation failed"),
+    ],
+    ids=["invalid", "runtime", "memory"],
+)
+def test_grammar_compile_error_finishes_only_request(
+    async_grammar: bool, error: Exception
+):
     scheduler = create_scheduler()
     manager = scheduler.structured_output_manager
     manager.backend = Mock()
-    manager.backend.compile_grammar.side_effect = RuntimeError(
-        "forced FSM compilation error"
-    )
+    manager.backend.compile_grammar.side_effect = error
     manager._use_async_grammar_compilation = async_grammar
     if async_grammar:
         manager.executor = ThreadPoolExecutor(max_workers=1)
@@ -2056,7 +2067,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert request.structured_output_request is not None
     grammar_future = request.structured_output_request._grammar
     assert isinstance(grammar_future, Future)
-    assert isinstance(grammar_future.exception(timeout=5), RuntimeError)
+    assert grammar_future.exception(timeout=5) is error
     if async_grammar:
         manager.executor.shutdown()
 
@@ -2075,6 +2086,13 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason is None
+    if isinstance(error, IRWKVValidationError):
+        assert output.error == RequestError(
+            code="validation_error",
+            message="Invalid structured outputs: invalid grammar syntax",
+        )
+    else:
+        assert output.error is None
 
     healthy_request = create_requests(num_requests=1, req_ids=["healthy-request"])[0]
     scheduler.add_request(healthy_request)
@@ -2082,6 +2100,48 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
     assert [req.req_id for req in next_output.scheduled_new_reqs] == [
         healthy_request.request_id
     ]
+
+
+def test_validation_probe_failure_keeps_the_compiler_error(monkeypatch):
+    manager = create_scheduler().structured_output_manager
+    manager.backend = Mock()
+    manager.backend_name = "xgrammar"
+    manager.backend.compile_grammar.side_effect = RuntimeError("compiler failed")
+    request = Request(
+        request_id="validation-probe",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(
+            structured_outputs=StructuredOutputsParams(json='{"type":"object"}')
+        ),
+    )
+    monkeypatch.setattr(
+        "xgrammar.Grammar.from_json_schema",
+        Mock(side_effect=MemoryError("validator allocation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="compiler failed"):
+        manager._create_grammar(request)
+
+
+def test_engine_rejects_a_different_structured_output_backend():
+    manager = create_scheduler().structured_output_manager
+    manager.backend = Mock()
+    manager.backend_name = "xgrammar"
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(choice=["OK"]))
+    assert params.structured_outputs is not None
+    params.structured_outputs._backend = "guidance"
+    request = Request(
+        request_id="mixed-backend",
+        prompt_token_ids=[1, 2],
+        sampling_params=params,
+    )
+
+    with pytest.raises(
+        IRWKVValidationError, match="uses structured output backend 'xgrammar'"
+    ):
+        manager.grammar_init(request)
+
+    manager.backend.compile_grammar.assert_not_called()
 
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
@@ -2114,7 +2174,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
-    scheduler.grammar_compile_error_reqs = set()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.encoder_cache_mismatch_reqs = set()
     scheduler.irwkv_config = Mock()
     scheduler.return_sampling_mask = False

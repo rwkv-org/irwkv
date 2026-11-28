@@ -25,6 +25,7 @@ from irwkv.distributed import (
     cleanup_dist_env_and_memory,
 )
 from irwkv.envs import enable_envs_cache
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import configure_logging, init_logger
 from irwkv.logging_utils.dump_input import dump_engine_exception
 from irwkv.lora.request import LoRARequest
@@ -32,6 +33,7 @@ from irwkv.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
 )
+from irwkv.outputs import RequestError
 from irwkv.tasks import SupportedTask
 from irwkv.tracing import instrument, maybe_init_worker_tracer
 from irwkv.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -1704,6 +1706,17 @@ class EngineCoreProc(EngineCore):
                             # drops the stale entry, client resends with data).
                             self._handle_mm_cache_miss(req, e)
                             continue
+                        except IRWKVValidationError as error:
+                            self._enqueue_abort_requests([req.request_id])
+                            self._send_finish_outputs_to_client(
+                                [req.request_id],
+                                req.client_index,
+                                FinishReason.ERROR,
+                                error=RequestError(
+                                    code="validation_error", message=str(error)
+                                ),
+                            )
+                            continue
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
@@ -1711,14 +1724,16 @@ class EngineCoreProc(EngineCore):
                         request = generic_decoder.decode(data_frames)
 
                         if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts are added to *both* queues, allows us to eagerly
-                            # process aborts while also ensuring ordering in the input
-                            # queue to avoid leaking requests. This is ok because
-                            # aborting in the scheduler is idempotent.
-                            self.aborts_queue.put_nowait(request)
+                            self._enqueue_abort_requests(request)
+                            continue
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
+
+    def _enqueue_abort_requests(self, request_ids: list[str]) -> None:
+        # Cancel promptly, and also process the abort after any queued ADD.
+        self.aborts_queue.put_nowait(request_ids)
+        self.input_queue.put_nowait((EngineCoreRequestType.ABORT, request_ids))
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
@@ -1900,10 +1915,20 @@ class EngineCoreProc(EngineCore):
         return not self.has_work()
 
     def _send_finish_outputs_to_client(
-        self, req_ids: list[str], client_index: int, finish_reason: FinishReason
+        self,
+        req_ids: list[str],
+        client_index: int,
+        finish_reason: FinishReason,
+        *,
+        error: RequestError | None = None,
     ) -> None:
         outputs = [
-            EngineCoreOutput(req_id, [], finish_reason=finish_reason)
+            EngineCoreOutput(
+                req_id,
+                [],
+                finish_reason=finish_reason,
+                error=error,
+            )
             for req_id in req_ids
         ]
         eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)

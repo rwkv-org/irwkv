@@ -8,11 +8,32 @@ from typing import Any
 
 import numpy as np
 
+from irwkv.exceptions import (
+    GenerationError,
+    IRWKVValidationError,
+    RetryableRequestError,
+)
 from irwkv.logger import init_logger
 from irwkv.logprobs import PromptLogprobs, SampleLogprobs
 from irwkv.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RequestError:
+    """A request-level error that does not mark the engine as unhealthy."""
+
+    code: str
+    message: str
+    retryable: bool = False
+
+    def to_exception(self) -> GenerationError | IRWKVValidationError:
+        if self.code == "validation_error":
+            return IRWKVValidationError(self.message)
+        if self.retryable:
+            return RetryableRequestError(self.message)
+        return GenerationError(self.message)
 
 
 @dataclass

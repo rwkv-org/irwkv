@@ -140,6 +140,36 @@ pub struct EngineCoreOutput {
     /// the first output of a request that asked for them.
     #[serde(default)]
     pub prompt_token_id_logprobs: Option<Box<WireNdArray>>,
+    /// Request-level error sent with an error finish reason.
+    #[serde(default)]
+    pub error: Option<Box<RequestError>>,
+}
+
+/// A request-level error that does not mark the engine as unhealthy.
+///
+/// Python models this as a plain `@dataclass`, so it is serialized by msgspec
+/// as a map (named fields).
+///
+/// Original Python definition: `RequestError` in `irwkv/outputs.py`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+impl RequestError {
+    /// `code` of an error caused by the request itself, e.g. a structured-output
+    /// constraint the engine's backend cannot compile. Python raises
+    /// `IRWKVValidationError` for it.
+    pub const VALIDATION_ERROR: &str = "validation_error";
+
+    /// Whether the request itself is invalid, so frontends report a client
+    /// error.
+    pub fn is_validation_error(&self) -> bool {
+        self.code == Self::VALIDATION_ERROR
+    }
 }
 
 /// Raw per-sequence speculative-decoding accumulator.
@@ -417,6 +447,18 @@ pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_error_decodes_python_named_fields() {
+        let payload = serde_json::json!({
+            "code": "validation_error", "message": "bad grammar", "retryable": false
+        });
+        let wire = rmp_serde::to_vec_named(&payload).unwrap();
+        let error: super::RequestError = rmp_serde::from_slice(&wire).unwrap();
+        assert!(error.is_validation_error());
+        assert_eq!(error.message, "bad grammar");
+        assert!(!error.retryable);
+    }
+
     use std::collections::BTreeSet;
 
     use super::*;
@@ -543,6 +585,7 @@ mod tests {
                             new_sampling_mask: None,
                             spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
+                            error: None,
                         },
                     ],
                     scheduler_stats: None,

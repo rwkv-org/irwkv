@@ -5,12 +5,15 @@ import math
 import time
 from unittest.mock import MagicMock
 
+import msgspec
 import numpy as np
 import pytest
 
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from irwkv.outputs import (
     CompletionOutput,
+    RequestError,
     RequestOutput,
     SamplingMask,
 )
@@ -1134,6 +1137,85 @@ def test_iteration_stats(dummy_test_vectors):
 
     assert iteration_stats.num_prompt_tokens == 0
     assert iteration_stats.num_generation_tokens == num_active
+
+
+def test_rust_request_tuple_preserves_priority_trace_and_session():
+    # An EngineCoreRequest from the Rust frontend, including its DP wave slot.
+    wire = [
+        "rust-request",
+        [1, 2],
+        None,
+        {"max_tokens": 2},
+        1.0,
+        None,
+        0,
+        None,
+        None,
+        1,
+        3,
+        -4,
+        {"traceparent": "sample"},
+        False,
+        "external",
+        None,
+        None,
+        False,
+        "session",
+    ]
+
+    request = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(wire), type=EngineCoreRequest
+    )
+
+    assert request.client_index == 1
+    assert request.priority == -4
+    assert request.trace_headers == {"traceparent": "sample"}
+    assert request.session_id == "session"
+
+
+def test_python_terminal_tuple_matches_rust_frontend_wire():
+    output = EngineCoreOutput(
+        request_id="rust-request",
+        new_token_ids=[1],
+        finish_reason=FinishReason.STOP,
+        stop_reason=1,
+    )
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(output))
+
+    # The Rust decoder reads the reserved pooling slot before finish and stop.
+    assert wire[:7] == ["rust-request", [1], None, None, None, 0, 1]
+    assert wire[14:17] == [None, None, None]
+
+
+def test_validation_error_reaches_request_consumer():
+    output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="grammar",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=2, detokenize=False),
+        arrival_time=0,
+        cache_salt=None,
+        data_parallel_rank=None,
+        external_req_id="grammar",
+    )
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, request.request_id)
+    output_processor.add_request(request, None, queue=queue)
+
+    output_processor.process_outputs(
+        [
+            EngineCoreOutput(
+                "grammar",
+                [],
+                finish_reason=FinishReason.ERROR,
+                error=RequestError(code="validation_error", message="bad grammar"),
+            )
+        ]
+    )
+
+    assert output_processor.get_num_unfinished_requests() == 0
+    with pytest.raises(IRWKVValidationError, match="bad grammar"):
+        queue.get_nowait()
 
 
 @pytest.mark.parametrize("abort_by", ["internal", "external"])

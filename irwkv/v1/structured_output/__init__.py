@@ -3,9 +3,11 @@
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from typing import TYPE_CHECKING, NamedTuple
 
 from irwkv.config import IrwkvConfig
+from irwkv.exceptions import IRWKVValidationError
 from irwkv.logger import init_logger
 from irwkv.parser.engine.adapters import ParserEngineReasoningAdapter
 from irwkv.reasoning import ReasoningParserManager
@@ -15,7 +17,10 @@ from irwkv.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
 )
-from irwkv.v1.structured_output.backend_xgrammar import XgrammarBackend
+from irwkv.v1.structured_output.backend_xgrammar import (
+    XgrammarBackend,
+    validate_xgrammar_grammar,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -47,6 +52,7 @@ class StructuredOutputManager:
 
     def __init__(self, irwkv_config: IrwkvConfig):
         self.backend: StructuredOutputBackend | None = None
+        self.backend_name: str | None = None
         # We only store the class of the reasoner in the manager.
         # The parser instance is request-scoped because some reasoning parsers
         # depend on per-request chat-template kwargs.
@@ -125,20 +131,20 @@ class StructuredOutputManager:
         if request.structured_output_request is None:
             return
 
-        if TYPE_CHECKING:
-            assert (
-                request.sampling_params is not None
-                and request.sampling_params.structured_outputs is not None
+        assert request.sampling_params is not None
+        structured_outputs = request.sampling_params.structured_outputs
+        assert structured_outputs is not None
+        backend = structured_outputs._backend
+        if self.backend_name is not None and backend != self.backend_name:
+            raise IRWKVValidationError(
+                f"The engine uses structured output backend '{self.backend_name}', "
+                f"but this request resolved to '{backend}'. Use a schema supported "
+                "by the current backend or configure a backend explicitly.",
+                parameter="structured_outputs",
             )
 
         # Initialize the backend the first time it is needed.
-        #
-        # NOTE: We only support a single backend. We do NOT support different
-        # backends on a per-request basis in V1 (for now, anyway...).
-        # _backend is set in Processor._validate_structured_output
         if self.backend is None:
-            assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
             vocab_size = self.irwkv_config.model_config.get_vocab_size()
             if backend == "xgrammar":
                 self.backend = XgrammarBackend(
@@ -174,6 +180,7 @@ class StructuredOutputManager:
                 )
             else:
                 raise ValueError(f"Unsupported structured output backend: {backend}")
+            self.backend_name = backend
 
         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
         if self._use_async_grammar_compilation:
@@ -204,7 +211,22 @@ class StructuredOutputManager:
             return self.backend.compile_grammar(
                 request_type, grammar_spec, stop_token_ids=stop_token_ids
             )
-        except Exception:
+        except Exception as error:
+            if self.backend_name == "xgrammar" and isinstance(
+                error, (ValueError, RuntimeError)
+            ):
+                # A compiler failure can also be an internal fault. Run the
+                # syntax validator only on failure, against a request-local copy.
+                assert request.sampling_params is not None
+                params = copy(request.sampling_params)
+                params.structured_outputs = copy(params.structured_outputs)
+                try:
+                    validate_xgrammar_grammar(params)
+                except IRWKVValidationError as validation:
+                    if not isinstance(
+                        validation.__cause__, (MemoryError, AssertionError)
+                    ):
+                        raise
             logger.exception(
                 "Failed to compile grammar for request %s", request.request_id
             )

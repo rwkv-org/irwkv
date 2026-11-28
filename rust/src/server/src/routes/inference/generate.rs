@@ -126,11 +126,8 @@ pub async fn generate(
     let collected = match raw_stream.collect_output().instrument(request_span.clone()).await {
         Ok(collected) => collected,
         Err(error) => {
-            return server_error!(
-                "failed to collect raw generate response: {}",
-                error.to_report_string()
-            )
-            .into_response();
+            return text_submit_error("failed to collect raw generate response", error.into())
+                .into_response();
         }
     };
 
@@ -251,7 +248,10 @@ async fn generate_chunk_stream(
                     error = %error.as_report(),
                     "raw generate stream failed"
                 );
-                bail_server_error!("{}", error.to_report_string());
+                return Err(text_submit_error(
+                    "raw generate stream failed",
+                    error.into(),
+                ));
             }
         }
     }

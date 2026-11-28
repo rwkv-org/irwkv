@@ -13,6 +13,7 @@ import torch
 from irwkv.config.kv_events import KVEventsConfig
 from irwkv.lora.request import LoRARequest
 from irwkv.multimodal.inputs import MultiModalFeatureSpec
+from irwkv.outputs import RequestError
 from irwkv.sampling_params import SamplingParams
 from irwkv.v1.kv_hints import KvHintsEnvelope
 from irwkv.v1.metrics.stats import (
@@ -116,6 +117,8 @@ class EngineCoreRequest(
     # client for this request when scaling out the front-end.
     client_index: int = 0
 
+    # Retain the DP wave position in the Rust client's request tuple.
+    current_wave: int = 0
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
@@ -185,6 +188,8 @@ class EngineCoreOutput(
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
+    # These positions are reserved in the Rust client's output tuple.
+    pooling_output: None = None
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
     events: list[EngineCoreEvent] | None = None
@@ -206,11 +211,11 @@ class EngineCoreOutput(
 
     new_sampling_mask: SamplingMaskLists | None = None
 
-    # Per-request spec-decode acceptance; attached only on the final output.
-    # Appended last so `array_like` positional serialization stays compatible.
+    spec_decode_metrics: None = None
 
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
+    error: RequestError | None = None
 
     @property
     def finished(self) -> bool:
